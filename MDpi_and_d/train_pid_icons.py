@@ -61,6 +61,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tuna_sdk import DetectAnnotation, DetectOutput, DetectRequest, DetectSettings, Rollout, TrainStepGroup, TunaClient
+from tuna_sdk import PointAnnotation, PointOutput, PointRequest, PointSettings
 from tuna_sdk.errors import TunaAPIError, TunaNetworkError
 
 
@@ -841,10 +842,66 @@ def _count_tp_fp_fn(
     return true_pos, false_pos, false_neg
 
 
+def _point_in_box(point: PointAnnotation, box: DetectAnnotation) -> bool:
+    return (box.x_min <= point.x <= box.x_max) and (box.y_min <= point.y <= box.y_max)
+
+
+def _match_points_in_boxes(points: list[PointAnnotation], ground_truth: list[DetectAnnotation]) -> int:
+    n_points = len(points)
+    n_gt = len(ground_truth)
+    if n_points == 0 or n_gt == 0:
+        return 0
+    size = max(n_points, n_gt)
+    score = np.zeros((size, size), dtype=np.float32)
+    for i, gt in enumerate(ground_truth):
+        for j, pt in enumerate(points):
+            score[i, j] = 1.0 if _point_in_box(pt, gt) else 0.0
+    cost = -score
+    row_idx, col_idx = linear_sum_assignment(cost)
+    return int(score[row_idx, col_idx].sum())
+
+
+def _count_tp_fp_fn_points(
+    points: list[PointAnnotation],
+    ground_truth: list[DetectAnnotation],
+) -> tuple[int, int, int]:
+    n_points = len(points)
+    n_gt = len(ground_truth)
+    if n_points == 0 and n_gt == 0:
+        return 0, 0, 0
+    if n_points == 0:
+        return 0, 0, n_gt
+    if n_gt == 0:
+        return 0, n_points, 0
+    tp = _match_points_in_boxes(points, ground_truth)
+    fp = n_points - tp
+    fn = n_gt - tp
+    return tp, fp, fn
+
+
+def _reward_f1_points(
+    points: list[PointAnnotation],
+    ground_truth: list[DetectAnnotation],
+    *,
+    fn_penalty_exponent: float = 1.0,
+    fp_penalty_exponent: float = 1.0,
+) -> float:
+    tp, fp, fn = _count_tp_fp_fn_points(points, ground_truth)
+    if tp == 0 and fp == 0 and fn == 0:
+        return 1.0
+    weighted_fp = float(fp) ** float(fp_penalty_exponent)
+    weighted_fn = float(fn) ** float(fn_penalty_exponent)
+    denom = (2.0 * float(tp)) + weighted_fp + weighted_fn
+    if denom <= 0.0:
+        return 0.0
+    return (2.0 * float(tp)) / denom
+
+
 def _rewards_for_rollouts(
     rollouts: list[Rollout],
     gt_boxes: list[DetectAnnotation],
     *,
+    skill: str = "detect",
     reward_metric: str = "f1",
     fn_penalty_exponent: float = 1.0,
     fp_penalty_exponent: float = 1.0,
@@ -852,26 +909,37 @@ def _rewards_for_rollouts(
 ) -> list[float]:
     rewards: list[float] = []
     is_negative_task = len(gt_boxes) == 0
+    effective_skill = (skill or "detect").strip().lower()
+    if effective_skill == "point" and reward_metric == "miou":
+        print("warning: reward_metric='miou' is not defined for point outputs; using point F1 instead.")
+        reward_metric = "f1"
     for rollout in rollouts:
-        pred_boxes = rollout.output.objects or []
-        if reward_metric == "miou":
-            reward = (
-                _reward_miou(
-                    pred_boxes,
-                    gt_boxes,
-                    fn_penalty_exponent=fn_penalty_exponent,
-                    fp_penalty_exponent=fp_penalty_exponent,
-                )
+        if effective_skill == "point":
+            output = rollout.output
+            pred_points = output.points if isinstance(output, PointOutput) else []
+            reward = _reward_f1_points(
+                pred_points,
+                gt_boxes,
+                fn_penalty_exponent=fn_penalty_exponent,
+                fp_penalty_exponent=fp_penalty_exponent,
             )
         else:
-            reward = (
-                _reward_f1_weighted(
+            output = rollout.output
+            pred_boxes = output.objects if isinstance(output, DetectOutput) else []
+            if reward_metric == "miou":
+                reward = _reward_miou(
                     pred_boxes,
                     gt_boxes,
                     fn_penalty_exponent=fn_penalty_exponent,
                     fp_penalty_exponent=fp_penalty_exponent,
                 )
-            )
+            else:
+                reward = _reward_f1_weighted(
+                    pred_boxes,
+                    gt_boxes,
+                    fn_penalty_exponent=fn_penalty_exponent,
+                    fp_penalty_exponent=fp_penalty_exponent,
+                )
         if is_negative_task:
             reward *= float(neg_reward_weight)
         rewards.append(float(reward))
@@ -887,7 +955,7 @@ def _is_rate_limit_error(exc: Exception) -> bool:
 def _rollouts_batch_with_retry(
     *,
     finetune,
-    requests: list[DetectRequest],
+    requests: list[DetectRequest | PointRequest],
     num_rollouts: int,
     max_workers: int,
     retries: int,
@@ -934,6 +1002,7 @@ def _evaluate(
     top_p: float,
     max_tokens: int,
     max_objects: int,
+    skill: str,
 ) -> dict[str, float]:
     tasks: list[TaskSample] = []
     total = 0
@@ -942,6 +1011,7 @@ def _evaluate(
     total_tp = 0
     total_fp = 0
     total_fn = 0
+    effective_skill = (skill or "detect").strip().lower()
 
     def _drain_batch(batch: list[TaskSample]) -> None:
         nonlocal total, total_f1, total_miou, total_tp, total_fp, total_fn
@@ -950,19 +1020,33 @@ def _evaluate(
         chunk_size = max(1, min(max_workers, len(batch)))
         for offset in range(0, len(batch), chunk_size):
             chunk = batch[offset : offset + chunk_size]
-            requests = [
-                DetectRequest(
-                    object_name=item.prompt,
-                    image_url=_to_data_url(item.image, quality=92),
-                    settings=DetectSettings(
-                        temperature=temperature,
-                        top_p=top_p,
-                        max_tokens=max_tokens,
-                        max_objects=max_objects,
-                    ),
-                )
-                for item in chunk
-            ]
+            if effective_skill == "point":
+                requests = [
+                    PointRequest(
+                        object_name=item.prompt,
+                        image_url=_to_data_url(item.image, quality=92),
+                        settings=PointSettings(
+                            temperature=temperature,
+                            top_p=top_p,
+                            max_tokens=max_tokens,
+                        ),
+                    )
+                    for item in chunk
+                ]
+            else:
+                requests = [
+                    DetectRequest(
+                        object_name=item.prompt,
+                        image_url=_to_data_url(item.image, quality=92),
+                        settings=DetectSettings(
+                            temperature=temperature,
+                            top_p=top_p,
+                            max_tokens=max_tokens,
+                            max_objects=max_objects,
+                        ),
+                    )
+                    for item in chunk
+                ]
             try:
                 results = _rollouts_batch_with_retry(
                     finetune=finetune,
@@ -984,11 +1068,34 @@ def _evaluate(
                 )
 
             for item, result in zip(chunk, results):
-                pred = result.rollouts[0].output.objects if result.rollouts else []
-                pred = pred or []
-                total_f1 += _reward_f1(pred, item.gt_boxes)
-                total_miou += _reward_miou(pred, item.gt_boxes)
-                tp, fp, fn = _count_tp_fp_fn(pred, item.gt_boxes)
+                if not result.rollouts:
+                    if effective_skill == "point":
+                        pred_points: list[PointAnnotation] = []
+                        total_f1 += _reward_f1_points(pred_points, item.gt_boxes)
+                        tp, fp, fn = _count_tp_fp_fn_points(pred_points, item.gt_boxes)
+                    else:
+                        pred_boxes: list[DetectAnnotation] = []
+                        total_f1 += _reward_f1(pred_boxes, item.gt_boxes)
+                        total_miou += _reward_miou(pred_boxes, item.gt_boxes)
+                        tp, fp, fn = _count_tp_fp_fn(pred_boxes, item.gt_boxes)
+                    total_tp += tp
+                    total_fp += fp
+                    total_fn += fn
+                    total += 1
+                    continue
+
+                rollout0 = result.rollouts[0]
+                if effective_skill == "point":
+                    output = rollout0.output
+                    pred_points = output.points if isinstance(output, PointOutput) else []
+                    total_f1 += _reward_f1_points(pred_points, item.gt_boxes)
+                    tp, fp, fn = _count_tp_fp_fn_points(pred_points, item.gt_boxes)
+                else:
+                    output = rollout0.output
+                    pred_boxes = output.objects if isinstance(output, DetectOutput) else []
+                    total_f1 += _reward_f1(pred_boxes, item.gt_boxes)
+                    total_miou += _reward_miou(pred_boxes, item.gt_boxes)
+                    tp, fp, fn = _count_tp_fp_fn(pred_boxes, item.gt_boxes)
                 total_tp += tp
                 total_fp += fp
                 total_fn += fn
@@ -1146,6 +1253,12 @@ def main() -> None:
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--max-objects", type=int, default=50)
+    parser.add_argument(
+        "--skill",
+        choices=["detect", "point"],
+        default="detect",
+        help="Which Moondream vision skill to train/eval against. In 'point' mode, a prediction counts as correct if the returned point lies inside any GT bbox.",
+    )
     parser.add_argument(
         "--reward-metric",
         choices=["f1", "miou"],
@@ -1403,7 +1516,7 @@ def main() -> None:
         print(f"warning: {numeric_msg}")
 
     if not args.finetune_id and not args.finetune_name:
-        args.finetune_name = f"pid-icons-detect-{_random_suffix()}"
+        args.finetune_name = f"pid-icons-{args.skill}-{_random_suffix()}"
 
     expected_tasks = args.num_steps * args.batch_size
     if total_train_rows is not None:
@@ -1468,6 +1581,7 @@ def main() -> None:
             "eval_top_p": args.eval_top_p,
             "max_tokens": args.max_tokens,
             "max_objects": args.max_objects,
+            "skill": args.skill,
             "reward_metric": args.reward_metric,
             "seed": args.seed,
             "off_policy": args.off_policy,
@@ -1576,6 +1690,7 @@ def main() -> None:
                 top_p=args.eval_top_p,
                 max_tokens=args.max_tokens,
                 max_objects=args.max_objects,
+                skill=args.skill,
             )
             event_payload.update(eval_metrics)
             event_payload["eval_event_success"] = 1
@@ -1595,8 +1710,10 @@ def main() -> None:
         print("running baseline eval before training...")
         baseline_metrics = _run_and_log_eval(trigger="baseline", step_for_log=baseline_step)
         if baseline_metrics is not None:
-            baseline_eval_miou = float(baseline_metrics.get("eval_miou", 0.0))
-            run.summary["baseline_eval_miou"] = baseline_eval_miou
+            metric_key = "eval_miou" if args.skill == "detect" else "eval_f1"
+            baseline_eval_miou = float(baseline_metrics.get(metric_key, 0.0))
+            run.summary[f"baseline_{metric_key}"] = baseline_eval_miou
+            run.summary["baseline_metric_key"] = metric_key
             print(
                 f"baseline eval step {baseline_step} tasks={baseline_metrics['eval_tasks']} "
                 f"miou={baseline_metrics['eval_miou']:.4f} f1={baseline_metrics['eval_f1']:.4f} "
@@ -1609,19 +1726,33 @@ def main() -> None:
 
         batch = [_next_task() for _ in range(args.batch_size)]
 
-        requests = [
-            DetectRequest(
-                object_name=item.prompt,
-                image_url=_to_data_url(item.image, quality=92),
-                settings=DetectSettings(
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    max_tokens=args.max_tokens,
-                    max_objects=args.max_objects,
-                ),
-            )
-            for item in batch
-        ]
+        if args.skill == "point":
+            requests = [
+                PointRequest(
+                    object_name=item.prompt,
+                    image_url=_to_data_url(item.image, quality=92),
+                    settings=PointSettings(
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        max_tokens=args.max_tokens,
+                    ),
+                )
+                for item in batch
+            ]
+        else:
+            requests = [
+                DetectRequest(
+                    object_name=item.prompt,
+                    image_url=_to_data_url(item.image, quality=92),
+                    settings=DetectSettings(
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        max_tokens=args.max_tokens,
+                        max_objects=args.max_objects,
+                    ),
+                )
+                for item in batch
+            ]
 
         try:
             rollout_start = time.monotonic()
@@ -1654,6 +1785,7 @@ def main() -> None:
             rewards = _rewards_for_rollouts(
                 rollouts,
                 item.gt_boxes,
+                skill=args.skill,
                 reward_metric=args.reward_metric,
                 fn_penalty_exponent=args.fn_penalty_exponent,
                 fp_penalty_exponent=args.fp_penalty_exponent,
@@ -1680,10 +1812,18 @@ def main() -> None:
                     replace_idx = int(np.argmin(np.asarray(rewards, dtype=np.float32)))
                     old_rollout = rollouts[replace_idx]
                     replacement_objects = list(item.gt_boxes)
+                    replacement_points = [
+                        PointAnnotation(x=(box.x_min + box.x_max) / 2.0, y=(box.y_min + box.y_max) / 2.0)
+                        for box in replacement_objects
+                    ]
                     rollouts[replace_idx] = Rollout(
                         skill=old_rollout.skill,
                         finish_reason=old_rollout.finish_reason,
-                        output=DetectOutput(objects=replacement_objects),
+                        output=(
+                            PointOutput(points=replacement_points)
+                            if args.skill == "point"
+                            else DetectOutput(objects=replacement_objects)
+                        ),
                         answer_tokens=list(old_rollout.answer_tokens),
                         thinking_tokens=list(old_rollout.thinking_tokens),
                         coords=list(old_rollout.coords),
@@ -1775,9 +1915,11 @@ def main() -> None:
             eval_metrics = _run_and_log_eval(trigger="periodic", step_for_log=global_step)
             if eval_metrics is None:
                 continue
+            metric_key = "eval_miou" if args.skill == "detect" else "eval_f1"
             if baseline_eval_miou is not None:
-                eval_metrics["eval_miou_delta_vs_baseline"] = float(eval_metrics["eval_miou"]) - baseline_eval_miou
-                wandb.log({"eval_miou_delta_vs_baseline": eval_metrics["eval_miou_delta_vs_baseline"]}, step=global_step)
+                delta_key = f"{metric_key}_delta_vs_baseline"
+                eval_metrics[delta_key] = float(eval_metrics.get(metric_key, 0.0)) - baseline_eval_miou
+                wandb.log({delta_key: eval_metrics[delta_key]}, step=global_step)
             print(
                 f"eval step {global_step} tasks={eval_metrics['eval_tasks']} "
                 f"miou={eval_metrics['eval_miou']:.4f} f1={eval_metrics['eval_f1']:.4f} "
@@ -1785,7 +1927,7 @@ def main() -> None:
                 f"updates={successful_updates}"
             )
 
-            metric = float(eval_metrics["eval_miou"])
+            metric = float(eval_metrics.get(metric_key, 0.0))
             if best_metric is None or metric > best_metric:
                 best_metric = metric
                 best_step = global_step
@@ -1797,7 +1939,9 @@ def main() -> None:
     finetune.save_checkpoint()
     if best_step is not None:
         run.summary["best_step"] = best_step
-        run.summary["best_eval_miou"] = best_metric
+        metric_key = "eval_miou" if args.skill == "detect" else "eval_f1"
+        run.summary[f"best_{metric_key}"] = best_metric
+        run.summary["best_metric_key"] = metric_key
     final_usage = _usage_snapshot(usage, total_train_rows=total_train_rows, top_k=args.usage_top_k)
     _print_usage_snapshot(final_usage, prefix="usage final")
     run.summary["rows_seen"] = int(final_usage["rows_seen"])
@@ -1818,7 +1962,7 @@ def main() -> None:
 
     print(
         f"done. finetune_id={finetune.finetune_id} "
-        f"best_step={best_step} best_eval_miou={best_metric}"
+        f"best_step={best_step} best_metric={best_metric}"
     )
 
 

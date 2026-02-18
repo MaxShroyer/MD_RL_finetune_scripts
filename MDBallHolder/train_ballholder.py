@@ -13,8 +13,10 @@ import json
 import os
 import random
 import string
+import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, List, Optional
 
 import numpy as np
@@ -23,6 +25,11 @@ from datasets import Dataset, DatasetDict, get_dataset_split_names, load_dataset
 from dotenv import load_dotenv
 from PIL import Image, ImageEnhance
 from scipy.optimize import linear_sum_assignment
+
+# Ensure repo-root imports (tuna_sdk) work when this file is run directly.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from tuna_sdk import (
     DetectAnnotation,
@@ -953,10 +960,14 @@ def _evaluate(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="RL finetune Moondream for ball-holder detection.")
-    parser.add_argument("--api-key", default=os.environ.get("MOONDREAM_API_KEY"))
-    parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN"))
+    # NOTE: Keep these defaults as None so that `--env-file` (dotenv) can supply
+    # values reliably. If we default to `os.environ[...]` here, argparse captures
+    # the pre-dotenv environment and `load_dotenv(..., override=False)` won't
+    # update already-populated args.
+    parser.add_argument("--api-key", default=None)
+    parser.add_argument("--hf-token", default=None)
     parser.add_argument("--env-file", "--env", default=_repo_relative(".env"))
-    parser.add_argument("--base-url", default=os.environ.get("TUNA_BASE_URL", "https://api.moondream.ai/v1"))
+    parser.add_argument("--base-url", default=None)
 
     parser.add_argument("--dataset-name", default=DEFAULT_DATASET)
     parser.add_argument("--dataset-path", default="", help="Optional local dataset path from save_to_disk().")
@@ -1016,6 +1027,8 @@ def main() -> None:
         args.api_key = os.environ.get("MOONDREAM_API_KEY")
     if not args.hf_token:
         args.hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    if not args.base_url:
+        args.base_url = os.environ.get("TUNA_BASE_URL", "https://api.moondream.ai/v1")
 
     if not args.api_key:
         raise ValueError("MOONDREAM_API_KEY is required")

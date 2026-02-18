@@ -13,10 +13,12 @@ import base64
 import io
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, List, Optional
 
 import numpy as np
@@ -25,6 +27,11 @@ from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 from scipy.optimize import linear_sum_assignment
 
+# Ensure repo-root imports (tuna_sdk) work when this file is run directly.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from tuna_sdk import DetectRequest, DetectSettings, TunaClient
 from tuna_sdk.errors import TunaAPIError, TunaNetworkError
 
@@ -32,6 +39,7 @@ from tuna_sdk.errors import TunaAPIError, TunaNetworkError
 DEFAULT_DATASET = "maxs-m87/Ball-Holder-splits-v1"
 DEFAULT_OBJECT_NAME = "Player with ball in hand"
 DEFAULT_MODEL = "moondream3-preview"
+DEFAULT_API_BASE = "https://api-staging.moondream.ai/v1"
 
 
 @dataclass(frozen=True)
@@ -73,6 +81,20 @@ def _build_auth_headers(api_key: str) -> dict[str, str]:
         ),
     }
     return headers
+
+
+def _normalize_api_base(api_base: str) -> str:
+    """Normalize an API base URL to the root /v1 prefix.
+
+    Historically some scripts used a base ending in "/v1/tuning". That breaks the
+    standard inference endpoint (/v1/detect) and also double-prefixes tuna paths
+    (e.g. /v1/tuning/tuning/...).
+    """
+
+    base = (api_base or "").strip().rstrip("/")
+    if base.endswith("/tuning"):
+        base = base[: -len("/tuning")].rstrip("/")
+    return base
 
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:
@@ -294,9 +316,64 @@ def _call_detect_api(
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8") if exc.fp else ""
         detail = error_body.strip() or str(exc.reason)
-        raise RuntimeError(f"HTTP {exc.code} from {url}: {detail}") from exc
+        request_id = None
+        try:
+            request_id = exc.headers.get("x-request-id")
+        except Exception:
+            request_id = None
+        suffix = f" (x-request-id={request_id})" if request_id else ""
+        raise RuntimeError(f"HTTP {exc.code} from {url}: {detail}{suffix}") from exc
     parsed = json.loads(body) if body else {}
     return _extract_pred_boxes(parsed)
+
+
+def _list_saved_checkpoint_steps(*, api_key: str, api_base: str, finetune_id: str, max_pages: int = 20) -> List[int]:
+    client = TunaClient(api_key=api_key, base_url=api_base)
+    steps: List[int] = []
+    cursor: Optional[str] = None
+    pages = 0
+    try:
+        while True:
+            page = client.list_checkpoints(finetune_id, limit=100, cursor=cursor)
+            steps.extend([c.step for c in page.checkpoints])
+            pages += 1
+            if not page.has_more or not page.next_cursor:
+                break
+            if pages >= max_pages:
+                break
+            cursor = page.next_cursor
+    finally:
+        client.close()
+    return steps
+
+
+def _resolve_checkpoint_step(
+    *,
+    api_key: str,
+    api_base: str,
+    finetune_id: str,
+    checkpoint_step: object,
+) -> Optional[int]:
+    if checkpoint_step is None:
+        return None
+    if isinstance(checkpoint_step, int):
+        return checkpoint_step
+    text = str(checkpoint_step).strip().lower()
+    if not text:
+        return None
+    if text == "latest":
+        steps = _list_saved_checkpoint_steps(api_key=api_key, api_base=api_base, finetune_id=finetune_id)
+        if not steps:
+            raise ValueError(
+                f"No saved checkpoints found for finetune {finetune_id}. "
+                "Only saved checkpoints can be used for /detect. "
+                "Save one first via POST /v1/tuning/finetunes/:finetuneId/checkpoints/save."
+            )
+        return max(steps)
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise ValueError("--checkpoint-step must be an integer, or 'latest'") from exc
 
 
 def _call_tuning_rollouts(
@@ -533,7 +610,7 @@ def _evaluate_model(
     args: argparse.Namespace,
     model: str,
     finetune_id: str,
-    checkpoint_step: Optional[int],
+    checkpoint_step: object,
     inference_mode: str,
     base_model: str,
     viz_dir: Optional[str],
@@ -541,15 +618,25 @@ def _evaluate_model(
     dataset_path = args.dataset_path.strip() or None
     model = model.strip()
     finetune_id = finetune_id.strip()
+    resolved_checkpoint_step = None
+    if finetune_id:
+        resolved_checkpoint_step = _resolve_checkpoint_step(
+            api_key=args.api_key,
+            api_base=args.api_base,
+            finetune_id=finetune_id,
+            checkpoint_step=checkpoint_step,
+        )
+    else:
+        resolved_checkpoint_step = None
 
-    if checkpoint_step is not None and checkpoint_step < 0:
+    if resolved_checkpoint_step is not None and resolved_checkpoint_step < 0:
         raise ValueError("--checkpoint-step must be >= 0")
-    if checkpoint_step is not None and not finetune_id:
+    if resolved_checkpoint_step is not None and not finetune_id:
         raise ValueError("--checkpoint-step requires --finetune-id")
 
     resolved_mode = inference_mode
     if resolved_mode == "auto":
-        if checkpoint_step is not None:
+        if resolved_checkpoint_step is not None:
             resolved_mode = "detect_api"
         elif finetune_id and not model:
             resolved_mode = "tuning_interface"
@@ -557,8 +644,8 @@ def _evaluate_model(
             resolved_mode = "detect_api"
 
     if resolved_mode == "detect_api":
-        if not model and finetune_id and checkpoint_step is not None:
-            model = f"{base_model.rstrip('/')}/{finetune_id}@{checkpoint_step}"
+        if not model and finetune_id and resolved_checkpoint_step is not None:
+            model = f"{base_model.rstrip('/')}/{finetune_id}@{resolved_checkpoint_step}"
         if not model:
             raise ValueError(
                 "detect_api mode requires --model, or both --finetune-id and --checkpoint-step."
@@ -566,7 +653,7 @@ def _evaluate_model(
     elif resolved_mode == "tuning_interface":
         if not finetune_id:
             raise ValueError("tuning_interface mode requires --finetune-id")
-        if checkpoint_step is not None:
+        if resolved_checkpoint_step is not None:
             raise ValueError(
                 "--checkpoint-step is not supported in tuning_interface mode. "
                 "Use --inference-mode detect_api to evaluate a saved checkpoint step."
@@ -577,6 +664,25 @@ def _evaluate_model(
     if resolved_mode == "tuning_interface":
         client = TunaClient(api_key=args.api_key, base_url=args.api_base)
         finetune = client.get_finetune(finetune_id)
+    elif finetune_id and resolved_checkpoint_step is not None:
+        try:
+            steps = _list_saved_checkpoint_steps(
+                api_key=args.api_key,
+                api_base=args.api_base,
+                finetune_id=finetune_id,
+            )
+            if steps and resolved_checkpoint_step not in set(steps):
+                shown = ", ".join(str(s) for s in steps[-20:]) if len(steps) > 20 else ", ".join(str(s) for s in steps)
+                raise ValueError(
+                    f"Requested checkpoint step {resolved_checkpoint_step} for finetune {finetune_id} "
+                    f"but it is not in the saved checkpoints list. Saved steps: [{shown}]. "
+                    "Only saved checkpoints can be used for /detect."
+                )
+        except (TunaAPIError, TunaNetworkError) as exc:
+            print(
+                f"{label}: warning: could not validate checkpoint step via /v1/tuning "
+                f"({type(exc).__name__}: {exc}). Continuing with /detect."
+            )
 
     total = 0
     total_miou = 0.0
@@ -789,7 +895,7 @@ def _evaluate_model(
         "label": label,
         "model": model or None,
         "finetune_id": finetune_id or None,
-        "checkpoint_step": checkpoint_step,
+        "checkpoint_step": resolved_checkpoint_step,
         "inference_mode": resolved_mode,
         "dataset_name": args.dataset_name,
         "dataset_path": dataset_path,
@@ -815,7 +921,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark ball-holder detection on unseen split.")
     parser.add_argument("--api-key", default=os.environ.get("MOONDREAM_API_KEY"))
     parser.add_argument("--env-file", "--env", default=_repo_relative(".env"))
-    parser.add_argument("--api-base", default="https://api.moondream.ai/v1")
+    parser.add_argument(
+        "--api-base",
+        default=None,
+        help=(
+            "Moondream API base URL (should end with '/v1'). "
+            "If you pass a legacy value ending with '/v1/tuning', it will be normalized."
+        ),
+    )
     parser.add_argument("--baseline-model", default=DEFAULT_MODEL)
     parser.add_argument(
         "--skip-baseline",
@@ -837,10 +950,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--checkpoint-step",
-        type=int,
+        type=str,
         default=None,
         help=(
-            "Checkpoint step for finetuned model inference via /detect. "
+            "Checkpoint step for finetuned model inference via /detect (integer), or 'latest'. "
             "When set with --finetune-id, model is built as moondream3-preview/<finetune_id>@<step>."
         ),
     )
@@ -908,6 +1021,16 @@ def main() -> None:
         args.hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
     if not args.api_key:
         raise ValueError("MOONDREAM_API_KEY is required")
+
+    if not args.api_base:
+        args.api_base = (
+            os.environ.get("TUNA_BASE_URL")
+            or os.environ.get("MOONDREAM_API_BASE")
+            or DEFAULT_API_BASE
+        )
+    args.api_base = _normalize_api_base(args.api_base)
+    if not args.api_base:
+        raise ValueError("--api-base must not be empty")
 
     has_candidate = bool(args.model.strip() or args.finetune_id.strip())
     if args.skip_baseline and not has_candidate:

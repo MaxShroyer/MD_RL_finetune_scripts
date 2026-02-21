@@ -348,8 +348,11 @@ def _group_boxes_by_class(boxes: list[ClassBox]) -> dict[str, tuple[str, list[De
     return grouped
 
 
-def _prompt_for_class(class_name: str) -> str:
-    # This string is sent as the `detect` "object" to Moondream. Keep it aligned with inference/benchmark usage.
+def _prompt_for_class(class_name: str, *, style: str = "detect_phrase") -> str:
+    normalized_style = (style or "detect_phrase").strip().lower()
+    if normalized_style == "class_name":
+        return class_name
+    # This string is sent as the `detect`/`point` "object" to Moondream.
     return f"{class_name} icon or icons"
 
 
@@ -360,6 +363,7 @@ def _tasks_from_base_sample(
     rng: random.Random,
     neg_prompts_per_empty: int,
     neg_prompts_per_nonempty: int,
+    prompt_style: str = "detect_phrase",
 ) -> list[TaskSample]:
     tasks: list[TaskSample] = []
     grouped = _group_boxes_by_class(sample.boxes)
@@ -370,7 +374,7 @@ def _tasks_from_base_sample(
             tasks.append(
                 TaskSample(
                     image=sample.image,
-                    prompt=_prompt_for_class(class_name),
+                    prompt=_prompt_for_class(class_name, style=prompt_style),
                     gt_boxes=list(boxes),
                     class_name=class_name,
                     is_positive=True,
@@ -385,7 +389,7 @@ def _tasks_from_base_sample(
                 tasks.append(
                     TaskSample(
                         image=sample.image,
-                        prompt=_prompt_for_class(class_name),
+                        prompt=_prompt_for_class(class_name, style=prompt_style),
                         gt_boxes=[],
                         class_name=class_name,
                         is_positive=False,
@@ -408,7 +412,7 @@ def _tasks_from_base_sample(
         tasks.append(
             TaskSample(
                 image=sample.image,
-                prompt=_prompt_for_class(class_name),
+                prompt=_prompt_for_class(class_name, style=prompt_style),
                 gt_boxes=[],
                 class_name=class_name,
                 is_positive=False,
@@ -1003,6 +1007,7 @@ def _evaluate(
     max_tokens: int,
     max_objects: int,
     skill: str,
+    point_prompt_style: str,
 ) -> dict[str, float]:
     tasks: list[TaskSample] = []
     total = 0
@@ -1111,6 +1116,7 @@ def _evaluate(
             rng=rng,
             neg_prompts_per_empty=neg_prompts_per_empty,
             neg_prompts_per_nonempty=neg_prompts_per_nonempty,
+            prompt_style=point_prompt_style,
         )
         for task in task_list:
             tasks.append(task)
@@ -1236,14 +1242,14 @@ def main() -> None:
 
     parser.add_argument("--finetune-id", default="")
     parser.add_argument("--finetune-name", default="")
-    parser.add_argument("--rank", type=int, default=8)
+    parser.add_argument("--rank", type=int, default=16)
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--buffer-size", type=int, default=100)
     parser.add_argument("--num-steps", type=int, default=100)
     parser.add_argument("--resume-step", type=int, default=0)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--group-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--group-size", type=int, default=6)
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--max-workers", type=int, default=4)
     parser.add_argument("--rollout-retries", type=int, default=2)
@@ -1264,6 +1270,12 @@ def main() -> None:
         choices=["f1", "miou"],
         default="f1",
         help="Training reward metric for rollouts. Use 'f1' to focus optimization on detection F1.",
+    )
+    parser.add_argument(
+        "--point-prompt-style",
+        choices=["detect_phrase", "class_name"],
+        default="detect_phrase",
+        help="Prompt style for class-conditional point training/eval tasks.",
     )
 
     parser.add_argument("--off-policy", action="store_true")
@@ -1301,6 +1313,33 @@ def main() -> None:
         default=0.5,
         help="Scale factor applied to rewards for negative tasks (no GT boxes). Range: (0, 1].",
     )
+    parser.add_argument(
+        "--use-recall-first-preset",
+        action="store_true",
+        help=(
+            "Apply recall-first point defaults: lr=5e-4, pos_task_prob=0.995, "
+            "neg_prompts_per_nonempty=0, neg_prompts_per_empty=1, neg_reward_weight=0.15, "
+            "fn_penalty_exponent=2.0, fp_penalty_exponent=1.0." 
+        ),
+    )
+    parser.add_argument(
+        "--recall-gate-step",
+        type=int,
+        default=40,
+        help="First eval step at/after which recall TP gate is checked.",
+    )
+    parser.add_argument(
+        "--recall-drop-threshold",
+        type=float,
+        default=0.25,
+        help="Maximum allowed TP drop vs baseline for recall gate. 0.25 means <=25%% drop.",
+    )
+    parser.add_argument(
+        "--f1-improvement-target",
+        type=float,
+        default=0.01,
+        help="Required best eval_f1 improvement over baseline eval_f1.",
+    )
     parser.add_argument("--augment-prob", type=float, default=0.5)
     parser.add_argument("--eval-temperature", type=float, default=0.0)
     parser.add_argument("--eval-top-p", type=float, default=1.0)
@@ -1325,11 +1364,27 @@ def main() -> None:
     parser.add_argument("--wandb-run-name", default="")
     args = parser.parse_args()
 
+    if args.use_recall_first_preset:
+        args.lr = 5e-4
+        args.pos_task_prob = 0.995
+        args.neg_prompts_per_nonempty = 0
+        args.neg_prompts_per_empty = 1
+        args.neg_reward_weight = 0.15
+        args.fn_penalty_exponent = 2.0
+        args.fp_penalty_exponent = 1.0
+        print(
+            "applied recall-first preset: "
+            "lr=5e-4 pos_task_prob=0.995 neg_prompts_per_nonempty=0 "
+            "neg_prompts_per_empty=1 neg_reward_weight=0.15 fn_exp=2.0 fp_exp=1.0"
+        )
+
     load_dotenv(args.env_file, override=False)
     if not args.api_key:
         args.api_key = os.environ.get("MOONDREAM_API_KEY")
     if not args.hf_token:
         args.hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    if not args.base_url:
+        args.base_url = os.environ.get("TUNA_BASE_URL", "https://api.moondream.ai/v1")
 
     if not args.api_key:
         raise ValueError("MOONDREAM_API_KEY is required")
@@ -1360,6 +1415,12 @@ def main() -> None:
         raise ValueError("--rollout-retries must be >= 0")
     if args.rollout_retry_backoff_s <= 0.0:
         raise ValueError("--rollout-retry-backoff-s must be > 0")
+    if args.recall_gate_step < 0:
+        raise ValueError("--recall-gate-step must be >= 0")
+    if not (0.0 <= args.recall_drop_threshold < 1.0):
+        raise ValueError("--recall-drop-threshold must be in [0, 1)")
+    if args.f1_improvement_target < 0.0:
+        raise ValueError("--f1-improvement-target must be >= 0")
 
     dataset_path = args.dataset_path.strip()
     dataset_name = args.dataset_name.strip()
@@ -1541,6 +1602,9 @@ def main() -> None:
         f"eval_every={args.eval_every} save_every={args.save_every} "
         f"off_policy={args.off_policy}"
     )
+    effective_point_prompt_style = args.point_prompt_style if args.skill == "point" else "detect_phrase"
+    if args.skill != "point" and args.point_prompt_style != "detect_phrase":
+        print("warning: --point-prompt-style is only applied when --skill=point; using detect_phrase.")
 
     client = TunaClient(api_key=args.api_key, base_url=args.base_url)
     if args.finetune_id:
@@ -1582,6 +1646,8 @@ def main() -> None:
             "max_tokens": args.max_tokens,
             "max_objects": args.max_objects,
             "skill": args.skill,
+            "point_prompt_style": args.point_prompt_style,
+            "effective_point_prompt_style": effective_point_prompt_style,
             "reward_metric": args.reward_metric,
             "seed": args.seed,
             "off_policy": args.off_policy,
@@ -1593,6 +1659,10 @@ def main() -> None:
             "fp_penalty_exponent": args.fp_penalty_exponent,
             "pos_task_prob": args.pos_task_prob,
             "neg_reward_weight": args.neg_reward_weight,
+            "use_recall_first_preset": args.use_recall_first_preset,
+            "recall_gate_step": args.recall_gate_step,
+            "recall_drop_threshold": args.recall_drop_threshold,
+            "f1_improvement_target": args.f1_improvement_target,
             "allow_duplicate_class_names": args.allow_duplicate_class_names,
             "fail_on_numeric_class_names": args.fail_on_numeric_class_names,
             "duplicate_class_name_count": len(duplicate_class_names),
@@ -1627,6 +1697,7 @@ def main() -> None:
                 rng=rng,
                 neg_prompts_per_empty=args.neg_prompts_per_empty,
                 neg_prompts_per_nonempty=args.neg_prompts_per_nonempty,
+                prompt_style=effective_point_prompt_style,
             )
             if not new_tasks:
                 continue
@@ -1661,7 +1732,12 @@ def main() -> None:
     best_metric: Optional[float] = None
     best_step: Optional[int] = None
     successful_updates = args.resume_step
-    baseline_eval_miou: Optional[float] = None
+    baseline_eval_metric: Optional[float] = None
+    baseline_eval_tp: Optional[float] = None
+    recall_gate_pass: Optional[bool] = None
+    recall_gate_eval_step: Optional[int] = None
+    recall_gate_eval_tp: Optional[float] = None
+    recall_gate_min_tp: Optional[float] = None
     eval_events_logged = 0
 
     def _run_and_log_eval(*, trigger: str, step_for_log: int) -> Optional[dict[str, float]]:
@@ -1691,6 +1767,7 @@ def main() -> None:
                 max_tokens=args.max_tokens,
                 max_objects=args.max_objects,
                 skill=args.skill,
+                point_prompt_style=effective_point_prompt_style,
             )
             event_payload.update(eval_metrics)
             event_payload["eval_event_success"] = 1
@@ -1711,8 +1788,10 @@ def main() -> None:
         baseline_metrics = _run_and_log_eval(trigger="baseline", step_for_log=baseline_step)
         if baseline_metrics is not None:
             metric_key = "eval_miou" if args.skill == "detect" else "eval_f1"
-            baseline_eval_miou = float(baseline_metrics.get(metric_key, 0.0))
-            run.summary[f"baseline_{metric_key}"] = baseline_eval_miou
+            baseline_eval_metric = float(baseline_metrics.get(metric_key, 0.0))
+            baseline_eval_tp = float(baseline_metrics.get("eval_tp", 0.0))
+            run.summary[f"baseline_{metric_key}"] = baseline_eval_metric
+            run.summary["baseline_eval_tp"] = baseline_eval_tp
             run.summary["baseline_metric_key"] = metric_key
             print(
                 f"baseline eval step {baseline_step} tasks={baseline_metrics['eval_tasks']} "
@@ -1780,6 +1859,9 @@ def main() -> None:
         off_policy_trigger_low_mean = 0
         off_policy_skipped_high_reward = 0
         off_policy_skipped_high_variance = 0
+        train_tp = 0
+        train_fp = 0
+        train_fn = 0
         for item, result in zip(batch, results):
             rollouts = list(result.rollouts)
             rewards = _rewards_for_rollouts(
@@ -1848,6 +1930,23 @@ def main() -> None:
                     elif reward_std >= args.off_policy_std_thresh:
                         off_policy_skipped_high_variance += 1
 
+            if args.skill == "point":
+                for rollout in rollouts:
+                    output = rollout.output
+                    pred_points = output.points if isinstance(output, PointOutput) else []
+                    tp, fp, fn = _count_tp_fp_fn_points(pred_points, item.gt_boxes)
+                    train_tp += tp
+                    train_fp += fp
+                    train_fn += fn
+            else:
+                for rollout in rollouts:
+                    output = rollout.output
+                    pred_boxes = output.objects if isinstance(output, DetectOutput) else []
+                    tp, fp, fn = _count_tp_fp_fn(pred_boxes, item.gt_boxes)
+                    train_tp += tp
+                    train_fp += fp
+                    train_fn += fn
+
             groups.append(TrainStepGroup(request=result.request, rollouts=rollouts, rewards=rewards))
             all_rewards.extend(rewards)
 
@@ -1864,6 +1963,12 @@ def main() -> None:
         reward_var = float(np.var(all_rewards)) if all_rewards else 0.0
         pos_tasks = sum(1 for item in batch if item.is_positive)
         neg_tasks = len(batch) - pos_tasks
+        precision_denom = train_tp + train_fp
+        recall_denom = train_tp + train_fn
+        micro_denom = (2 * train_tp) + train_fp + train_fn
+        train_precision = 1.0 if precision_denom == 0 else train_tp / precision_denom
+        train_recall = 1.0 if recall_denom == 0 else train_tp / recall_denom
+        train_f1 = 1.0 if micro_denom == 0 else (2 * train_tp) / micro_denom
         rows_seen_fraction = (
             usage.rows_seen / float(total_train_rows)
             if total_train_rows and total_train_rows > 0
@@ -1876,6 +1981,12 @@ def main() -> None:
                 "reward_var": reward_var,
                 "batch_positive_tasks": pos_tasks,
                 "batch_negative_tasks": neg_tasks,
+                "train_tp": train_tp,
+                "train_fp": train_fp,
+                "train_fn": train_fn,
+                "train_precision": train_precision,
+                "train_recall": train_recall,
+                "train_f1": train_f1,
                 "accepted_groups": len(groups),
                 "off_policy_injected": off_policy_injected_total,
                 "off_policy_injected_positive": off_policy_injected_positive,
@@ -1903,6 +2014,7 @@ def main() -> None:
         total_s = time.monotonic() - step_start
         print(
             f"step {global_step} reward={reward_mean:.4f} kl={float(train_out.kl or 0.0):.4f} "
+            f"train_p={train_precision:.3f} train_r={train_recall:.3f} "
             f"pos={pos_tasks} neg={neg_tasks} rollout_s={(rollout_end-rollout_start):.2f} "
             f"train_s={(train_end-train_start):.2f} total_s={total_s:.2f} "
             f"offp={off_policy_injected_total}/{off_policy_considered} updates={successful_updates}"
@@ -1916,10 +2028,34 @@ def main() -> None:
             if eval_metrics is None:
                 continue
             metric_key = "eval_miou" if args.skill == "detect" else "eval_f1"
-            if baseline_eval_miou is not None:
+            if baseline_eval_metric is not None:
                 delta_key = f"{metric_key}_delta_vs_baseline"
-                eval_metrics[delta_key] = float(eval_metrics.get(metric_key, 0.0)) - baseline_eval_miou
+                eval_metrics[delta_key] = float(eval_metrics.get(metric_key, 0.0)) - baseline_eval_metric
                 wandb.log({delta_key: eval_metrics[delta_key]}, step=global_step)
+            if (
+                args.skill == "point"
+                and baseline_eval_tp is not None
+                and recall_gate_pass is None
+                and global_step >= args.recall_gate_step
+            ):
+                recall_gate_eval_step = global_step
+                recall_gate_eval_tp = float(eval_metrics.get("eval_tp", 0.0))
+                recall_gate_min_tp = float(baseline_eval_tp) * (1.0 - float(args.recall_drop_threshold))
+                recall_gate_pass = bool(recall_gate_eval_tp >= recall_gate_min_tp)
+                wandb.log(
+                    {
+                        "recall_gate_step": recall_gate_eval_step,
+                        "recall_gate_eval_tp": recall_gate_eval_tp,
+                        "recall_gate_min_tp": recall_gate_min_tp,
+                        "recall_gate_pass": int(recall_gate_pass),
+                    },
+                    step=global_step,
+                )
+                print(
+                    f"recall gate step {recall_gate_eval_step}: "
+                    f"tp={recall_gate_eval_tp:.1f} min_tp={recall_gate_min_tp:.1f} "
+                    f"pass={recall_gate_pass}"
+                )
             print(
                 f"eval step {global_step} tasks={eval_metrics['eval_tasks']} "
                 f"miou={eval_metrics['eval_miou']:.4f} f1={eval_metrics['eval_f1']:.4f} "
@@ -1937,11 +2073,28 @@ def main() -> None:
             finetune.save_checkpoint()
 
     finetune.save_checkpoint()
+    metric_key = "eval_miou" if args.skill == "detect" else "eval_f1"
+    f1_target_value: Optional[float] = None
+    f1_target_pass: Optional[bool] = None
     if best_step is not None:
         run.summary["best_step"] = best_step
-        metric_key = "eval_miou" if args.skill == "detect" else "eval_f1"
         run.summary[f"best_{metric_key}"] = best_metric
         run.summary["best_metric_key"] = metric_key
+    if metric_key == "eval_f1" and baseline_eval_metric is not None and best_metric is not None:
+        f1_target_value = float(baseline_eval_metric) + float(args.f1_improvement_target)
+        f1_target_pass = bool(float(best_metric) >= f1_target_value)
+        run.summary["f1_target_value"] = f1_target_value
+        run.summary["f1_target_pass"] = int(f1_target_pass)
+    run.summary["f1_target_evaluated"] = int(f1_target_pass is not None)
+    run.summary["recall_gate_evaluated"] = int(recall_gate_pass is not None)
+    if recall_gate_pass is not None:
+        run.summary["recall_gate_pass"] = int(recall_gate_pass)
+    if recall_gate_eval_step is not None:
+        run.summary["recall_gate_eval_step"] = int(recall_gate_eval_step)
+    if recall_gate_eval_tp is not None:
+        run.summary["recall_gate_eval_tp"] = float(recall_gate_eval_tp)
+    if recall_gate_min_tp is not None:
+        run.summary["recall_gate_min_tp"] = float(recall_gate_min_tp)
     final_usage = _usage_snapshot(usage, total_train_rows=total_train_rows, top_k=args.usage_top_k)
     _print_usage_snapshot(final_usage, prefix="usage final")
     run.summary["rows_seen"] = int(final_usage["rows_seen"])
@@ -1962,7 +2115,8 @@ def main() -> None:
 
     print(
         f"done. finetune_id={finetune.finetune_id} "
-        f"best_step={best_step} best_metric={best_metric}"
+        f"best_step={best_step} best_metric={best_metric} "
+        f"recall_gate_pass={recall_gate_pass} f1_target_pass={f1_target_pass}"
     )
 
 

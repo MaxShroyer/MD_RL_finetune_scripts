@@ -17,6 +17,7 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, List, Optional
 
 import numpy as np
@@ -26,7 +27,12 @@ from dotenv import load_dotenv
 from PIL import Image, ImageEnhance
 from scipy.optimize import linear_sum_assignment
 
-TUNA_SDK_PATH = os.environ.get("TUNA_SDK_PATH", "/Users/maxs/Documents/Repos/MD/tuna-sdk-tmp")
+# Ensure repo-root imports (tuna_sdk) work when this file is run directly.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+TUNA_SDK_PATH = os.environ.get("TUNA_SDK_PATH")
 if TUNA_SDK_PATH:
     sdk_src = os.path.join(TUNA_SDK_PATH, "src")
     if os.path.isdir(sdk_src) and sdk_src not in sys.path:
@@ -167,12 +173,26 @@ def _bbox_xyxy_to_box(bbox_xyxy: List[float], width: int, height: int) -> Detect
     )
 
 
-def _parse_statefarm_boxes(answer_boxes: Optional[str], width: int, height: int) -> List[DetectAnnotation]:
+def _parse_statefarm_boxes(answer_boxes: Optional[object], width: int, height: int) -> List[DetectAnnotation]:
     if not answer_boxes:
         return []
-    raw = json.loads(answer_boxes) if isinstance(answer_boxes, str) else answer_boxes
+    raw = answer_boxes
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
     boxes: List[DetectAnnotation] = []
     for item in raw or []:
+        if not isinstance(item, dict):
+            continue
         try:
             x_min = float(item["x_min"])
             y_min = float(item["y_min"])
@@ -249,10 +269,22 @@ def _stream_statefarm_samples(
     buffer_size: int,
     max_boxes: Optional[int],
 ) -> Iterable[Sample]:
+    resolved_split = split
     while True:
-        ds = load_dataset(dataset_name, split=split, streaming=True, token=token)
-        if seed:
-            ds = ds.shuffle(seed=seed, buffer_size=buffer_size)
+        try:
+            ds = load_dataset(dataset_name, split=resolved_split, streaming=True, token=token)
+        except ValueError as exc:
+            if "[" in resolved_split and "]" in resolved_split:
+                base_split = resolved_split.split("[", 1)[0]
+                print(
+                    f"split '{resolved_split}' not supported for streaming; "
+                    f"falling back to '{base_split}'."
+                )
+                resolved_split = base_split
+                ds = load_dataset(dataset_name, split=resolved_split, streaming=True, token=token)
+            else:
+                raise exc
+        ds = ds.shuffle(seed=seed, buffer_size=buffer_size)
         for row in ds:
             image = row["image"].convert("RGB")
             width, height = image.size
@@ -269,7 +301,7 @@ def _format_object_name(name: str, rng: random.Random) -> str:
     else:
         if base and base[0].isalpha():
             base = base[0].upper() + base[1:].lower()
-    if rng.random() < 0.5:
+    if rng.random() < 0.5 and "logo" not in {part.strip(".,:;!?") for part in base.lower().split()}:
         base = f"{base} logo"
     return base
 
@@ -601,7 +633,20 @@ def _iter_eval_samples(
     token: str,
     max_boxes: Optional[int],
 ) -> Iterable[Sample]:
-    ds = load_dataset(dataset_name, split=split, streaming=True, token=token)
+    resolved_split = split
+    try:
+        ds = load_dataset(dataset_name, split=resolved_split, streaming=True, token=token)
+    except ValueError as exc:
+        if "[" in resolved_split and "]" in resolved_split:
+            base_split = resolved_split.split("[", 1)[0]
+            print(
+                f"eval split '{resolved_split}' not supported for streaming; "
+                f"falling back to '{base_split}'."
+            )
+            resolved_split = base_split
+            ds = load_dataset(dataset_name, split=resolved_split, streaming=True, token=token)
+        else:
+            raise exc
     for row in ds:
         image = row["image"].convert("RGB")
         width, height = image.size
@@ -844,6 +889,56 @@ def _make_val_splits(split: str, val_fraction: float) -> tuple[str, str]:
     return train_split, val_split
 
 
+def _list_available_splits(*, dataset_name: str, token: Optional[str]) -> list[str]:
+    try:
+        dataset_obj = load_dataset(dataset_name, streaming=True, token=token)
+    except Exception:
+        return []
+    if hasattr(dataset_obj, "keys"):
+        return list(dataset_obj.keys())
+    return []
+
+
+def _resolve_split_name(split: str, *, available_splits: list[str], kind: str) -> str:
+    if not available_splits:
+        return split
+    if split in available_splits:
+        return split
+    if "[" in split and "]" in split:
+        base_split = split.split("[", 1)[0]
+        if base_split in available_splits:
+            return split
+    raise ValueError(f"{kind} split '{split}' not found. Available splits: {available_splits}")
+
+
+def _resolve_val_split(
+    val_split: str,
+    *,
+    available_splits: list[str],
+    train_split: str,
+) -> Optional[str]:
+    if not available_splits:
+        return None if not val_split or val_split == "auto" else val_split
+
+    train_base_split = train_split.split("[", 1)[0]
+    if not val_split or val_split == "auto":
+        for candidate in ("validation", "val", "valid", "dev", "test"):
+            if candidate in available_splits and candidate != train_base_split:
+                return candidate
+        for candidate in available_splits:
+            if candidate != train_base_split:
+                return candidate
+        return None
+
+    if val_split in available_splits:
+        return val_split
+    if "[" in val_split and "]" in val_split:
+        base_split = val_split.split("[", 1)[0]
+        if base_split in available_splits:
+            return val_split
+    raise ValueError(f"val split '{val_split}' not found. Available splits: {available_splits}")
+
+
 def _default_augment_config() -> AugmentConfig:
     return AugmentConfig(
         flip_p=0.5,
@@ -874,11 +969,11 @@ def _default_augment_config() -> AugmentConfig:
 def main() -> None:
     parser = argparse.ArgumentParser(description="State Farm logo detect finetuning.")
     parser.add_argument("--env-file", "--env", default=".env")
-    parser.add_argument("--api-key", default=os.environ.get("MOONDREAM_API_KEY"))
-    parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN"))
+    parser.add_argument("--api-key", default=None)
+    parser.add_argument("--hf-token", default=None)
     parser.add_argument("--dataset", default=STATEFARM_DATASET)
-    parser.add_argument("--base-url", default=os.environ.get("TUNA_BASE_URL", "https://api.moondream.ai/v1"))
-    parser.add_argument("--detect-base-url", default=os.environ.get("MOONDREAM_BASE_URL"))
+    parser.add_argument("--base-url", default=None)
+    parser.add_argument("--detect-base-url", default=None)
     parser.add_argument("--finetune-name", default=None)
     parser.add_argument("--finetune-id", default=None)
     parser.add_argument("--rank", type=int, default=8)
@@ -897,8 +992,8 @@ def main() -> None:
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument(
         "--val-split",
-        default="validation",
-        help="Validation split name (leave empty to use --val-fraction slicing).",
+        default="auto",
+        help="Validation split name, or 'auto' to pick from dataset splits; falls back to --val-fraction slicing.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--buffer-size", type=int, default=1000)
@@ -923,6 +1018,10 @@ def main() -> None:
         args.api_key = os.environ.get("MOONDREAM_API_KEY")
     if not args.hf_token:
         args.hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    if not args.base_url:
+        args.base_url = os.environ.get("TUNA_BASE_URL", "https://api.moondream.ai/v1")
+    if not args.detect_base_url:
+        args.detect_base_url = os.environ.get("MOONDREAM_BASE_URL")
 
     if not args.api_key:
         raise ValueError("MOONDREAM_API_KEY is required")
@@ -930,16 +1029,36 @@ def main() -> None:
         raise ValueError("HF_TOKEN or HUGGINGFACE_HUB_TOKEN is required for gated datasets")
     if args.resume_step < 0:
         raise ValueError("Resume step must be >= 0")
+    if not (0.0 < args.val_fraction < 1.0):
+        raise ValueError("--val-fraction must be in (0, 1)")
+    if not (0.0 <= args.augment_prob <= 1.0):
+        raise ValueError("--augment-prob must be in [0, 1]")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be > 0")
+    if args.group_size <= 0:
+        raise ValueError("--group-size must be > 0")
+    if args.eval_batch_size <= 0:
+        raise ValueError("--eval-batch-size must be > 0")
+    if args.eval_max_samples is not None and args.eval_max_samples <= 0:
+        raise ValueError("--eval-max-samples must be > 0 when provided")
 
     detect_base_url = args.detect_base_url or args.base_url
     if args.val_json:
         train_split = args.split
         val_split = args.split
-    elif args.val_split:
-        train_split = args.split
-        val_split = args.val_split
     else:
-        train_split, val_split = _make_val_splits(args.split, args.val_fraction)
+        available_splits = _list_available_splits(dataset_name=args.dataset, token=args.hf_token)
+        train_split = _resolve_split_name(args.split, available_splits=available_splits, kind="train")
+        resolved_val = _resolve_val_split(
+            args.val_split,
+            available_splits=available_splits,
+            train_split=train_split,
+        )
+        if resolved_val is None:
+            base_train_split = train_split.split("[", 1)[0]
+            train_split, val_split = _make_val_splits(base_train_split, args.val_fraction)
+        else:
+            val_split = resolved_val
 
     rng = random.Random(args.seed)
     rng_np = np.random.default_rng(args.seed)

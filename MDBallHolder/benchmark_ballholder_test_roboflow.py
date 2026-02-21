@@ -737,14 +737,14 @@ def _parse_class_ids(raw: Optional[str]) -> Optional[set[int]]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark Ball-Holder test split with Roboflow hosted inference.")
     parser.add_argument("--env-file", "--env", default=_repo_relative(".env"))
-    parser.add_argument("--api-key", default=os.environ.get("ROBOFLOW_API_KEY"))
-    parser.add_argument("--api-base", default=os.environ.get("ROBOFLOW_BASE_URL", DEFAULT_ROBOFLOW_BASE_URL))
-    parser.add_argument("--model-id", default=os.environ.get("ROBOFLOW_MODEL_ID", DEFAULT_MODEL_ID))
-    parser.add_argument("--project", default=os.environ.get("ROBOFLOW_PROJECT"))
+    parser.add_argument("--api-key", default=None)
+    parser.add_argument("--api-base", default=None)
+    parser.add_argument("--model-id", default=None)
+    parser.add_argument("--project", default=None)
     parser.add_argument("--version", type=int, default=None)
     parser.add_argument("--image-dir", default=_repo_relative(DEFAULT_IMAGE_DIR))
     parser.add_argument("--label-dir", default=_repo_relative(DEFAULT_LABEL_DIR))
-    parser.add_argument("--class-name", default=os.environ.get("ROBOFLOW_CLASS_NAME"))
+    parser.add_argument("--class-name", default=None)
     parser.add_argument(
         "--allowed-class-ids",
         default=None,
@@ -767,6 +767,14 @@ def main() -> None:
         load_dotenv(args.env_file, override=False)
     if not args.api_key:
         args.api_key = os.environ.get("ROBOFLOW_API_KEY")
+    if not args.api_base:
+        args.api_base = os.environ.get("ROBOFLOW_BASE_URL", DEFAULT_ROBOFLOW_BASE_URL)
+    if not args.model_id:
+        args.model_id = os.environ.get("ROBOFLOW_MODEL_ID") or DEFAULT_MODEL_ID
+    if not args.project:
+        args.project = os.environ.get("ROBOFLOW_PROJECT")
+    if not args.class_name:
+        args.class_name = os.environ.get("ROBOFLOW_CLASS_NAME")
     if args.version is None and os.environ.get("ROBOFLOW_VERSION"):
         try:
             args.version = int(os.environ["ROBOFLOW_VERSION"])

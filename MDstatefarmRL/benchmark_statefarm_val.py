@@ -597,8 +597,8 @@ def _print_metrics(label: str, metrics: dict[str, float]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark State Farm val set.")
     parser.add_argument("--env-file", "--env", default=".env")
-    parser.add_argument("--api-key", default=os.environ.get("MOONDREAM_API_KEY"))
-    parser.add_argument("--api-base", default=os.environ.get("MOONDREAM_BASE_URL", "https://api.moondream.ai/v1"))
+    parser.add_argument("--api-key", default=None)
+    parser.add_argument("--api-base", default=None)
     parser.add_argument("--val-json", default="val/post_train_benchmark/post_train_benchmark.json")
     parser.add_argument("--val-image-dir", default="val/post_train_benchmark/post_train_benchmark")
     parser.add_argument("--object-name", default=OBJECT_NAME)
@@ -629,8 +629,13 @@ def main() -> None:
         load_dotenv(args.env_file, override=False)
     if not args.api_key:
         args.api_key = os.environ.get("MOONDREAM_API_KEY")
+    if not args.api_base:
+        args.api_base = os.environ.get("MOONDREAM_BASE_URL", "https://api.moondream.ai/v1")
     if not args.api_key:
         raise ValueError("MOONDREAM_API_KEY is required")
+    has_checkpoint_candidate = bool(args.finetune_id and args.checkpoint_step is not None)
+    if args.skip_baseline and not has_checkpoint_candidate:
+        raise ValueError("Provide both --finetune-id and --checkpoint-step, or omit --skip-baseline.")
 
     baseline_metrics = None
     if not args.skip_baseline:
@@ -657,7 +662,8 @@ def main() -> None:
         _print_metrics("baseline", baseline_metrics)
 
     checkpoint_viz_dir = None
-    if args.finetune_id and args.checkpoint_step is not None:
+    tuned_metrics = None
+    if has_checkpoint_candidate:
         model = f"{DEFAULT_MODEL}/{args.finetune_id}@{args.checkpoint_step}"
         if args.viz_dir:
             checkpoint_viz_dir = os.path.join(args.viz_dir, "checkpoint", args.finetune_id)
@@ -688,7 +694,7 @@ def main() -> None:
     if args.metrics_json:
         output_payload = {
             "baseline": baseline_metrics,
-            "checkpoint": tuned_metrics if args.finetune_id and args.checkpoint_step is not None else None,
+            "checkpoint": tuned_metrics,
             "config": {
                 "object_name": args.object_name,
                 "iou_threshold": args.iou_threshold,

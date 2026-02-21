@@ -39,7 +39,7 @@ from tuna_sdk.errors import TunaAPIError, TunaNetworkError
 DEFAULT_DATASET = "maxs-m87/Ball-Holder-splits-v1"
 DEFAULT_OBJECT_NAME = "Player with ball in hand"
 DEFAULT_MODEL = "moondream3-preview"
-DEFAULT_API_BASE = "https://api-staging.moondream.ai/v1"
+DEFAULT_API_BASE = "https://api.moondream.ai/v1"
 
 
 @dataclass(frozen=True)

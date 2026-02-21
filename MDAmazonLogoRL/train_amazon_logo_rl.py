@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, List, Optional
 
 import numpy as np
@@ -27,7 +28,12 @@ from dotenv import load_dotenv
 from PIL import Image, ImageEnhance
 from scipy.optimize import linear_sum_assignment
 
-TUNA_SDK_PATH = os.environ.get("TUNA_SDK_PATH", "/Users/maxs/Documents/Repos/MD/tuna-sdk-tmp")
+# Ensure repo-root imports (tuna_sdk) work when this file is run directly.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+TUNA_SDK_PATH = os.environ.get("TUNA_SDK_PATH")
 if TUNA_SDK_PATH:
     sdk_src = os.path.join(TUNA_SDK_PATH, "src")
     if os.path.isdir(sdk_src) and sdk_src not in sys.path:
@@ -172,10 +178,24 @@ def _parse_amazon_boxes(
 ) -> tuple[List[DetectAnnotation], set[str]]:
     if not answer_boxes:
         return [], set()
-    raw = json.loads(answer_boxes) if isinstance(answer_boxes, str) else answer_boxes
+    raw = answer_boxes
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return [], set()
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError:
+            return [], set()
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return [], set()
     boxes: List[DetectAnnotation] = []
     variants: set[str] = set()
     for item in raw or []:
+        if not isinstance(item, dict):
+            continue
         try:
             x_min = float(item["x_min"])
             y_min = float(item["y_min"])
@@ -274,7 +294,7 @@ def _stream_amazon_samples(
             local_ds = dataset_obj
         epoch = 0
         while True:
-            shuffled = local_ds.shuffle(seed=seed + epoch) if seed else local_ds
+            shuffled = local_ds.shuffle(seed=seed + epoch)
             for row in shuffled:
                 image = row["image"].convert("RGB")
                 width, height = image.size
@@ -311,8 +331,7 @@ def _stream_amazon_samples(
                     ds = load_dataset(dataset_name, split=resolved_split, streaming=True, token=token)
                 else:
                     raise exc
-            if seed:
-                ds = ds.shuffle(seed=seed, buffer_size=buffer_size)
+            ds = ds.shuffle(seed=seed, buffer_size=buffer_size)
             for row in ds:
                 image = row["image"].convert("RGB")
                 width, height = image.size
@@ -341,7 +360,7 @@ def _format_object_name(name: str, rng: random.Random) -> str:
     else:
         if base and base[0].isalpha():
             base = base[0].upper() + base[1:].lower()
-    if rng.random() < 0.5:
+    if rng.random() < 0.5 and "logo" not in {part.strip(".,:;!?") for part in base.lower().split()}:
         base = f"{base} logo"
     return base
 
@@ -1156,6 +1175,14 @@ def main() -> None:
         raise ValueError("--off-policy-min-reward must be > 0.0")
     if args.off_policy_reward_scale <= 0.0:
         raise ValueError("--off-policy-reward-scale must be > 0.0")
+    if args.eval_max_samples is not None and args.eval_max_samples <= 0:
+        raise ValueError("--eval-max-samples must be > 0 when provided")
+    if args.eval_batch_size <= 0:
+        raise ValueError("--eval-batch-size must be > 0")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be > 0")
+    if args.group_size <= 0:
+        raise ValueError("--group-size must be > 0")
 
     detect_base_url = args.detect_base_url or args.base_url
 

@@ -411,9 +411,9 @@ def _draw_boxes(image: Image.Image, boxes: List[Box], color: str) -> Image.Image
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate Amazon logo checkpoint.")
     parser.add_argument("--env-file", default=".env")
-    parser.add_argument("--api-key", default=os.environ.get("MOONDREAM_API_KEY"))
-    parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN"))
-    parser.add_argument("--api-base", default=os.environ.get("MOONDREAM_BASE_URL", "https://api.moondream.ai/v1"))
+    parser.add_argument("--api-key", default=None)
+    parser.add_argument("--hf-token", default=None)
+    parser.add_argument("--api-base", default=None)
     parser.add_argument("--dataset-name", default=AMAZON_DATASET)
     parser.add_argument("--dataset-path", default=None)
     parser.add_argument("--finetune-id", default=None)
@@ -446,6 +446,8 @@ def main() -> None:
         args.api_key = os.environ.get("MOONDREAM_API_KEY")
     if not args.hf_token:
         args.hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    if not args.api_base:
+        args.api_base = os.environ.get("MOONDREAM_BASE_URL", "https://api.moondream.ai/v1")
     if not args.api_key:
         raise ValueError("MOONDREAM_API_KEY is required")
 

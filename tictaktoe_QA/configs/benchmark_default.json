@@ -1,0 +1,23 @@
+{
+  "env_file": ".env",
+  "dataset_dir": "synth_dataset/outputs/smoke_full_jsonl",
+  "split": "test",
+  "seed": 42,
+  "max_samples": 0,
+  "task_types": [],
+  "model": "",
+  "finetune_id": "",
+  "checkpoint_step": -1,
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "max_tokens": 256,
+  "reasoning": false,
+  "timeout": 60.0,
+  "retry_429_max_retries": 2,
+  "retry_429_backoff_s": 1.0,
+  "retry_429_max_backoff_s": 8.0,
+  "best_move_optimal_reward": 0.7,
+  "output_json": "",
+  "predictions_jsonl": "",
+  "no_progress": false
+}

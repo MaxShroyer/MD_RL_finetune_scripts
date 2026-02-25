@@ -4,7 +4,7 @@ This folder builds a synthetic tic-tac-toe QA dataset with:
 - deduplicated PNG images (`768x768`)
 - exact main split size (`train/val/test = 40k/5k/5k`)
 - top-50 benchmark tracks (`canonical` + `paraphrase`, all 4 colorways)
-- JSONL and HF `DatasetDict` exports
+- JSONL and HF `DatasetDict` exports, plus HF Hub upload
 
 Benchmark note:
 - `best_move`, `turn_player`, and legal-move tasks use Cloudwalk top-50 states directly.
@@ -25,13 +25,29 @@ pip install -r tictaktoe_QA/synth_dataset/requirements.txt
 python tictaktoe_QA/synth_dataset/build_ttt_qa_dataset.py \
   --output-dir tictaktoe_QA/synth_dataset/outputs/v1 \
   --cache-dir tictaktoe_QA/synth_dataset/cache/cloudwalk \
+  --hf-repo-id <your_hf_username>/tictactoe-qa-v1 \
   --seed 42 \
   --target-states 3000 \
   --target-rows 50000
 ```
 
+By default, the builder loads `tictaktoe_QA/.env` (`--env-file` can override).
+For HF export (default), it writes local HF artifacts and uploads to Hub.
+Set either:
+- `--hf-repo-id ...` on CLI, or
+- `HF_DATASET_REPO_ID=...` in `.env`
+
+`--target-rows` is now configurable (default `50000`).
+Example: `--target-rows 10000` yields an 80/10/10 split target (`8000/1000/1000`) with per-task quotas scaled proportionally.
+
+Optional HF auth vars in `.env`:
+- `HF_TOKEN` (or `HUGGINGFACE_HUB_TOKEN`)
+- `OPENAI_API_KEY` (only used for optional rationale paraphrasing)
+
 Optional rationale LLM paraphrase (train split only, ~20%) uses `OPENAI_API_KEY` and `gpt-4o-mini` by default.
 Disable with `--no-llm`.
+
+Use `--hf-private` to push to a private dataset repo.
 
 If disk is tight, you can export JSONL only:
 
@@ -45,6 +61,7 @@ python tictaktoe_QA/synth_dataset/build_ttt_qa_dataset.py --skip-hf-export
 python tictaktoe_QA/synth_dataset/build_ttt_qa_dataset.py \
   --no-llm \
   --no-network \
+  --skip-hf-export \
   --max-main-rows 500 \
   --max-benchmark-rows 200
 ```

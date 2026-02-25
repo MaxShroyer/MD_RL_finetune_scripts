@@ -5,10 +5,12 @@ import random
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from PIL import Image
 
 from tictaktoe_QA import train_ttt_query_rl as mod
+from tuna_sdk.errors import TunaAPIError
 
 
 class ParsePredictionTests(unittest.TestCase):
@@ -266,6 +268,89 @@ class ConfigPrecedenceTests(unittest.TestCase):
             self.assertEqual(args.max_tokens_by_task["legal_moves_list"], 512)
             self.assertEqual(args.max_tokens_by_task["best_move"], 196)
 
+    def test_unknown_config_key_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text(
+                json.dumps(
+                    {
+                        "dataset_dir": "tictaktoe_QA/synth_dataset/outputs/smoke_full_jsonl",
+                        "resoning": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "Unknown config key"):
+                mod.parse_args(["--config", str(cfg_path)])
+
+    def test_hf_dataset_source_parsing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text(
+                json.dumps(
+                    {
+                        "dataset_source": "hf_hub",
+                        "hf_dataset_repo_id": "maxs-m87/tictactoe-qa-v1",
+                        "hf_dataset_revision": "main",
+                        "checkpoint_avg_splits": ["val", "test"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            args = mod.parse_args(["--config", str(cfg_path)])
+            self.assertEqual(args.dataset_source, "hf_hub")
+            self.assertEqual(args.hf_dataset_repo_id, "maxs-m87/tictactoe-qa-v1")
+            self.assertEqual(args.hf_dataset_revision, "main")
+            self.assertEqual(args.checkpoint_avg_splits, ["val", "test"])
+
+
+class CheckpointRankingTests(unittest.TestCase):
+    def test_rank_checkpoint_eval_history(self) -> None:
+        history = [
+            {"step": 10, "avg_eval_reward_mean": 0.40},
+            {"step": 20, "avg_eval_reward_mean": 0.55},
+            {"step": 30, "avg_eval_reward_mean": 0.50},
+        ]
+        ranked = mod._rank_checkpoint_eval_history(history)
+        self.assertEqual([item["step"] for item in ranked], [20, 30, 10])
+
+    def test_build_checkpoint_ranking_payload(self) -> None:
+        payload = mod._build_checkpoint_ranking_payload(
+            finetune_id="ft_123",
+            checkpoint_avg_metric="eval_reward_mean",
+            checkpoint_avg_splits=["val", "test"],
+            checkpoint_eval_history=[
+                {"step": 5, "avg_eval_reward_mean": 0.2},
+                {"step": 9, "avg_eval_reward_mean": 0.7},
+            ],
+        )
+        self.assertEqual(payload["best_avg_eval_reward_step"], 9)
+        self.assertAlmostEqual(payload["best_avg_eval_reward"], 0.7, places=6)
+        self.assertEqual(payload["checkpoint_avg_metric"], "eval_reward_mean")
+        self.assertEqual(len(payload["rankings"]), 2)
+
+    def test_rank_checkpoint_eval_history_prefers_saved_candidates(self) -> None:
+        history = [
+            {"step": 10, "avg_eval_reward_mean": 0.90, "checkpoint_saved": False},
+            {"step": 20, "avg_eval_reward_mean": 0.50, "checkpoint_saved": True},
+            {"step": 30, "avg_eval_reward_mean": 0.60, "checkpoint_saved": True},
+        ]
+        ranked = mod._rank_checkpoint_eval_history(history)
+        self.assertEqual([item["step"] for item in ranked], [30, 20])
+
+
+class CheckpointSaveTests(unittest.TestCase):
+    def test_try_save_checkpoint_handles_checkpoint_not_found(self) -> None:
+        finetune = SimpleNamespace(
+            save_checkpoint=lambda: (_ for _ in ()).throw(
+                TunaAPIError("Checkpoint not found", status_code=404)
+            )
+        )
+        ok = mod._try_save_checkpoint(finetune=finetune, context="test")
+        self.assertFalse(ok)
+
 
 class SamplingConfigTests(unittest.TestCase):
     def test_task_sampling_weights_validation(self) -> None:
@@ -296,7 +381,11 @@ class SamplingConfigTests(unittest.TestCase):
 
     def test_weighted_sampling_oversamples_weak_tasks(self) -> None:
         weights = mod._resolve_task_sampling_weights(
-            config_map=mod.DEFAULT_TASK_SAMPLING_WEIGHTS,
+            config_map={
+                "best_move": 2.0,
+                "legal_moves_count": 2.0,
+                "legal_moves_list": 5.0,
+            },
             cli_override_json="",
         )
         tasks = sorted(mod.SUPPORTED_TASKS)

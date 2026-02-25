@@ -63,6 +63,41 @@ class BenchmarkArgTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown task_type"):
             mod._normalize_task_types(["best_move,bad_task"])
 
+    def test_unknown_config_key_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "benchmark.json"
+            cfg_path.write_text(
+                json.dumps(
+                    {
+                        "dataset_source": "hf_hub",
+                        "resoning": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "Unknown config key"):
+                mod._parse_args(["--config", str(cfg_path)])
+
+    def test_hf_dataset_source_parsing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "benchmark.json"
+            cfg_path.write_text(
+                json.dumps(
+                    {
+                        "dataset_source": "hf_hub",
+                        "hf_dataset_repo_id": "maxs-m87/tictactoe-qa-v1",
+                        "hf_dataset_revision": "main",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            args = mod._parse_args(["--config", str(cfg_path)])
+            self.assertEqual(args.dataset_source, "hf_hub")
+            self.assertEqual(args.hf_dataset_repo_id, "maxs-m87/tictactoe-qa-v1")
+            self.assertEqual(args.hf_dataset_revision, "main")
+
 
 class QueryPayloadTests(unittest.TestCase):
     def test_reasoning_field_present_when_set(self) -> None:

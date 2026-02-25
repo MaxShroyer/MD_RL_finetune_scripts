@@ -15,6 +15,8 @@ This folder contains query-skill RL finetuning and benchmarking for the syntheti
 cd /Users/maxs/Documents/Repos/MD/MD_RL_Pipe/RL_amazon_logo
 cp tictaktoe_QA/.env.example tictaktoe_QA/.env
 # edit tictaktoe_QA/.env with your keys
+# optional for private HF access:
+# HF_TOKEN=...
 ```
 
 ## Train
@@ -23,14 +25,12 @@ python tictaktoe_QA/train_ttt_query_rl.py \
   --config tictaktoe_QA/configs/query_rl_default.json
 ```
 
-Smoke train run:
+HF-only override example:
 ```bash
 python tictaktoe_QA/train_ttt_query_rl.py \
   --config tictaktoe_QA/configs/query_rl_default.json \
-  --dataset-dir tictaktoe_QA/synth_dataset/outputs/smoke_full_jsonl \
-  --num-steps 1 \
-  --group-size 2 \
-  --eval-max-samples 20
+  --dataset-source hf_hub \
+  --hf-dataset-repo-id maxs-m87/tictactoe-qa-v1
 ```
 
 Reasoning and sampling overrides:
@@ -42,10 +42,22 @@ python tictaktoe_QA/train_ttt_query_rl.py \
   --max-tokens-by-task-json '{"legal_moves_list":384}'
 ```
 
+Local JSONL fallback:
+```bash
+python tictaktoe_QA/train_ttt_query_rl.py \
+  --config tictaktoe_QA/configs/query_rl_default.json \
+  --dataset-source local_jsonl \
+  --dataset-dir tictaktoe_QA/synth_dataset/outputs/v1
+```
+
 ## Training config keys
+- `dataset_source` (`hf_hub` or `local_jsonl`, default `hf_hub`).
+- `hf_dataset_repo_id` / `hf_dataset_revision` / `hf_token` / `hf_cache_dir`: HF loader controls.
 - `reasoning` (bool): toggles query reasoning mode (default `false`).
 - `task_sampling_weights` (object): `task_type -> weight`, missing tasks default to `1.0`.
 - `max_tokens_by_task` (object): optional `task_type -> max_tokens`; fallback is global `max_tokens`.
+- `checkpoint_avg_splits` (list): splits to average during periodic eval/checkpoint ranking.
+- `checkpoint_ranking_output` (path): JSON artifact with all ranked eval checkpoints.
 
 Config precedence:
 - CLI overrides config JSON.
@@ -60,12 +72,18 @@ Config precedence:
 - `eval_json_parse_rate` is schema-valid parse rate for the active task.
 - `eval_json_object_rate` is raw JSON-object extraction rate (dict parsed, regardless of schema validity).
 
-## Dataset expectation
-`--dataset-dir` should point to a synth dataset output containing:
+## Dataset source
+Default is HF Hub (`maxs-m87/tictactoe-qa-v1`), so local JSONL is not required.
+
+If you choose `--dataset-source local_jsonl`, `--dataset-dir` should point to a synth dataset output containing:
 - `jsonl/train.jsonl`
 - `jsonl/val.jsonl`
 - optional eval splits in `jsonl/*.jsonl`
 - `images/` for fallback image path resolution
+
+## Checkpoint ranking output
+At each periodic eval, the trainer evaluates `checkpoint_avg_splits`, computes average `eval_reward_mean`, and records it.
+At train end, it writes the full ranking JSON (default `tictaktoe_QA/outputs/checkpoint_ranking.json`) and prints the highest-average checkpoint step.
 
 ## Benchmark
 Use config-driven benchmark defaults:
@@ -75,6 +93,7 @@ python tictaktoe_QA/benchmark_ttt_query.py \
 ```
 
 Benchmark config/CLI supports:
+- `dataset_source` (`hf_hub` default) plus HF args (`hf_dataset_repo_id`, `hf_dataset_revision`, etc.)
 - `reasoning` via config or `--reasoning` / `--no-reasoning`
 - `task_types` via config or `--task-types`
 - existing model flags (`--finetune-id`, `--checkpoint-step`, `--max-tokens`, etc.)

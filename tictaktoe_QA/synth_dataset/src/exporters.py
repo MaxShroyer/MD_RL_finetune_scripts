@@ -95,7 +95,15 @@ def write_jsonl(rows_by_split: dict[str, list[dict[str, Any]]], out_dir: Path) -
     return out_paths
 
 
-def write_hf_dataset(rows_by_split: dict[str, list[dict[str, Any]]], out_dir: Path) -> Path:
+def write_hf_dataset(
+    rows_by_split: dict[str, list[dict[str, Any]]],
+    out_dir: Path,
+    *,
+    push_to_hub: bool = False,
+    repo_id: str = "",
+    token: str = "",
+    private: bool = False,
+) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     features = _features()
 
@@ -111,6 +119,18 @@ def write_hf_dataset(rows_by_split: dict[str, list[dict[str, Any]]], out_dir: Pa
 
     dsd = DatasetDict(ds_map)
     dsd.save_to_disk(str(out_dir))
+    if push_to_hub:
+        cleaned_repo_id = repo_id.strip()
+        if not cleaned_repo_id:
+            raise ValueError("repo_id is required when push_to_hub=True")
+        push_kwargs: dict[str, Any] = {
+            "repo_id": cleaned_repo_id,
+            "private": bool(private),
+        }
+        cleaned_token = token.strip()
+        if cleaned_token:
+            push_kwargs["token"] = cleaned_token
+        dsd.push_to_hub(**push_kwargs)
     return out_dir
 
 

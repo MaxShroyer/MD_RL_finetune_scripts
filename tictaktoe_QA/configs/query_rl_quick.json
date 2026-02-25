@@ -1,6 +1,10 @@
 {
   "env_file": ".env",
-  "dataset_dir": "synth_dataset/outputs/smoke_full_jsonl",
+  "dataset_source": "hf_hub",
+  "hf_dataset_repo_id": "maxs-m87/tictactoe-qa-v1",
+  "hf_dataset_revision": "main",
+  "hf_cache_dir": "",
+  "dataset_dir": "synth_dataset/outputs/v1",
   "train_split": "train",
   "val_split": "val",
   "final_eval_splits": [
@@ -12,7 +16,7 @@
   "finetune_id": "",
   "finetune_name": "",
   "rank": 16,
-  "resoning": false,
+  "reasoning": false,
   "num_steps": 200,
   "resume_step": 0,
   "batch_size": 16,
@@ -26,8 +30,15 @@
   "rollout_retry_backoff_s": 1.0,
   "eval_every": 10,
   "save_every": 10,
+  "save_on_eval": true,
   "eval_batch_size": 32,
   "eval_max_samples": 200,
+  "checkpoint_avg_splits": [
+    "val",
+    "test"
+  ],
+  "checkpoint_avg_metric": "eval_reward_mean",
+  "checkpoint_ranking_output": "tictaktoe_QA/outputs/checkpoint_ranking.json",
   "seed": 42,
   "best_metric": "eval_reward_mean",
   "best_move_optimal_reward": 0.7,

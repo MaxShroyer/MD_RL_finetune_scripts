@@ -65,10 +65,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tictaktoe_QA import data_loader as dataset_loader  # noqa: E402
 from tuna_sdk import QueryOutput, QueryRequest, QuerySettings, TunaClient  # noqa: E402
 from tuna_sdk.errors import TunaAPIError, TunaNetworkError  # noqa: E402
 
 DEFAULT_BASE_URL = "https://api.moondream.ai/v1"
+DEFAULT_DATASET_SOURCE = dataset_loader.DEFAULT_DATASET_SOURCE
+DEFAULT_HF_DATASET_REPO_ID = dataset_loader.DEFAULT_HF_DATASET_REPO_ID
+DEFAULT_HF_DATASET_REVISION = dataset_loader.DEFAULT_HF_DATASET_REVISION
 DEFAULT_FINAL_EVAL_SPLITS = [
     "val",
     "test",
@@ -95,6 +99,21 @@ DEFAULT_TASK_SAMPLING_WEIGHTS: dict[str, float] = {
 DEFAULT_MAX_TOKENS_BY_TASK: dict[str, int] = {
     "legal_moves_list": 800,
 }
+MAIN_TRAIN_WANDB_METRIC_KEYS = (
+    "reward_mean",
+    "train_json_object_rate",
+    "train_json_parse_rate",
+    "kl",
+)
+MAIN_EVAL_WANDB_METRIC_KEYS = (
+    "eval_samples",
+    "eval_reward_mean",
+    "eval_json_object_rate",
+    "eval_json_parse_rate",
+    "eval_best_move_set_accuracy",
+    "eval_best_move_canonical_accuracy",
+    "eval_exact_accuracy_non_best_move",
+)
 
 REQUIRED_ROW_FIELDS = (
     "row_id",
@@ -106,6 +125,52 @@ REQUIRED_ROW_FIELDS = (
     "best_move_optimal_set_json",
     "image_path",
 )
+
+TRAIN_CONFIG_ALLOWED_KEYS = {
+    "api_key",
+    "base_url",
+    "batch_size",
+    "best_metric",
+    "best_move_optimal_reward",
+    "checkpoint_avg_metric",
+    "checkpoint_avg_splits",
+    "checkpoint_ranking_output",
+    "dataset_dir",
+    "dataset_source",
+    "env_file",
+    "eval_batch_size",
+    "eval_every",
+    "eval_max_samples",
+    "final_eval_splits",
+    "finetune_id",
+    "finetune_name",
+    "group_size",
+    "hf_cache_dir",
+    "hf_dataset_repo_id",
+    "hf_dataset_revision",
+    "hf_token",
+    "lr",
+    "max_tokens",
+    "max_tokens_by_task",
+    "max_workers",
+    "no_progress",
+    "num_steps",
+    "rank",
+    "reasoning",
+    "resume_step",
+    "rollout_retries",
+    "rollout_retry_backoff_s",
+    "save_every",
+    "save_on_eval",
+    "seed",
+    "task_sampling_weights",
+    "temperature",
+    "top_p",
+    "train_split",
+    "val_split",
+    "wandb_project",
+    "wandb_run_name",
+}
 
 
 @dataclass(frozen=True)
@@ -166,6 +231,15 @@ def _load_json_config(config_path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"Config must be a JSON object: {config_path}")
     return payload
+
+
+def _validate_config_keys(config: dict[str, Any], *, config_path: Path) -> None:
+    unknown = sorted(key for key in config.keys() if key not in TRAIN_CONFIG_ALLOWED_KEYS)
+    if unknown:
+        raise ValueError(
+            f"Unknown config key(s) in {config_path}: {unknown}. "
+            "Remove typos or update script support."
+        )
 
 
 def _cfg_str(config: dict[str, Any], key: str, fallback: str) -> str:
@@ -310,9 +384,26 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
     parser.add_argument("--base-url", default=_cfg_str(config, "base_url", ""))
 
     parser.add_argument(
+        "--dataset-source",
+        choices=sorted(dataset_loader.SUPPORTED_DATASET_SOURCES),
+        default=_cfg_str(config, "dataset_source", DEFAULT_DATASET_SOURCE),
+        help="Dataset source: HF Hub or local JSONL directory.",
+    )
+    parser.add_argument(
         "--dataset-dir",
         default=_cfg_str(config, "dataset_dir", str(_repo_relative("synth_dataset/outputs/v1"))),
+        help="Local dataset dir (required when --dataset-source=local_jsonl).",
     )
+    parser.add_argument(
+        "--hf-dataset-repo-id",
+        default=_cfg_str(config, "hf_dataset_repo_id", DEFAULT_HF_DATASET_REPO_ID),
+    )
+    parser.add_argument(
+        "--hf-dataset-revision",
+        default=_cfg_str(config, "hf_dataset_revision", DEFAULT_HF_DATASET_REVISION),
+    )
+    parser.add_argument("--hf-token", default=_cfg_str(config, "hf_token", ""))
+    parser.add_argument("--hf-cache-dir", default=_cfg_str(config, "hf_cache_dir", ""))
     parser.add_argument("--train-split", default=_cfg_str(config, "train_split", "train"))
     parser.add_argument("--val-split", default=_cfg_str(config, "val_split", "val"))
     parser.add_argument(
@@ -370,12 +461,42 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
 
     parser.add_argument("--eval-every", type=int, default=_cfg_int(config, "eval_every", 20))
     parser.add_argument("--save-every", type=int, default=_cfg_int(config, "save_every", 20))
+    save_on_eval_group = parser.add_mutually_exclusive_group()
+    save_on_eval_group.add_argument(
+        "--save-on-eval",
+        dest="save_on_eval",
+        action="store_true",
+        help="Save a checkpoint at each periodic evaluation.",
+    )
+    save_on_eval_group.add_argument(
+        "--no-save-on-eval",
+        dest="save_on_eval",
+        action="store_false",
+        help="Disable automatic checkpoint save at periodic evaluations.",
+    )
+    parser.set_defaults(save_on_eval=_cfg_bool(config, "save_on_eval", True))
     parser.add_argument("--eval-batch-size", type=int, default=_cfg_int(config, "eval_batch_size", 32))
     parser.add_argument(
         "--eval-max-samples",
         type=int,
         default=_cfg_int(config, "eval_max_samples", 1000),
         help="Max samples per eval split. <=0 means full split.",
+    )
+    parser.add_argument(
+        "--checkpoint-avg-splits",
+        nargs="+",
+        default=_cfg_list_str(config, "checkpoint_avg_splits", ["val", "test"]),
+        help="Splits used for periodic checkpoint average ranking.",
+    )
+    parser.add_argument(
+        "--checkpoint-avg-metric",
+        choices=["eval_reward_mean"],
+        default=_cfg_str(config, "checkpoint_avg_metric", "eval_reward_mean"),
+    )
+    parser.add_argument(
+        "--checkpoint-ranking-output",
+        default=_cfg_str(config, "checkpoint_ranking_output", ""),
+        help="Path to write periodic checkpoint ranking JSON.",
     )
 
     parser.add_argument(
@@ -414,6 +535,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
     config_path = _resolve_config_path(pre_args.config)
     config = _load_json_config(config_path)
+    _validate_config_keys(config, config_path=config_path)
     parser = _build_parser(config, config_path)
     args = parser.parse_args(argv)
 
@@ -457,7 +579,18 @@ def _resolve_env_file(env_file: str) -> str:
     return str(from_cwd)
 
 
+def _resolve_output_path(raw_path: str, *, fallback_name: str) -> Path:
+    text = str(raw_path or "").strip()
+    if text:
+        path = Path(text).expanduser()
+        if path.is_absolute():
+            return path
+        return (Path.cwd() / path).resolve()
+    return _repo_relative("outputs", fallback_name).resolve()
+
+
 def _validate_args(args: argparse.Namespace) -> None:
+    args.dataset_source = dataset_loader.normalize_dataset_source(args.dataset_source)
     if args.num_steps < 0:
         raise ValueError("--num-steps must be >= 0")
     if args.resume_step < 0:
@@ -488,9 +621,15 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--rollout-retry-backoff-s must be > 0")
     if not (0.0 <= args.best_move_optimal_reward <= 1.0):
         raise ValueError("--best-move-optimal-reward must be in [0,1]")
+    if not args.checkpoint_avg_splits:
+        raise ValueError("--checkpoint-avg-splits must contain at least one split")
 
     if args.finetune_id and args.finetune_name:
         raise ValueError("Provide either --finetune-id or --finetune-name, not both")
+    if args.dataset_source == "local_jsonl" and not str(args.dataset_dir).strip():
+        raise ValueError("--dataset-dir is required when --dataset-source=local_jsonl")
+    if args.dataset_source == "hf_hub" and not str(args.hf_dataset_repo_id).strip():
+        raise ValueError("--hf-dataset-repo-id is required when --dataset-source=hf_hub")
 
 
 
@@ -826,7 +965,7 @@ def _score_rollout_for_example(
     )
 
 
-def _resolve_image_path(row: dict[str, Any], dataset_dir: Path) -> Optional[Path]:
+def _resolve_image_path(row: dict[str, Any], dataset_dir: Optional[Path]) -> Optional[Path]:
     candidates: list[str] = []
     for key in ("image_path", "image"):
         value = row.get(key)
@@ -838,13 +977,13 @@ def _resolve_image_path(row: dict[str, Any], dataset_dir: Path) -> Optional[Path
         if path.is_file():
             return path.resolve()
 
-        if not path.is_absolute():
+        if not path.is_absolute() and dataset_dir is not None:
             joined = (dataset_dir / path).resolve()
             if joined.is_file():
                 return joined
 
         basename = path.name
-        if basename:
+        if basename and dataset_dir is not None:
             fallback = (dataset_dir / "images" / basename).resolve()
             if fallback.is_file():
                 return fallback
@@ -856,7 +995,7 @@ def _build_example(
     row: dict[str, Any],
     *,
     split_name: str,
-    dataset_dir: Path,
+    dataset_dir: Optional[Path],
     line_number: int,
 ) -> Optional[QAExample]:
     missing = [field for field in REQUIRED_ROW_FIELDS if field not in row]
@@ -902,39 +1041,46 @@ def _build_example(
     )
 
 
-def _load_split_examples(dataset_dir: Path, split_name: str) -> list[QAExample]:
-    path = dataset_dir / "jsonl" / f"{split_name}.jsonl"
-    if not path.exists():
-        raise FileNotFoundError(f"split JSONL not found: {path}")
+def _load_split_examples(
+    *,
+    split_name: str,
+    dataset_source: str,
+    dataset_dir: Optional[Path],
+    hf_dataset_repo_id: str,
+    hf_dataset_revision: str,
+    hf_token: str,
+    hf_cache_dir: str,
+) -> list[QAExample]:
+    rows = dataset_loader.load_split_rows(
+        dataset_source=dataset_source,
+        split_name=split_name,
+        dataset_dir=dataset_dir,
+        hf_dataset_repo_id=hf_dataset_repo_id,
+        hf_dataset_revision=hf_dataset_revision,
+        hf_token=hf_token,
+        hf_cache_dir=hf_cache_dir,
+    )
 
     examples: list[QAExample] = []
     skipped = 0
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            text = line.strip()
-            if not text:
-                continue
-            try:
-                row = json.loads(text)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"invalid JSON in {path}:{line_number}: {exc}") from exc
-            if not isinstance(row, dict):
-                skipped += 1
-                continue
-            example = _build_example(
-                row,
-                split_name=split_name,
-                dataset_dir=dataset_dir,
-                line_number=line_number,
-            )
-            if example is None:
-                skipped += 1
-                continue
-            examples.append(example)
+    for line_number, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            skipped += 1
+            continue
+        example = _build_example(
+            row,
+            split_name=split_name,
+            dataset_dir=dataset_dir,
+            line_number=line_number,
+        )
+        if example is None:
+            skipped += 1
+            continue
+        examples.append(example)
 
-    print(f"loaded split={split_name} rows={len(examples)} skipped={skipped} from {path}")
+    print(f"usable split={split_name} examples={len(examples)} skipped={skipped}")
     if not examples:
-        raise ValueError(f"split={split_name} contains no usable rows: {path}")
+        raise ValueError(f"split={split_name} contains no usable rows")
     return examples
 
 
@@ -1226,6 +1372,91 @@ def _metric_prefix_for_split(split_name: str) -> str:
     return f"final_{sanitized}_"
 
 
+def _sanitize_split_name(split_name: str) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in split_name.strip())
+
+
+def _numeric_metrics_only(metrics: dict[str, Any]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for key, value in metrics.items():
+        if isinstance(value, (int, float)):
+            out[key] = float(value)
+    return out
+
+
+def _rank_checkpoint_eval_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    saved_entries = [item for item in history if bool(item.get("checkpoint_saved"))]
+    candidates = saved_entries if saved_entries else history
+    return sorted(
+        candidates,
+        key=lambda item: float(item.get("avg_eval_reward_mean", 0.0)),
+        reverse=True,
+    )
+
+
+def _build_checkpoint_ranking_payload(
+    *,
+    finetune_id: str,
+    checkpoint_avg_metric: str,
+    checkpoint_avg_splits: list[str],
+    checkpoint_eval_history: list[dict[str, Any]],
+) -> dict[str, Any]:
+    ranking = _rank_checkpoint_eval_history(checkpoint_eval_history)
+    best_avg_eval_reward = float(ranking[0]["avg_eval_reward_mean"]) if ranking else 0.0
+    best_avg_eval_reward_step = int(ranking[0]["step"]) if ranking else -1
+    return {
+        "finetune_id": finetune_id,
+        "checkpoint_avg_metric": checkpoint_avg_metric,
+        "checkpoint_avg_splits": checkpoint_avg_splits,
+        "best_avg_eval_reward": best_avg_eval_reward,
+        "best_avg_eval_reward_step": best_avg_eval_reward_step,
+        "rankings": ranking,
+    }
+
+
+def _filter_wandb_metrics(metrics: dict[str, float], keys: tuple[str, ...]) -> dict[str, float]:
+    return {key: metrics[key] for key in keys if key in metrics}
+
+
+def _select_eval_wandb_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    selected = _filter_wandb_metrics(metrics, MAIN_EVAL_WANDB_METRIC_KEYS)
+    for task in sorted(SUPPORTED_TASKS):
+        key = f"eval_task_accuracy_{task}"
+        if key in metrics:
+            selected[key] = metrics[key]
+    return selected
+
+
+def _is_checkpoint_not_found_error(exc: Exception) -> bool:
+    if not isinstance(exc, TunaAPIError):
+        return False
+    if exc.status_code == 404 and "checkpoint" in str(exc).lower():
+        return True
+    return "checkpoint not found" in str(exc).lower()
+
+
+def _try_save_checkpoint(
+    *,
+    finetune: Any,
+    context: str,
+) -> bool:
+    try:
+        finetune.save_checkpoint()
+        return True
+    except (TunaAPIError, TunaNetworkError) as exc:
+        if _is_checkpoint_not_found_error(exc):
+            print(
+                f"{context}: checkpoint unavailable yet; continuing. "
+                f"details: {_error_details(exc)}"
+            )
+            return False
+        print(
+            f"{context}: checkpoint save failed; continuing. "
+            f"details: {_error_details(exc)}"
+        )
+        return False
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     args = parse_args(argv)
     args.env_file = _resolve_env_file(args.env_file)
@@ -1240,22 +1471,44 @@ def main(argv: Optional[list[str]] = None) -> None:
     _validate_args(args)
     if not args.api_key:
         raise ValueError("MOONDREAM_API_KEY is required")
+    args.hf_token = dataset_loader.resolve_hf_token(args.hf_token)
 
     if args.eval_max_samples is not None and args.eval_max_samples <= 0:
         args.eval_max_samples = None
 
-    dataset_dir = Path(args.dataset_dir).expanduser().resolve()
-    if not dataset_dir.exists():
-        raise FileNotFoundError(f"dataset_dir not found: {dataset_dir}")
+    dataset_dir: Optional[Path] = None
+    if args.dataset_source == "local_jsonl":
+        dataset_dir = Path(args.dataset_dir).expanduser().resolve()
+        if not dataset_dir.exists():
+            raise FileNotFoundError(f"dataset_dir not found: {dataset_dir}")
 
     final_eval_splits = _dedupe_splits(list(args.final_eval_splits))
     if not final_eval_splits:
         raise ValueError("--final-eval-splits must contain at least one split")
+    checkpoint_avg_splits = _dedupe_splits(list(args.checkpoint_avg_splits))
+    if not checkpoint_avg_splits:
+        raise ValueError("--checkpoint-avg-splits must contain at least one split")
 
     rng = random.Random(args.seed)
 
-    train_examples = _load_split_examples(dataset_dir, args.train_split)
-    val_examples = _load_split_examples(dataset_dir, args.val_split)
+    train_examples = _load_split_examples(
+        split_name=args.train_split,
+        dataset_source=args.dataset_source,
+        dataset_dir=dataset_dir,
+        hf_dataset_repo_id=args.hf_dataset_repo_id,
+        hf_dataset_revision=args.hf_dataset_revision,
+        hf_token=args.hf_token,
+        hf_cache_dir=args.hf_cache_dir,
+    )
+    val_examples = _load_split_examples(
+        split_name=args.val_split,
+        dataset_source=args.dataset_source,
+        dataset_dir=dataset_dir,
+        hf_dataset_repo_id=args.hf_dataset_repo_id,
+        hf_dataset_revision=args.hf_dataset_revision,
+        hf_token=args.hf_token,
+        hf_cache_dir=args.hf_cache_dir,
+    )
     train_examples_by_task: dict[str, list[QAExample]] = {}
     for item in train_examples:
         train_examples_by_task.setdefault(item.task_type, []).append(item)
@@ -1267,12 +1520,28 @@ def main(argv: Optional[list[str]] = None) -> None:
     if not sampling_tasks:
         raise ValueError("no tasks available for weighted sampling")
 
+    split_examples_cache: dict[str, list[QAExample]] = {
+        args.train_split: train_examples,
+        args.val_split: val_examples,
+    }
+
+    def _examples_for_split(split_name: str) -> list[QAExample]:
+        if split_name not in split_examples_cache:
+            split_examples_cache[split_name] = _load_split_examples(
+                split_name=split_name,
+                dataset_source=args.dataset_source,
+                dataset_dir=dataset_dir,
+                hf_dataset_repo_id=args.hf_dataset_repo_id,
+                hf_dataset_revision=args.hf_dataset_revision,
+                hf_token=args.hf_token,
+                hf_cache_dir=args.hf_cache_dir,
+            )
+        return split_examples_cache[split_name]
+
     final_eval_examples: dict[str, list[QAExample]] = {}
     for split in final_eval_splits:
-        if split == args.val_split:
-            final_eval_examples[split] = val_examples
-        else:
-            final_eval_examples[split] = _load_split_examples(dataset_dir, split)
+        final_eval_examples[split] = _examples_for_split(split)
+    checkpoint_avg_examples = {split: _examples_for_split(split) for split in checkpoint_avg_splits}
 
     if not args.finetune_id and not args.finetune_name:
         args.finetune_name = f"ttt-query-rl-{_random_suffix()}"
@@ -1290,10 +1559,16 @@ def main(argv: Optional[list[str]] = None) -> None:
             "config": args.config,
             "env_file": args.env_file,
             "base_url": args.base_url,
-            "dataset_dir": str(dataset_dir),
+            "dataset_source": args.dataset_source,
+            "dataset_dir": str(dataset_dir) if dataset_dir is not None else "",
+            "hf_dataset_repo_id": args.hf_dataset_repo_id,
+            "hf_dataset_revision": args.hf_dataset_revision,
+            "hf_cache_dir": args.hf_cache_dir,
             "train_split": args.train_split,
             "val_split": args.val_split,
             "final_eval_splits": final_eval_splits,
+            "checkpoint_avg_splits": checkpoint_avg_splits,
+            "checkpoint_avg_metric": args.checkpoint_avg_metric,
             "train_rows": len(train_examples),
             "val_rows": len(val_examples),
             "finetune_id": finetune.finetune_id,
@@ -1319,39 +1594,105 @@ def main(argv: Optional[list[str]] = None) -> None:
             },
             "eval_every": args.eval_every,
             "save_every": args.save_every,
+            "save_on_eval": args.save_on_eval,
             "eval_batch_size": args.eval_batch_size,
             "eval_max_samples": args.eval_max_samples,
             "best_metric": args.best_metric,
             "best_move_optimal_reward": args.best_move_optimal_reward,
+            "checkpoint_ranking_output": args.checkpoint_ranking_output,
         },
     )
     run.summary["finetune_id"] = finetune.finetune_id
 
     best_metric_value: Optional[float] = None
     best_step: Optional[int] = None
+    checkpoint_eval_history: list[dict[str, Any]] = []
+
+    def _run_checkpoint_eval(
+        *,
+        step_for_log: int,
+        seed_base: int,
+        stage_label: str,
+    ) -> dict[str, dict[str, float]]:
+        by_split: dict[str, dict[str, float]] = {}
+        for split_idx, split_name in enumerate(checkpoint_avg_splits):
+            split_metrics = _evaluate_split(
+                finetune=finetune,
+                examples=checkpoint_avg_examples[split_name],
+                split_name=split_name,
+                seed=seed_base + split_idx,
+                batch_size=args.eval_batch_size,
+                max_workers=args.max_workers,
+                max_samples=args.eval_max_samples,
+                rollout_retries=args.rollout_retries,
+                rollout_retry_backoff_s=args.rollout_retry_backoff_s,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                max_tokens=args.max_tokens,
+                max_tokens_by_task=args.max_tokens_by_task,
+                reasoning=args.reasoning,
+                best_move_optimal_reward=args.best_move_optimal_reward,
+                show_progress=show_progress,
+            )
+            by_split[split_name] = split_metrics
+            prefix = f"checkpoint_{_sanitize_split_name(split_name)}_"
+            split_wandb_metrics = _select_eval_wandb_metrics(split_metrics)
+            wandb.log({f"{prefix}{k}": v for k, v in split_wandb_metrics.items()}, step=step_for_log)
+            print(
+                f"{stage_label} eval step={step_for_log} split={split_name} "
+                f"reward={split_metrics['eval_reward_mean']:.4f} "
+                f"obj_parse={split_metrics['eval_json_object_rate']:.4f} "
+                f"parse={split_metrics['eval_json_parse_rate']:.4f}"
+            )
+
+        avg_eval_reward = float(
+            np.mean([float(m.get(args.checkpoint_avg_metric, 0.0)) for m in by_split.values()])
+        )
+        wandb.log({"checkpoint_avg_eval_reward_mean": avg_eval_reward}, step=step_for_log)
+        print(
+            f"{stage_label} checkpoint average step={step_for_log} "
+            f"{args.checkpoint_avg_metric}={avg_eval_reward:.4f}"
+        )
+
+        checkpoint_eval_history.append(
+            {
+                "step": int(step_for_log),
+                "avg_eval_reward_mean": avg_eval_reward,
+                "checkpoint_avg_metric": args.checkpoint_avg_metric,
+                "split_metrics": {k: _numeric_metrics_only(v) for k, v in by_split.items()},
+            }
+        )
+        return by_split
 
     if args.eval_every > 0:
-        print("running baseline validation eval...")
-        baseline_metrics = _evaluate_split(
-            finetune=finetune,
-            examples=val_examples,
-            split_name=args.val_split,
-            seed=args.seed + 101,
-            batch_size=args.eval_batch_size,
-            max_workers=args.max_workers,
-            max_samples=args.eval_max_samples,
-            rollout_retries=args.rollout_retries,
-            rollout_retry_backoff_s=args.rollout_retry_backoff_s,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            max_tokens=args.max_tokens,
-            max_tokens_by_task=args.max_tokens_by_task,
-            reasoning=args.reasoning,
-            best_move_optimal_reward=args.best_move_optimal_reward,
-            show_progress=show_progress,
+        print("running baseline checkpoint-average eval...")
+        baseline_by_split = _run_checkpoint_eval(
+            step_for_log=args.resume_step,
+            seed_base=args.seed + 101,
+            stage_label="baseline",
         )
-        wandb.log({f"baseline_{k}": v for k, v in baseline_metrics.items()}, step=args.resume_step)
-        wandb.log(baseline_metrics, step=args.resume_step)
+        baseline_metrics = baseline_by_split.get(args.val_split)
+        if baseline_metrics is None:
+            baseline_metrics = _evaluate_split(
+                finetune=finetune,
+                examples=val_examples,
+                split_name=args.val_split,
+                seed=args.seed + 151,
+                batch_size=args.eval_batch_size,
+                max_workers=args.max_workers,
+                max_samples=args.eval_max_samples,
+                rollout_retries=args.rollout_retries,
+                rollout_retry_backoff_s=args.rollout_retry_backoff_s,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                max_tokens=args.max_tokens,
+                max_tokens_by_task=args.max_tokens_by_task,
+                reasoning=args.reasoning,
+                best_move_optimal_reward=args.best_move_optimal_reward,
+                show_progress=show_progress,
+            )
+        baseline_wandb_metrics = _select_eval_wandb_metrics(baseline_metrics)
+        wandb.log({f"baseline_{k}": v for k, v in baseline_wandb_metrics.items()}, step=args.resume_step)
 
         baseline_metric = float(baseline_metrics.get(args.best_metric, 0.0))
         best_metric_value = baseline_metric
@@ -1364,6 +1705,17 @@ def main(argv: Optional[list[str]] = None) -> None:
             f"best_move_canon={baseline_metrics['eval_best_move_canonical_accuracy']:.4f} "
             f"exact_non_best={baseline_metrics['eval_exact_accuracy_non_best_move']:.4f}"
         )
+        if args.save_on_eval:
+            baseline_saved = _try_save_checkpoint(
+                finetune=finetune,
+                context=f"baseline eval step={args.resume_step}",
+            )
+            if checkpoint_eval_history:
+                checkpoint_eval_history[-1]["checkpoint_saved"] = bool(baseline_saved)
+            if baseline_saved:
+                print("baseline checkpoint saved (save_on_eval=true)")
+        elif checkpoint_eval_history:
+            checkpoint_eval_history[-1]["checkpoint_saved"] = False
 
     step_iter = tqdm(
         range(args.num_steps),
@@ -1372,15 +1724,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         dynamic_ncols=True,
         disable=not show_progress,
     )
-    sampled_task_running_counts: Counter[str] = Counter()
-    sampled_task_running_total = 0
     for step in step_iter:
         global_step = args.resume_step + step
 
         sampled_tasks = rng.choices(sampling_tasks, weights=sampling_weights, k=args.batch_size)
-        sampled_task_counts = Counter(sampled_tasks)
-        sampled_task_running_counts.update(sampled_task_counts)
-        sampled_task_running_total += len(sampled_tasks)
         batch = [rng.choice(train_examples_by_task[task_name]) for task_name in sampled_tasks]
         requests, active_examples = _prepare_requests(
             batch,
@@ -1471,15 +1818,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             "router_kl": float(train_out.router_kl or 0.0),
             "grad_norm": float(train_out.grad_norm or 0.0),
         }
-        for task_name in sampling_tasks:
-            step_count = sampled_task_counts.get(task_name, 0)
-            train_metrics[f"batch_task_count_{task_name}"] = float(step_count)
-            train_metrics[f"batch_task_share_{task_name}"] = step_count / max(1, args.batch_size)
-            train_metrics[f"running_task_share_{task_name}"] = (
-                sampled_task_running_counts.get(task_name, 0) / max(1, sampled_task_running_total)
-            )
-
-        wandb.log(train_metrics, step=global_step)
+        wandb.log(_filter_wandb_metrics(train_metrics, MAIN_TRAIN_WANDB_METRIC_KEYS), step=global_step)
 
         print(
             f"step {global_step} reward={reward_mean:.4f} "
@@ -1497,25 +1836,32 @@ def main(argv: Optional[list[str]] = None) -> None:
             )
 
         if args.eval_every > 0 and (global_step + 1) % args.eval_every == 0:
-            eval_metrics = _evaluate_split(
-                finetune=finetune,
-                examples=val_examples,
-                split_name=args.val_split,
-                seed=args.seed + 1000 + global_step,
-                batch_size=args.eval_batch_size,
-                max_workers=args.max_workers,
-                max_samples=args.eval_max_samples,
-                rollout_retries=args.rollout_retries,
-                rollout_retry_backoff_s=args.rollout_retry_backoff_s,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                max_tokens=args.max_tokens,
-                max_tokens_by_task=args.max_tokens_by_task,
-                reasoning=args.reasoning,
-                best_move_optimal_reward=args.best_move_optimal_reward,
-                show_progress=show_progress,
+            eval_by_split = _run_checkpoint_eval(
+                step_for_log=global_step,
+                seed_base=args.seed + 1000 + (global_step * 13),
+                stage_label="checkpoint",
             )
-            wandb.log(eval_metrics, step=global_step)
+            eval_metrics = eval_by_split.get(args.val_split)
+            if eval_metrics is None:
+                eval_metrics = _evaluate_split(
+                    finetune=finetune,
+                    examples=val_examples,
+                    split_name=args.val_split,
+                    seed=args.seed + 1000 + global_step,
+                    batch_size=args.eval_batch_size,
+                    max_workers=args.max_workers,
+                    max_samples=args.eval_max_samples,
+                    rollout_retries=args.rollout_retries,
+                    rollout_retry_backoff_s=args.rollout_retry_backoff_s,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    max_tokens=args.max_tokens,
+                    max_tokens_by_task=args.max_tokens_by_task,
+                    reasoning=args.reasoning,
+                    best_move_optimal_reward=args.best_move_optimal_reward,
+                    show_progress=show_progress,
+                )
+            wandb.log(_select_eval_wandb_metrics(eval_metrics), step=global_step)
             metric_value = float(eval_metrics.get(args.best_metric, 0.0))
             print(
                 f"eval step {global_step} reward={eval_metrics['eval_reward_mean']:.4f} "
@@ -1529,15 +1875,48 @@ def main(argv: Optional[list[str]] = None) -> None:
             if best_metric_value is None or metric_value > best_metric_value:
                 best_metric_value = metric_value
                 best_step = global_step
-                finetune.save_checkpoint()
-                print(
-                    f"new best {args.best_metric}={metric_value:.4f} at step {global_step}; checkpoint saved"
+                if not args.save_on_eval:
+                    best_saved = _try_save_checkpoint(
+                        finetune=finetune,
+                        context=f"best metric checkpoint step={global_step}",
+                    )
+                    if checkpoint_eval_history:
+                        checkpoint_eval_history[-1]["checkpoint_saved"] = bool(best_saved)
+                    if best_saved:
+                        print(
+                            f"new best {args.best_metric}={metric_value:.4f} at step {global_step}; checkpoint saved"
+                        )
+                    else:
+                        print(
+                            f"new best {args.best_metric}={metric_value:.4f} at step {global_step}; checkpoint save skipped"
+                        )
+                else:
+                    print(
+                        f"new best {args.best_metric}={metric_value:.4f} at step {global_step}"
+                    )
+
+            if args.save_on_eval:
+                eval_saved = _try_save_checkpoint(
+                    finetune=finetune,
+                    context=f"periodic eval step={global_step}",
                 )
+                if checkpoint_eval_history:
+                    checkpoint_eval_history[-1]["checkpoint_saved"] = bool(eval_saved)
+                if eval_saved:
+                    print(f"checkpoint saved at eval step={global_step} (save_on_eval=true)")
+            elif checkpoint_eval_history and "checkpoint_saved" not in checkpoint_eval_history[-1]:
+                checkpoint_eval_history[-1]["checkpoint_saved"] = False
 
         if args.save_every > 0 and (global_step + 1) % args.save_every == 0:
-            finetune.save_checkpoint()
+            _try_save_checkpoint(
+                finetune=finetune,
+                context=f"save_every checkpoint step={global_step}",
+            )
 
-    finetune.save_checkpoint()
+    _try_save_checkpoint(
+        finetune=finetune,
+        context="final checkpoint save",
+    )
 
     final_eval_step = args.resume_step + args.num_steps
     for idx, (split_name, split_examples) in enumerate(final_eval_examples.items()):
@@ -1560,7 +1939,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             show_progress=show_progress,
         )
         prefix = _metric_prefix_for_split(split_name)
-        wandb.log({f"{prefix}{k}": v for k, v in eval_metrics.items()}, step=final_eval_step)
+        final_eval_wandb_metrics = _select_eval_wandb_metrics(eval_metrics)
+        wandb.log({f"{prefix}{k}": v for k, v in final_eval_wandb_metrics.items()}, step=final_eval_step)
 
         print(
             f"final eval split={split_name} reward={eval_metrics['eval_reward_mean']:.4f} "
@@ -1571,19 +1951,53 @@ def main(argv: Optional[list[str]] = None) -> None:
             f"exact_non_best={eval_metrics['eval_exact_accuracy_non_best_move']:.4f}"
         )
 
+    ranking_payload = _build_checkpoint_ranking_payload(
+        finetune_id=finetune.finetune_id,
+        checkpoint_avg_metric=args.checkpoint_avg_metric,
+        checkpoint_avg_splits=checkpoint_avg_splits,
+        checkpoint_eval_history=checkpoint_eval_history,
+    )
+    checkpoint_ranking = ranking_payload["rankings"]
+    best_avg_eval_reward = float(ranking_payload["best_avg_eval_reward"])
+    best_avg_eval_reward_step = int(ranking_payload["best_avg_eval_reward_step"])
+    if checkpoint_ranking:
+        print(
+            "best checkpoint by average eval reward: "
+            f"step={best_avg_eval_reward_step} avg_eval_reward_mean={best_avg_eval_reward:.4f} "
+            f"splits={checkpoint_avg_splits}"
+        )
+    else:
+        print("no checkpoint eval history to rank (eval_every may be 0).")
+
+    ranking_output_path = _resolve_output_path(
+        args.checkpoint_ranking_output,
+        fallback_name=f"checkpoint_ranking_{finetune.finetune_id}.json",
+    )
+    ranking_output_path.parent.mkdir(parents=True, exist_ok=True)
+    ranking_output_path.write_text(
+        json.dumps(ranking_payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    print(f"wrote checkpoint ranking JSON: {ranking_output_path}")
+
     run.summary["best_metric_name"] = args.best_metric
     run.summary["best_metric_value"] = float(best_metric_value or 0.0)
     run.summary["best_metric_step"] = int(best_step if best_step is not None else -1)
     run.summary["finetune_id"] = finetune.finetune_id
     run.summary["train_rows"] = len(train_examples)
     run.summary["val_rows"] = len(val_examples)
+    run.summary["best_avg_eval_reward"] = float(best_avg_eval_reward)
+    run.summary["best_avg_eval_reward_step"] = int(best_avg_eval_reward_step)
+    run.summary["best_avg_eval_reward_splits"] = ",".join(checkpoint_avg_splits)
+    run.summary["checkpoint_ranking_output"] = str(ranking_output_path)
 
     run.finish()
     client.close()
 
     print(
         f"done. finetune_id={finetune.finetune_id} best_{args.best_metric}={best_metric_value} "
-        f"best_step={best_step}"
+        f"best_step={best_step} best_avg_eval_reward={best_avg_eval_reward} "
+        f"best_avg_eval_reward_step={best_avg_eval_reward_step}"
     )
 
 

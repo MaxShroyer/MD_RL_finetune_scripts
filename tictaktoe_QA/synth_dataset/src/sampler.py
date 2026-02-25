@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 from collections import defaultdict
 from dataclasses import dataclass
+import math
 from typing import Iterable
 
 from .label_engine import BoardRecord
@@ -40,6 +41,8 @@ MAIN_TASK_QUOTAS: dict[str, dict[str, int]] = {
         "legal_moves_list": 600,
     },
 }
+
+MAIN_TOTAL_ROWS = sum(sum(task_counts.values()) for task_counts in MAIN_TASK_QUOTAS.values())
 
 
 @dataclass(frozen=True)
@@ -199,9 +202,45 @@ def _state_keys_by_split(records: dict[str, BoardRecord], selected_keys: list[st
     return out
 
 
-def _build_main_rows(records: dict[str, BoardRecord], split_state_keys: dict[str, list[str]], *, seed: int) -> list[RowPlan]:
+def derive_main_task_quotas(target_rows: int) -> dict[str, dict[str, int]]:
+    if target_rows <= 0:
+        raise ValueError("target_rows must be > 0")
+    if target_rows == MAIN_TOTAL_ROWS:
+        return {split: dict(task_counts) for split, task_counts in MAIN_TASK_QUOTAS.items()}
+
+    cells: list[tuple[str, str, int, float]] = []
+    base_total = 0
+    for split_name, task_counts in MAIN_TASK_QUOTAS.items():
+        for task_type, baseline in task_counts.items():
+            raw = (target_rows * baseline) / MAIN_TOTAL_ROWS
+            base = int(math.floor(raw))
+            cells.append((split_name, task_type, base, raw - base))
+            base_total += base
+
+    remainder = target_rows - base_total
+    cells.sort(key=lambda item: (-item[3], item[0], item[1]))
+    bumped: set[tuple[str, str]] = set()
+    for split_name, task_type, _, _ in cells:
+        if remainder <= 0:
+            break
+        bumped.add((split_name, task_type))
+        remainder -= 1
+
+    out: dict[str, dict[str, int]] = {split: {} for split in MAIN_TASK_QUOTAS}
+    for split_name, task_type, base, _ in cells:
+        out[split_name][task_type] = base + (1 if (split_name, task_type) in bumped else 0)
+    return out
+
+
+def _build_main_rows(
+    records: dict[str, BoardRecord],
+    split_state_keys: dict[str, list[str]],
+    *,
+    main_task_quotas: dict[str, dict[str, int]],
+    seed: int,
+) -> list[RowPlan]:
     rows: list[RowPlan] = []
-    for split_name, task_quotas in MAIN_TASK_QUOTAS.items():
+    for split_name, task_quotas in main_task_quotas.items():
         rng = random.Random(f"{seed}:{split_name}:rows")
         for task_type in TASK_TYPES:
             target = task_quotas.get(task_type, 0)
@@ -311,6 +350,7 @@ def sample_dataset_plan(
     top50_keys: set[str],
     *,
     target_states: int,
+    main_task_quotas: dict[str, dict[str, int]] | None = None,
     seed: int,
 ) -> SamplingOutput:
     rng = random.Random(seed)
@@ -321,7 +361,8 @@ def sample_dataset_plan(
     split_groups = _split_groups(main_pool, selected_main, rng=rng)
     split_state_keys = _state_keys_by_split(main_pool, selected_main, split_groups)
 
-    main_rows = _build_main_rows(main_pool, split_state_keys, seed=seed)
+    quotas = main_task_quotas or MAIN_TASK_QUOTAS
+    main_rows = _build_main_rows(main_pool, split_state_keys, main_task_quotas=quotas, seed=seed)
     benchmark_rows = _build_benchmark_rows(sorted(top50_keys), records)
 
     return SamplingOutput(

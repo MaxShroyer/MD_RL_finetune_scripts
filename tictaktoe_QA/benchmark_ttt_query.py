@@ -40,10 +40,43 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tictaktoe_QA import data_loader as dataset_loader  # noqa: E402
 from tictaktoe_QA import train_ttt_query_rl as train_utils  # noqa: E402
 
 DEFAULT_BASE_URL = "https://api.moondream.ai/v1"
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "benchmark_default.json"
+
+BENCHMARK_CONFIG_ALLOWED_KEYS = {
+    "api_key",
+    "base_url",
+    "best_move_optimal_reward",
+    "checkpoint_step",
+    "config",
+    "dataset_dir",
+    "dataset_source",
+    "env_file",
+    "finetune_id",
+    "hf_cache_dir",
+    "hf_dataset_repo_id",
+    "hf_dataset_revision",
+    "hf_token",
+    "max_samples",
+    "max_tokens",
+    "model",
+    "no_progress",
+    "output_json",
+    "predictions_jsonl",
+    "reasoning",
+    "retry_429_backoff_s",
+    "retry_429_max_backoff_s",
+    "retry_429_max_retries",
+    "seed",
+    "split",
+    "task_types",
+    "temperature",
+    "timeout",
+    "top_p",
+}
 
 
 class QueryAPIError(Exception):
@@ -91,6 +124,15 @@ def _load_json_config(config_path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"Config must be a JSON object: {config_path}")
     return payload
+
+
+def _validate_config_keys(config: dict[str, Any], *, config_path: Path) -> None:
+    unknown = sorted(key for key in config.keys() if key not in BENCHMARK_CONFIG_ALLOWED_KEYS)
+    if unknown:
+        raise ValueError(
+            f"Unknown config key(s) in {config_path}: {unknown}. "
+            "Remove typos or update script support."
+        )
 
 
 def _cfg_str(config: dict[str, Any], key: str, fallback: str) -> str:
@@ -387,9 +429,26 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
     parser.add_argument("--base-url", default=_cfg_str(config, "base_url", ""))
 
     parser.add_argument(
+        "--dataset-source",
+        choices=sorted(dataset_loader.SUPPORTED_DATASET_SOURCES),
+        default=_cfg_str(config, "dataset_source", dataset_loader.DEFAULT_DATASET_SOURCE),
+        help="Dataset source: HF Hub or local JSONL directory.",
+    )
+    parser.add_argument(
         "--dataset-dir",
         default=_cfg_str(config, "dataset_dir", str(_repo_relative("synth_dataset/outputs/v1"))),
+        help="Local dataset dir (required when --dataset-source=local_jsonl).",
     )
+    parser.add_argument(
+        "--hf-dataset-repo-id",
+        default=_cfg_str(config, "hf_dataset_repo_id", dataset_loader.DEFAULT_HF_DATASET_REPO_ID),
+    )
+    parser.add_argument(
+        "--hf-dataset-revision",
+        default=_cfg_str(config, "hf_dataset_revision", dataset_loader.DEFAULT_HF_DATASET_REVISION),
+    )
+    parser.add_argument("--hf-token", default=_cfg_str(config, "hf_token", ""))
+    parser.add_argument("--hf-cache-dir", default=_cfg_str(config, "hf_cache_dir", ""))
     parser.add_argument("--split", default=_cfg_str(config, "split", "test"))
     parser.add_argument("--seed", type=int, default=_cfg_int(config, "seed", 42))
     parser.add_argument(
@@ -469,6 +528,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
     config_path = _resolve_config_path(pre_args.config)
     config = _load_json_config(config_path)
+    _validate_config_keys(config, config_path=config_path)
     parser = _build_parser(config, config_path)
     args = parser.parse_args(argv)
 
@@ -491,6 +551,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    args.dataset_source = dataset_loader.normalize_dataset_source(args.dataset_source)
     if not (0.0 <= args.temperature <= 2.0):
         raise ValueError("--temperature must be in [0,2]")
     if not (0.0 < args.top_p <= 1.0):
@@ -509,6 +570,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--best-move-optimal-reward must be in [0,1]")
     if args.checkpoint_step is not None and args.checkpoint_step < 0:
         raise ValueError("--checkpoint-step must be >= 0")
+    if args.dataset_source == "local_jsonl" and not str(args.dataset_dir).strip():
+        raise ValueError("--dataset-dir is required when --dataset-source=local_jsonl")
+    if args.dataset_source == "hf_hub" and not str(args.hf_dataset_repo_id).strip():
+        raise ValueError("--hf-dataset-repo-id is required when --dataset-source=hf_hub")
 
 
 
@@ -528,6 +593,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     _validate_args(args)
     if not args.api_key:
         raise ValueError("MOONDREAM_API_KEY is required")
+    args.hf_token = dataset_loader.resolve_hf_token(args.hf_token)
 
     model = _resolve_model_identifier(
         model=args.model,
@@ -535,8 +601,19 @@ def main(argv: Optional[list[str]] = None) -> None:
         checkpoint_step=args.checkpoint_step,
     )
 
-    dataset_dir = Path(args.dataset_dir).expanduser().resolve()
-    examples = train_utils._load_split_examples(dataset_dir, args.split)
+    dataset_dir: Optional[Path] = None
+    if args.dataset_source == "local_jsonl":
+        dataset_dir = Path(args.dataset_dir).expanduser().resolve()
+
+    examples = train_utils._load_split_examples(
+        split_name=args.split,
+        dataset_source=args.dataset_source,
+        dataset_dir=dataset_dir,
+        hf_dataset_repo_id=args.hf_dataset_repo_id,
+        hf_dataset_revision=args.hf_dataset_revision,
+        hf_token=args.hf_token,
+        hf_cache_dir=args.hf_cache_dir,
+    )
 
     rng = random.Random(args.seed)
     if args.task_types:
@@ -706,7 +783,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         "model": model,
         "config": args.config,
         "split": args.split,
-        "dataset_dir": str(dataset_dir),
+        "dataset_source": args.dataset_source,
+        "dataset_dir": str(dataset_dir) if dataset_dir is not None else "",
+        "hf_dataset_repo_id": args.hf_dataset_repo_id,
+        "hf_dataset_revision": args.hf_dataset_revision,
         "reasoning": bool(args.reasoning),
         "task_types": list(args.task_types or []),
         "requested_rows": len(indices),

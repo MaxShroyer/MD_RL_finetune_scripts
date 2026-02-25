@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 from pathlib import Path
 from typing import Any
 import sys
+
+from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -18,7 +21,12 @@ from tictaktoe_QA.synth_dataset.src.exporters import build_stats, write_hf_datas
 from tictaktoe_QA.synth_dataset.src.label_engine import BoardRecord, build_board_record, move_to_row_col
 from tictaktoe_QA.synth_dataset.src.rationale import OpenAIParaphraser, build_answer_payload
 from tictaktoe_QA.synth_dataset.src.renderer import choose_colorway_for_state, render_board_image
-from tictaktoe_QA.synth_dataset.src.sampler import MAIN_TASK_QUOTAS, RowPlan, sample_dataset_plan
+from tictaktoe_QA.synth_dataset.src.sampler import (
+    MAIN_TOTAL_ROWS,
+    RowPlan,
+    derive_main_task_quotas,
+    sample_dataset_plan,
+)
 from tictaktoe_QA.synth_dataset.src.state_source import MAIN_URL, TOP50_URL, load_cloudwalk_data
 from tictaktoe_QA.synth_dataset.src.templates import choose_prompt
 
@@ -35,6 +43,10 @@ def _default_output_dir() -> Path:
 
 def _default_cache_dir() -> Path:
     return Path(__file__).resolve().parent / "cache" / "cloudwalk"
+
+
+def _default_env_file() -> Path:
+    return Path(__file__).resolve().parents[1] / ".env"
 
 
 def _best_move_canonical_json(record: BoardRecord) -> str:
@@ -220,13 +232,18 @@ def _build_rows(
     return rows
 
 
-def _validate_main_totals(rows_by_split: dict[str, list[dict[str, Any]]], expected_total: int) -> None:
+def _validate_main_totals(
+    rows_by_split: dict[str, list[dict[str, Any]]],
+    *,
+    expected_total: int,
+    expected_task_quotas: dict[str, dict[str, int]],
+) -> None:
     main_splits = ("train", "val", "test")
     total = sum(len(rows_by_split[s]) for s in main_splits)
     if total != expected_total:
         raise ValueError(f"main rows total mismatch: expected {expected_total}, got {total}")
 
-    for split_name, expected_task_counts in MAIN_TASK_QUOTAS.items():
+    for split_name, expected_task_counts in expected_task_quotas.items():
         rows = rows_by_split[split_name]
         observed: dict[str, int] = {}
         for row in rows:
@@ -243,9 +260,10 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build TicTacToe synthetic QA dataset")
     parser.add_argument("--output-dir", default=str(_default_output_dir()))
     parser.add_argument("--cache-dir", default=str(_default_cache_dir()))
+    parser.add_argument("--env-file", default=str(_default_env_file()))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--target-states", type=int, default=3000)
-    parser.add_argument("--target-rows", type=int, default=50000)
+    parser.add_argument("--target-rows", type=int, default=MAIN_TOTAL_ROWS)
     parser.add_argument("--allow-network", action="store_true", default=True)
     parser.add_argument("--no-network", dest="allow_network", action="store_false")
     parser.add_argument("--no-llm", action="store_true")
@@ -255,17 +273,42 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-benchmark-rows", type=int, default=0, help="Optional smoke cap for benchmark rows.")
     parser.add_argument("--skip-jsonl-export", action="store_true")
     parser.add_argument("--skip-hf-export", action="store_true")
+    parser.add_argument(
+        "--hf-repo-id",
+        default="",
+        help="Hugging Face dataset repo id, e.g. username/tictactoe-qa-v1. "
+        "If omitted, reads HF_DATASET_REPO_ID from env/.env.",
+    )
+    parser.add_argument(
+        "--hf-token",
+        default="",
+        help="Optional Hugging Face token override. If omitted, uses HF_TOKEN or HUGGINGFACE_HUB_TOKEN.",
+    )
+    parser.add_argument("--hf-private", action="store_true", help="Push dataset to a private Hugging Face repo.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-    if args.target_rows != 50000 and args.max_main_rows <= 0:
-        raise ValueError("V1 currently supports exact target_rows=50000 unless using --max-main-rows for smoke tests")
+    load_dotenv(args.env_file, override=False)
+
+    if args.target_rows <= 0:
+        raise ValueError("--target-rows must be > 0")
     if args.llm_ratio < 0.0 or args.llm_ratio > 1.0:
         raise ValueError("--llm-ratio must be within [0,1]")
     if args.skip_jsonl_export and args.skip_hf_export:
         raise ValueError("Cannot skip both exports; enable at least one of JSONL or HF export.")
+
+    hf_repo_id = args.hf_repo_id.strip() or os.environ.get("HF_DATASET_REPO_ID", "").strip()
+    hf_token = (
+        args.hf_token.strip()
+        or os.environ.get("HF_TOKEN", "").strip()
+        or os.environ.get("HUGGINGFACE_HUB_TOKEN", "").strip()
+    )
+    if not args.skip_hf_export and not hf_repo_id:
+        raise ValueError("HF export is enabled; provide --hf-repo-id or set HF_DATASET_REPO_ID in env/.env.")
+
+    main_task_quotas = derive_main_task_quotas(args.target_rows)
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     cache_dir = Path(args.cache_dir).expanduser().resolve()
@@ -284,7 +327,13 @@ def main() -> None:
     if missing_top50:
         raise ValueError(f"top50 keys not present in main boards: {missing_top50[:5]}")
 
-    sampling = sample_dataset_plan(records, top50_keys, target_states=args.target_states, seed=args.seed)
+    sampling = sample_dataset_plan(
+        records,
+        top50_keys,
+        target_states=args.target_states,
+        main_task_quotas=main_task_quotas,
+        seed=args.seed,
+    )
 
     llm_enabled = not args.no_llm
     paraphraser = OpenAIParaphraser(model=args.openai_model) if llm_enabled else None
@@ -343,17 +392,33 @@ def main() -> None:
         rows_by_split[split_name] = rows
 
     if args.max_main_rows <= 0:
-        _validate_main_totals(rows_by_split, expected_total=args.target_rows)
+        _validate_main_totals(
+            rows_by_split,
+            expected_total=args.target_rows,
+            expected_task_quotas=main_task_quotas,
+        )
 
     if not args.skip_jsonl_export:
         write_jsonl(rows_by_split, jsonl_dir)
     if not args.skip_hf_export:
         try:
-            write_hf_dataset(rows_by_split, hf_dir)
+            write_hf_dataset(
+                rows_by_split,
+                hf_dir,
+                push_to_hub=True,
+                repo_id=hf_repo_id,
+                token=hf_token,
+                private=bool(args.hf_private),
+            )
         except OSError as exc:
             raise OSError(
                 f"HF export failed (likely disk space issue): {exc}. "
                 "Retry with --skip-hf-export to generate JSONL-only artifacts."
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "HF upload failed. Check your HF token permissions and repo id, "
+                "or rerun with --skip-hf-export for local-only artifacts."
             ) from exc
 
     stats = build_stats(rows_by_split)
@@ -375,10 +440,12 @@ def main() -> None:
         "top50_state_count": len(top50_keys),
         "top50_state_keys": sorted(top50_keys),
         "split_state_counts": {k: len(v) for k, v in sampling.split_state_keys.items()},
-        "main_task_quotas": MAIN_TASK_QUOTAS,
+        "main_task_quotas": main_task_quotas,
         "exports": {
             "jsonl_enabled": not args.skip_jsonl_export,
             "hf_enabled": not args.skip_hf_export,
+            "hf_repo_id": hf_repo_id,
+            "hf_upload_enabled": not args.skip_hf_export,
         },
     }
 
@@ -388,6 +455,8 @@ def main() -> None:
     print(f"saved dataset to {output_dir}")
     for split_name, rows in rows_by_split.items():
         print(f"  {split_name}: {len(rows)} rows")
+    if not args.skip_hf_export:
+        print(f"uploaded hf dataset to {hf_repo_id}")
 
 
 if __name__ == "__main__":

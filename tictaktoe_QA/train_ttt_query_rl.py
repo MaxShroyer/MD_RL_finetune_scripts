@@ -12,7 +12,7 @@ import random
 import string
 import sys
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -103,6 +103,8 @@ MAIN_TRAIN_WANDB_METRIC_KEYS = (
     "reward_mean",
     "train_json_object_rate",
     "train_json_parse_rate",
+    "off_policy_group_fraction",
+    "replay_buffer_size",
     "kl",
 )
 MAIN_EVAL_WANDB_METRIC_KEYS = (
@@ -155,6 +157,11 @@ TRAIN_CONFIG_ALLOWED_KEYS = {
     "max_workers",
     "no_progress",
     "num_steps",
+    "off_policy",
+    "off_policy_buffer_size",
+    "off_policy_min_buffer_groups",
+    "off_policy_mix_ratio",
+    "off_policy_warmup_steps",
     "rank",
     "reasoning",
     "resume_step",
@@ -444,6 +451,46 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
         default="",
         help="JSON object override for per-task max token caps: {\"task_type\": int}.",
     )
+
+    off_policy_group = parser.add_mutually_exclusive_group()
+    off_policy_group.add_argument(
+        "--off-policy",
+        dest="off_policy",
+        action="store_true",
+        help="Enable off-policy replay mixing in train_step updates.",
+    )
+    off_policy_group.add_argument(
+        "--no-off-policy",
+        dest="off_policy",
+        action="store_false",
+        help="Disable off-policy replay mixing in train_step updates.",
+    )
+    parser.set_defaults(off_policy=_cfg_bool(config, "off_policy", False))
+    parser.add_argument(
+        "--off-policy-mix-ratio",
+        type=float,
+        default=_cfg_float(config, "off_policy_mix_ratio", 0.5),
+        help="Fraction of train groups sourced from replay when off-policy is active.",
+    )
+    parser.add_argument(
+        "--off-policy-buffer-size",
+        type=int,
+        default=_cfg_int(config, "off_policy_buffer_size", 4096),
+        help="Max number of train groups stored in off-policy replay buffer.",
+    )
+    parser.add_argument(
+        "--off-policy-warmup-steps",
+        type=int,
+        default=_cfg_int(config, "off_policy_warmup_steps", 10),
+        help="Minimum number of train steps before off-policy replay can be used.",
+    )
+    parser.add_argument(
+        "--off-policy-min-buffer-groups",
+        type=int,
+        default=_cfg_int(config, "off_policy_min_buffer_groups", 64),
+        help="Minimum replay groups required before off-policy replay is used.",
+    )
+
     reasoning_group = parser.add_mutually_exclusive_group()
     reasoning_group.add_argument(
         "--reasoning",
@@ -619,6 +666,18 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--rollout-retries must be >= 0")
     if args.rollout_retry_backoff_s <= 0.0:
         raise ValueError("--rollout-retry-backoff-s must be > 0")
+    if not (0.0 <= args.off_policy_mix_ratio <= 1.0):
+        raise ValueError("--off-policy-mix-ratio must be in [0,1]")
+    if args.off_policy_buffer_size <= 0:
+        raise ValueError("--off-policy-buffer-size must be > 0")
+    if args.off_policy_warmup_steps < 0:
+        raise ValueError("--off-policy-warmup-steps must be >= 0")
+    if args.off_policy_min_buffer_groups <= 0:
+        raise ValueError("--off-policy-min-buffer-groups must be > 0")
+    if args.off_policy_min_buffer_groups > args.off_policy_buffer_size:
+        raise ValueError(
+            "--off-policy-min-buffer-groups must be <= --off-policy-buffer-size"
+        )
     if not (0.0 <= args.best_move_optimal_reward <= 1.0):
         raise ValueError("--best-move-optimal-reward must be in [0,1]")
     if not args.checkpoint_avg_splits:
@@ -1384,6 +1443,53 @@ def _numeric_metrics_only(metrics: dict[str, Any]) -> dict[str, float]:
     return out
 
 
+def _compose_train_groups(
+    *,
+    on_policy_groups: list[Any],
+    replay_groups: list[Any],
+    off_policy: bool,
+    off_policy_mix_ratio: float,
+    off_policy_warmup_steps: int,
+    off_policy_min_buffer_groups: int,
+    global_step: int,
+    rng: random.Random,
+) -> tuple[list[Any], int]:
+    if not on_policy_groups:
+        return [], 0
+    if not off_policy:
+        return list(on_policy_groups), 0
+    if off_policy_mix_ratio <= 0.0:
+        return list(on_policy_groups), 0
+    if global_step < off_policy_warmup_steps:
+        return list(on_policy_groups), 0
+    if len(replay_groups) < off_policy_min_buffer_groups:
+        return list(on_policy_groups), 0
+
+    desired_off_policy = int(round(len(on_policy_groups) * off_policy_mix_ratio))
+    if desired_off_policy <= 0:
+        desired_off_policy = 1
+    desired_off_policy = min(
+        desired_off_policy,
+        len(on_policy_groups),
+        len(replay_groups),
+    )
+    if desired_off_policy <= 0:
+        return list(on_policy_groups), 0
+
+    keep_on_policy = len(on_policy_groups) - desired_off_policy
+    if keep_on_policy <= 0:
+        selected_on_policy: list[Any] = []
+    elif keep_on_policy >= len(on_policy_groups):
+        selected_on_policy = list(on_policy_groups)
+    else:
+        selected_on_policy = rng.sample(list(on_policy_groups), k=keep_on_policy)
+
+    selected_off_policy = rng.sample(list(replay_groups), k=desired_off_policy)
+    mixed = selected_on_policy + selected_off_policy
+    rng.shuffle(mixed)
+    return mixed, desired_off_policy
+
+
 def _rank_checkpoint_eval_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     saved_entries = [item for item in history if bool(item.get("checkpoint_saved"))]
     candidates = saved_entries if saved_entries else history
@@ -1586,6 +1692,11 @@ def main(argv: Optional[list[str]] = None) -> None:
             "temperature": args.temperature,
             "top_p": args.top_p,
             "max_tokens": args.max_tokens,
+            "off_policy": args.off_policy,
+            "off_policy_mix_ratio": args.off_policy_mix_ratio,
+            "off_policy_buffer_size": args.off_policy_buffer_size,
+            "off_policy_warmup_steps": args.off_policy_warmup_steps,
+            "off_policy_min_buffer_groups": args.off_policy_min_buffer_groups,
             "max_tokens_by_task": args.max_tokens_by_task,
             "reasoning": args.reasoning,
             "task_sampling_weights": {
@@ -1607,6 +1718,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     best_metric_value: Optional[float] = None
     best_step: Optional[int] = None
     checkpoint_eval_history: list[dict[str, Any]] = []
+    replay_buffer: deque[Any] = deque(maxlen=int(args.off_policy_buffer_size))
 
     def _run_checkpoint_eval(
         *,
@@ -1764,7 +1876,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                 f"{len(active_examples)} requests; training on aligned subset"
             )
 
-        groups = []
+        on_policy_groups: list[Any] = []
         rewards_all: list[float] = []
         object_parses = 0
         parse_successes = 0
@@ -1788,14 +1900,30 @@ def main(argv: Optional[list[str]] = None) -> None:
                     parse_successes += 1
 
             if rewards:
-                groups.append(result.to_group(rewards=rewards))
+                on_policy_groups.append(result.to_group(rewards=rewards))
 
-        if not groups:
+        if not on_policy_groups:
             print(f"step {global_step}: no train groups produced; skipping")
             continue
 
+        train_groups, off_policy_groups_used = _compose_train_groups(
+            on_policy_groups=on_policy_groups,
+            replay_groups=list(replay_buffer),
+            off_policy=bool(args.off_policy),
+            off_policy_mix_ratio=float(args.off_policy_mix_ratio),
+            off_policy_warmup_steps=int(args.off_policy_warmup_steps),
+            off_policy_min_buffer_groups=int(args.off_policy_min_buffer_groups),
+            global_step=int(global_step),
+            rng=rng,
+        )
+        replay_buffer.extend(on_policy_groups)
+
+        if not train_groups:
+            print(f"step {global_step}: no train groups selected; skipping")
+            continue
+
         try:
-            train_out = finetune.train_step(groups=groups, lr=args.lr)
+            train_out = finetune.train_step(groups=train_groups, lr=args.lr)
         except (TunaAPIError, TunaNetworkError) as exc:
             print(
                 f"step {global_step}: train_step failed; skipping step. "
@@ -1813,7 +1941,13 @@ def main(argv: Optional[list[str]] = None) -> None:
             "reward_var": reward_var,
             "train_json_object_rate": object_parse_rate,
             "train_json_parse_rate": parse_rate,
-            "accepted_groups": float(len(groups)),
+            "accepted_groups": float(len(train_groups)),
+            "on_policy_groups": float(len(train_groups) - off_policy_groups_used),
+            "off_policy_groups": float(off_policy_groups_used),
+            "off_policy_group_fraction": float(
+                off_policy_groups_used / max(1, len(train_groups))
+            ),
+            "replay_buffer_size": float(len(replay_buffer)),
             "kl": float(train_out.kl or 0.0),
             "router_kl": float(train_out.router_kl or 0.0),
             "grad_norm": float(train_out.grad_norm or 0.0),
@@ -1823,6 +1957,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         print(
             f"step {global_step} reward={reward_mean:.4f} "
             f"obj_parse_rate={object_parse_rate:.4f} parse_rate={parse_rate:.4f} "
+            f"offp={off_policy_groups_used}/{len(train_groups)} "
+            f"replay={len(replay_buffer)} "
             f"kl={float(train_out.kl or 0.0):.4f} "
             f"router_kl={float(train_out.router_kl or 0.0):.4f} "
             f"grad_norm={float(train_out.grad_norm or 0.0):.4f}"

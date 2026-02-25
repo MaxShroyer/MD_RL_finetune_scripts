@@ -268,6 +268,37 @@ class ConfigPrecedenceTests(unittest.TestCase):
             self.assertEqual(args.max_tokens_by_task["legal_moves_list"], 512)
             self.assertEqual(args.max_tokens_by_task["best_move"], 196)
 
+    def test_off_policy_config_and_cli_override_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text(
+                json.dumps(
+                    {
+                        "off_policy": True,
+                        "off_policy_mix_ratio": 0.75,
+                        "off_policy_buffer_size": 2048,
+                        "off_policy_warmup_steps": 12,
+                        "off_policy_min_buffer_groups": 96,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            args = mod.parse_args(
+                [
+                    "--config",
+                    str(cfg_path),
+                    "--no-off-policy",
+                    "--off-policy-mix-ratio",
+                    "0.25",
+                ]
+            )
+            self.assertFalse(args.off_policy)
+            self.assertAlmostEqual(args.off_policy_mix_ratio, 0.25, places=6)
+            self.assertEqual(args.off_policy_buffer_size, 2048)
+            self.assertEqual(args.off_policy_warmup_steps, 12)
+            self.assertEqual(args.off_policy_min_buffer_groups, 96)
+
     def test_unknown_config_key_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = Path(tmp) / "cfg.json"
@@ -402,6 +433,45 @@ class SamplingConfigTests(unittest.TestCase):
 
         self.assertGreater(weighted_counts["legal_moves_list"], uniform_counts["legal_moves_list"])
         self.assertGreater(weighted_counts["best_move"], uniform_counts["best_move"])
+
+
+class OffPolicyMixTests(unittest.TestCase):
+    def test_compose_train_groups_skips_off_policy_before_warmup(self) -> None:
+        on_policy = ["on0", "on1", "on2", "on3"]
+        replay = ["rp0", "rp1", "rp2", "rp3", "rp4", "rp5"]
+
+        mixed, off_policy_count = mod._compose_train_groups(
+            on_policy_groups=on_policy,
+            replay_groups=replay,
+            off_policy=True,
+            off_policy_mix_ratio=0.5,
+            off_policy_warmup_steps=10,
+            off_policy_min_buffer_groups=2,
+            global_step=3,
+            rng=random.Random(7),
+        )
+        self.assertEqual(mixed, on_policy)
+        self.assertEqual(off_policy_count, 0)
+
+    def test_compose_train_groups_mixes_replay_after_warmup(self) -> None:
+        on_policy = ["on0", "on1", "on2", "on3"]
+        replay = ["rp0", "rp1", "rp2", "rp3", "rp4", "rp5"]
+
+        mixed, off_policy_count = mod._compose_train_groups(
+            on_policy_groups=on_policy,
+            replay_groups=replay,
+            off_policy=True,
+            off_policy_mix_ratio=0.5,
+            off_policy_warmup_steps=1,
+            off_policy_min_buffer_groups=2,
+            global_step=4,
+            rng=random.Random(11),
+        )
+        replay_in_mixed = sum(1 for item in mixed if item.startswith("rp"))
+
+        self.assertEqual(len(mixed), len(on_policy))
+        self.assertEqual(off_policy_count, 2)
+        self.assertEqual(replay_in_mixed, off_policy_count)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ This folder contains query-skill RL finetuning and benchmarking for the syntheti
 - `benchmark_ttt_query.py`: split benchmark runner against `/query`.
 - `configs/query_rl_default.json`: default training config.
 - `configs/query_rl_quick.json`: quick training config.
+- `configs/query_rl_off_policy.json`: off-policy replay config.
 - `configs/benchmark_default.json`: default benchmark config.
 - `.env.example`: required environment variable template.
 
@@ -42,6 +43,12 @@ python tictaktoe_QA/train_ttt_query_rl.py \
   --max-tokens-by-task-json '{"legal_moves_list":384}'
 ```
 
+Off-policy replay config:
+```bash
+python tictaktoe_QA/train_ttt_query_rl.py \
+  --config tictaktoe_QA/configs/query_rl_off_policy.json
+```
+
 Local JSONL fallback:
 ```bash
 python tictaktoe_QA/train_ttt_query_rl.py \
@@ -56,6 +63,9 @@ python tictaktoe_QA/train_ttt_query_rl.py \
 - `reasoning` (bool): toggles query reasoning mode (default `false`).
 - `task_sampling_weights` (object): `task_type -> weight`, missing tasks default to `1.0`.
 - `max_tokens_by_task` (object): optional `task_type -> max_tokens`; fallback is global `max_tokens`.
+- `off_policy` (bool): enable replay-buffer off-policy group mixing during train updates.
+- `off_policy_mix_ratio` (float in `[0,1]`): target fraction of train groups sampled from replay.
+- `off_policy_buffer_size` / `off_policy_warmup_steps` / `off_policy_min_buffer_groups`: replay capacity and activation thresholds.
 - `checkpoint_avg_splits` (list): splits to average during periodic eval/checkpoint ranking.
 - `checkpoint_ranking_output` (path): JSON artifact with all ranked eval checkpoints.
 

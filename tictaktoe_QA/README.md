@@ -49,6 +49,53 @@ python tictaktoe_QA/train_ttt_query_rl.py \
   --config tictaktoe_QA/configs/query_rl_off_policy.json
 ```
 
+Hyperparameter sweep (staged Optuna TPE):
+```bash
+pip install optuna
+```
+
+Run paths in this section assume you are in repo root:
+`/Users/maxs/Documents/Repos/MD/MD_RL_Pipe/RL_amazon_logo`
+
+If you run from inside `tictaktoe_QA/`, drop the `tictaktoe_QA/` prefix from script/config paths.
+
+Dry-run (generates planned trial configs/artifacts only):
+```bash
+python tictaktoe_QA/sweep_ttt_query_optuna.py \
+  --base-config tictaktoe_QA/configs/query_rl_off_policy.json \
+  --sweep-config tictaktoe_QA/configs/query_rl_sweep_optuna.json \
+  --study-name ttt_query_sweep_v1 \
+  --dry-run
+```
+
+Normal sweep run:
+```bash
+python tictaktoe_QA/sweep_ttt_query_optuna.py \
+  --base-config tictaktoe_QA/configs/query_rl_off_policy.json \
+  --sweep-config tictaktoe_QA/configs/query_rl_sweep_optuna.json \
+  --study-name ttt_query_sweep_v1
+```
+
+Resume an existing sweep:
+```bash
+python tictaktoe_QA/sweep_ttt_query_optuna.py \
+  --base-config tictaktoe_QA/configs/query_rl_off_policy.json \
+  --sweep-config tictaktoe_QA/configs/query_rl_sweep_optuna.json \
+  --study-name ttt_query_sweep_v1 \
+  --resume
+```
+
+Sweep artifacts are written under:
+`tictaktoe_QA/outputs/sweeps/<study_name>/`
+
+Key outputs:
+- `optuna.db`: persistent Optuna study storage.
+- `resolved_sweep_config.json`: fully resolved runtime sweep settings.
+- `stage_a_results.json`, `stage_b_results.json`, `stage_c_results.json`: trial outcomes per stage.
+- `final_confirmation_results.json`: multi-seed confirmation runs + aggregate ranking.
+- `best_config.json`: selected winning config payload.
+- `summary.json`: top-level run summary and artifact pointers.
+
 Local JSONL fallback:
 ```bash
 python tictaktoe_QA/train_ttt_query_rl.py \

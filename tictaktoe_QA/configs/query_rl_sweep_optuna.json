@@ -1,0 +1,59 @@
+{
+  "objective_metric": "best_avg_eval_reward",
+  "screening_overrides": {
+    "num_steps": 100,
+    "eval_every": 10,
+    "eval_fixed_subset_size": 256,
+    "eval_fixed_subset_seed": 1337,
+    "eval_temperature": 0.0,
+    "eval_top_p": 1.0,
+    "max_tokens": 64,
+    "max_tokens_by_task": {
+      "best_move": 32,
+      "legal_moves_count": 32,
+      "legal_moves_list": 128
+    },
+    "top_p": 1.0,
+    "reasoning": true,
+    "early_stop": true,
+    "early_stop_mode": "balanced",
+    "skip_final_eval": true
+  },
+  "stage_a": {
+    "lr_values": [
+      0.0001,
+      0.0002,
+      0.0005,
+      0.001
+    ],
+    "group_size": 4,
+    "temperature": 0.7,
+    "off_policy": false,
+    "keep_top_k": 2
+  },
+  "stage_b": {
+    "group_size_values": [
+      2,
+      4,
+      8
+    ],
+    "keep_top_k": 2
+  },
+  "stage_c": {
+    "mix_ratios_default": [
+      0.0,
+      0.25,
+      0.5
+    ],
+    "mix_ratios_if_stable": [
+      0.25,
+      0.5,
+      0.75
+    ],
+    "warmup_buffer_pairs": [
+      [10, 64],
+      [30, 128]
+    ],
+    "keep_top_k": 2
+  }
+}

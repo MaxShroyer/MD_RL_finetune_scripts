@@ -139,10 +139,17 @@ TRAIN_CONFIG_ALLOWED_KEYS = {
     "checkpoint_ranking_output",
     "dataset_dir",
     "dataset_source",
+    "early_stop",
+    "early_stop_mode",
     "env_file",
     "eval_batch_size",
     "eval_every",
+    "eval_fixed_subset_seed",
+    "eval_fixed_subset_size",
     "eval_max_samples",
+    "eval_reasoning",
+    "eval_temperature",
+    "eval_top_p",
     "final_eval_splits",
     "finetune_id",
     "finetune_name",
@@ -168,6 +175,7 @@ TRAIN_CONFIG_ALLOWED_KEYS = {
     "rollout_retries",
     "rollout_retry_backoff_s",
     "save_every",
+    "skip_final_eval",
     "save_on_eval",
     "seed",
     "task_sampling_weights",
@@ -178,6 +186,8 @@ TRAIN_CONFIG_ALLOWED_KEYS = {
     "wandb_project",
     "wandb_run_name",
 }
+
+EARLY_STOP_MODES = ("conservative", "balanced", "aggressive")
 
 
 @dataclass(frozen=True)
@@ -302,6 +312,52 @@ def _cfg_bool(config: dict[str, Any], key: str, fallback: bool) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return fallback
+
+
+def _cfg_optional_float(config: dict[str, Any], key: str) -> Optional[float]:
+    value = config.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"", "none", "null", "inherit"}:
+            return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _cfg_optional_bool(config: dict[str, Any], key: str) -> Optional[bool]:
+    value = config.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"", "none", "null", "inherit"}:
+            return None
+        if lowered in {"true", "1", "yes", "y", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "n", "off"}:
+            return False
+    if isinstance(value, (int, float)):
+        if value == 0:
+            return False
+        if value == 1:
+            return True
+    return None
+
+
+def _parse_optional_float_arg(raw_value: str) -> Optional[float]:
+    text = str(raw_value or "").strip().lower()
+    if text in {"", "none", "null", "inherit"}:
+        return None
+    try:
+        return float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected float or inherit/none/null, got: {raw_value!r}") from exc
 
 
 def _parse_json_object_arg(raw_value: str, arg_name: str) -> dict[str, Any]:
@@ -442,6 +498,18 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
     parser.add_argument("--top-p", type=float, default=_cfg_float(config, "top_p", 0.9))
     parser.add_argument("--max-tokens", type=int, default=_cfg_int(config, "max_tokens", 256))
     parser.add_argument(
+        "--eval-temperature",
+        type=_parse_optional_float_arg,
+        default=_cfg_optional_float(config, "eval_temperature"),
+        help="Eval temperature override. Use inherit/none/null to reuse rollout temperature.",
+    )
+    parser.add_argument(
+        "--eval-top-p",
+        type=_parse_optional_float_arg,
+        default=_cfg_optional_float(config, "eval_top_p"),
+        help="Eval top-p override. Use inherit/none/null to reuse rollout top-p.",
+    )
+    parser.add_argument(
         "--task-sampling-weights-json",
         default="",
         help="JSON object override for task sampling weights: {\"task_type\": weight}.",
@@ -505,6 +573,27 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
         help="Disable reasoning mode in query requests.",
     )
     parser.set_defaults(reasoning=_cfg_bool(config, "reasoning", DEFAULT_REASONING))
+    eval_reasoning_group = parser.add_mutually_exclusive_group()
+    eval_reasoning_group.add_argument(
+        "--eval-reasoning",
+        dest="eval_reasoning",
+        action="store_true",
+        help="Force reasoning=true for eval requests.",
+    )
+    eval_reasoning_group.add_argument(
+        "--no-eval-reasoning",
+        dest="eval_reasoning",
+        action="store_false",
+        help="Force reasoning=false for eval requests.",
+    )
+    eval_reasoning_group.add_argument(
+        "--eval-reasoning-inherit",
+        dest="eval_reasoning",
+        action="store_const",
+        const=None,
+        help="Inherit eval reasoning from rollout --reasoning.",
+    )
+    parser.set_defaults(eval_reasoning=_cfg_optional_bool(config, "eval_reasoning"))
 
     parser.add_argument("--eval-every", type=int, default=_cfg_int(config, "eval_every", 20))
     parser.add_argument("--save-every", type=int, default=_cfg_int(config, "save_every", 20))
@@ -528,6 +617,18 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
         type=int,
         default=_cfg_int(config, "eval_max_samples", 1000),
         help="Max samples per eval split. <=0 means full split.",
+    )
+    parser.add_argument(
+        "--eval-fixed-subset-size",
+        type=int,
+        default=_cfg_int(config, "eval_fixed_subset_size", 0),
+        help="Fixed deterministic eval subset size per split. <=0 disables fixed subsets.",
+    )
+    parser.add_argument(
+        "--eval-fixed-subset-seed",
+        type=int,
+        default=_cfg_int(config, "eval_fixed_subset_seed", 1337),
+        help="Seed used for deterministic eval fixed subset index generation.",
     )
     parser.add_argument(
         "--checkpoint-avg-splits",
@@ -562,6 +663,40 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
         type=float,
         default=_cfg_float(config, "best_move_optimal_reward", 0.7),
     )
+    early_stop_group = parser.add_mutually_exclusive_group()
+    early_stop_group.add_argument(
+        "--early-stop",
+        dest="early_stop",
+        action="store_true",
+        help="Enable periodic eval-based early termination rules.",
+    )
+    early_stop_group.add_argument(
+        "--no-early-stop",
+        dest="early_stop",
+        action="store_false",
+        help="Disable eval-based early termination rules.",
+    )
+    parser.set_defaults(early_stop=_cfg_bool(config, "early_stop", False))
+    parser.add_argument(
+        "--early-stop-mode",
+        choices=list(EARLY_STOP_MODES),
+        default=_cfg_str(config, "early_stop_mode", "balanced"),
+        help="Threshold profile for early-stop collapse/plateau checks.",
+    )
+    skip_final_eval_group = parser.add_mutually_exclusive_group()
+    skip_final_eval_group.add_argument(
+        "--skip-final-eval",
+        dest="skip_final_eval",
+        action="store_true",
+        help="Skip final post-training split evals (useful for sweep screening).",
+    )
+    skip_final_eval_group.add_argument(
+        "--no-skip-final-eval",
+        dest="skip_final_eval",
+        action="store_false",
+        help="Run final post-training split evals.",
+    )
+    parser.set_defaults(skip_final_eval=_cfg_bool(config, "skip_final_eval", False))
 
     parser.add_argument("--wandb-project", default=_cfg_str(config, "wandb_project", "moondream-ttt-query-rl"))
     parser.add_argument("--wandb-run-name", default=_cfg_str(config, "wandb_run_name", ""))
@@ -654,6 +789,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--temperature must be in [0,2]")
     if not (0.0 < args.top_p <= 1.0):
         raise ValueError("--top-p must be in (0,1]")
+    if args.eval_temperature is not None and not (0.0 <= float(args.eval_temperature) <= 2.0):
+        raise ValueError("--eval-temperature must be in [0,2] when set")
+    if args.eval_top_p is not None and not (0.0 < float(args.eval_top_p) <= 1.0):
+        raise ValueError("--eval-top-p must be in (0,1] when set")
     if args.max_tokens <= 0:
         raise ValueError("--max-tokens must be > 0")
     if args.eval_every < 0:
@@ -662,6 +801,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--save-every must be >= 0")
     if args.eval_batch_size <= 0:
         raise ValueError("--eval-batch-size must be > 0")
+    if args.eval_fixed_subset_size < 0:
+        raise ValueError("--eval-fixed-subset-size must be >= 0")
     if args.rollout_retries < 0:
         raise ValueError("--rollout-retries must be >= 0")
     if args.rollout_retry_backoff_s <= 0.0:
@@ -680,6 +821,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
     if not (0.0 <= args.best_move_optimal_reward <= 1.0):
         raise ValueError("--best-move-optimal-reward must be in [0,1]")
+    if args.early_stop_mode not in EARLY_STOP_MODES:
+        raise ValueError(f"--early-stop-mode must be one of {list(EARLY_STOP_MODES)}")
     if not args.checkpoint_avg_splits:
         raise ValueError("--checkpoint-avg-splits must contain at least one split")
 
@@ -1280,10 +1423,14 @@ def _evaluate_split(
     reasoning: bool,
     best_move_optimal_reward: float,
     show_progress: bool,
+    fixed_indices: Optional[list[int]] = None,
 ) -> dict[str, float]:
-    rng = random.Random(seed)
-    indices = list(range(len(examples)))
-    rng.shuffle(indices)
+    if fixed_indices is not None:
+        indices = [idx for idx in fixed_indices if 0 <= idx < len(examples)]
+    else:
+        rng = random.Random(seed)
+        indices = list(range(len(examples)))
+        rng.shuffle(indices)
     if max_samples is not None:
         indices = indices[: max(0, min(max_samples, len(indices)))]
 
@@ -1443,6 +1590,98 @@ def _numeric_metrics_only(metrics: dict[str, Any]) -> dict[str, float]:
     return out
 
 
+def _split_seed_offset(split_name: str) -> int:
+    return sum((idx + 1) * ord(ch) for idx, ch in enumerate(str(split_name)))
+
+
+def _build_fixed_eval_indices(
+    *,
+    split_examples: dict[str, list[QAExample]],
+    fixed_subset_size: int,
+    fixed_subset_seed: int,
+    max_samples: Optional[int],
+) -> dict[str, list[int]]:
+    if fixed_subset_size <= 0:
+        return {}
+
+    out: dict[str, list[int]] = {}
+    for split_name, examples in split_examples.items():
+        if not examples:
+            out[split_name] = []
+            continue
+        indices = list(range(len(examples)))
+        rng = random.Random(int(fixed_subset_seed) + _split_seed_offset(split_name))
+        rng.shuffle(indices)
+        limit = min(len(indices), int(fixed_subset_size))
+        if max_samples is not None:
+            limit = min(limit, int(max_samples))
+        out[split_name] = indices[:limit]
+    return out
+
+
+def _early_stop_thresholds(mode: str) -> dict[str, float]:
+    normalized = str(mode).strip().lower()
+    if normalized == "conservative":
+        return {
+            "parse_floor": 0.50,
+            "parse_streak": 3.0,
+            "reward_drop": 0.30,
+            "reward_drop_streak": 3.0,
+            "plateau_window": 5.0,
+            "plateau_min_improvement": 0.005,
+        }
+    if normalized == "aggressive":
+        return {
+            "parse_floor": 0.70,
+            "parse_streak": 2.0,
+            "reward_drop": 0.15,
+            "reward_drop_streak": 2.0,
+            "plateau_window": 3.0,
+            "plateau_min_improvement": 0.02,
+        }
+    return {
+        "parse_floor": 0.60,
+        "parse_streak": 2.0,
+        "reward_drop": 0.20,
+        "reward_drop_streak": 2.0,
+        "plateau_window": 4.0,
+        "plateau_min_improvement": 0.01,
+    }
+
+
+def _should_early_stop(
+    *,
+    mode: str,
+    parse_streak: int,
+    reward_drop_streak: int,
+    recent_eval_rewards: list[float],
+) -> tuple[bool, str, bool]:
+    thresholds = _early_stop_thresholds(mode)
+    if parse_streak >= int(thresholds["parse_streak"]):
+        return True, "collapse_parse_floor", True
+    if reward_drop_streak >= int(thresholds["reward_drop_streak"]):
+        return True, "collapse_reward_drop", True
+
+    plateau_window = int(thresholds["plateau_window"])
+    if plateau_window > 0 and len(recent_eval_rewards) >= plateau_window:
+        window = recent_eval_rewards[-plateau_window:]
+        if window and (max(window) - min(window)) < float(thresholds["plateau_min_improvement"]):
+            return True, "plateau_no_improvement", False
+
+    return False, "", False
+
+
+def _default_training_status(*, target_steps: int, early_stop_mode: str) -> dict[str, Any]:
+    return {
+        "stopped_early": False,
+        "stop_reason": "",
+        "completed_steps": 0,
+        "target_steps": int(target_steps),
+        "early_stop_mode": str(early_stop_mode),
+        "collapse_detected": False,
+    }
+
+
 def _compose_train_groups(
     *,
     on_policy_groups: list[Any],
@@ -1506,16 +1745,25 @@ def _build_checkpoint_ranking_payload(
     checkpoint_avg_metric: str,
     checkpoint_avg_splits: list[str],
     checkpoint_eval_history: list[dict[str, Any]],
+    training_status: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     ranking = _rank_checkpoint_eval_history(checkpoint_eval_history)
     best_avg_eval_reward = float(ranking[0]["avg_eval_reward_mean"]) if ranking else 0.0
     best_avg_eval_reward_step = int(ranking[0]["step"]) if ranking else -1
+    status_payload = dict(training_status or {})
+    status_payload.setdefault("stopped_early", False)
+    status_payload.setdefault("stop_reason", "")
+    status_payload.setdefault("completed_steps", 0)
+    status_payload.setdefault("target_steps", 0)
+    status_payload.setdefault("early_stop_mode", "balanced")
+    status_payload.setdefault("collapse_detected", False)
     return {
         "finetune_id": finetune_id,
         "checkpoint_avg_metric": checkpoint_avg_metric,
         "checkpoint_avg_splits": checkpoint_avg_splits,
         "best_avg_eval_reward": best_avg_eval_reward,
         "best_avg_eval_reward_step": best_avg_eval_reward_step,
+        "training_status": status_payload,
         "rankings": ranking,
     }
 
@@ -1581,6 +1829,12 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     if args.eval_max_samples is not None and args.eval_max_samples <= 0:
         args.eval_max_samples = None
+
+    eval_temperature = float(args.temperature) if args.eval_temperature is None else float(args.eval_temperature)
+    eval_top_p = float(args.top_p) if args.eval_top_p is None else float(args.eval_top_p)
+    eval_reasoning = bool(args.reasoning) if args.eval_reasoning is None else bool(args.eval_reasoning)
+    eval_fixed_subset_size = int(args.eval_fixed_subset_size)
+    eval_fixed_subset_seed = int(args.eval_fixed_subset_seed)
 
     dataset_dir: Optional[Path] = None
     if args.dataset_source == "local_jsonl":
@@ -1648,6 +1902,22 @@ def main(argv: Optional[list[str]] = None) -> None:
     for split in final_eval_splits:
         final_eval_examples[split] = _examples_for_split(split)
     checkpoint_avg_examples = {split: _examples_for_split(split) for split in checkpoint_avg_splits}
+    eval_splits_for_fixed_indices: dict[str, list[QAExample]] = {args.val_split: val_examples}
+    eval_splits_for_fixed_indices.update(checkpoint_avg_examples)
+    eval_splits_for_fixed_indices.update(final_eval_examples)
+    fixed_eval_indices_by_split = _build_fixed_eval_indices(
+        split_examples=eval_splits_for_fixed_indices,
+        fixed_subset_size=eval_fixed_subset_size,
+        fixed_subset_seed=eval_fixed_subset_seed,
+        max_samples=args.eval_max_samples,
+    )
+    if fixed_eval_indices_by_split:
+        print(
+            "using fixed eval subsets: "
+            + ", ".join(
+                f"{name}={len(indices)}" for name, indices in sorted(fixed_eval_indices_by_split.items())
+            )
+        )
 
     if not args.finetune_id and not args.finetune_name:
         args.finetune_name = f"ttt-query-rl-{_random_suffix()}"
@@ -1691,6 +1961,12 @@ def main(argv: Optional[list[str]] = None) -> None:
             "rollout_retry_backoff_s": args.rollout_retry_backoff_s,
             "temperature": args.temperature,
             "top_p": args.top_p,
+            "eval_temperature": eval_temperature,
+            "eval_top_p": eval_top_p,
+            "eval_reasoning": eval_reasoning,
+            "eval_temperature_override": args.eval_temperature,
+            "eval_top_p_override": args.eval_top_p,
+            "eval_reasoning_override": args.eval_reasoning,
             "max_tokens": args.max_tokens,
             "off_policy": args.off_policy,
             "off_policy_mix_ratio": args.off_policy_mix_ratio,
@@ -1708,6 +1984,11 @@ def main(argv: Optional[list[str]] = None) -> None:
             "save_on_eval": args.save_on_eval,
             "eval_batch_size": args.eval_batch_size,
             "eval_max_samples": args.eval_max_samples,
+            "eval_fixed_subset_size": eval_fixed_subset_size,
+            "eval_fixed_subset_seed": eval_fixed_subset_seed,
+            "early_stop": args.early_stop,
+            "early_stop_mode": args.early_stop_mode,
+            "skip_final_eval": args.skip_final_eval,
             "best_metric": args.best_metric,
             "best_move_optimal_reward": args.best_move_optimal_reward,
             "checkpoint_ranking_output": args.checkpoint_ranking_output,
@@ -1717,6 +1998,15 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     best_metric_value: Optional[float] = None
     best_step: Optional[int] = None
+    best_eval_reward_seen: Optional[float] = None
+    low_parse_streak = 0
+    reward_drop_streak = 0
+    recent_eval_rewards: list[float] = []
+    completed_steps = 0
+    training_status = _default_training_status(
+        target_steps=int(args.num_steps),
+        early_stop_mode=str(args.early_stop_mode),
+    )
     checkpoint_eval_history: list[dict[str, Any]] = []
     replay_buffer: deque[Any] = deque(maxlen=int(args.off_policy_buffer_size))
 
@@ -1738,13 +2028,14 @@ def main(argv: Optional[list[str]] = None) -> None:
                 max_samples=args.eval_max_samples,
                 rollout_retries=args.rollout_retries,
                 rollout_retry_backoff_s=args.rollout_retry_backoff_s,
-                temperature=args.temperature,
-                top_p=args.top_p,
+                temperature=eval_temperature,
+                top_p=eval_top_p,
                 max_tokens=args.max_tokens,
                 max_tokens_by_task=args.max_tokens_by_task,
-                reasoning=args.reasoning,
+                reasoning=eval_reasoning,
                 best_move_optimal_reward=args.best_move_optimal_reward,
                 show_progress=show_progress,
+                fixed_indices=fixed_eval_indices_by_split.get(split_name),
             )
             by_split[split_name] = split_metrics
             prefix = f"checkpoint_{_sanitize_split_name(split_name)}_"
@@ -1795,13 +2086,14 @@ def main(argv: Optional[list[str]] = None) -> None:
                 max_samples=args.eval_max_samples,
                 rollout_retries=args.rollout_retries,
                 rollout_retry_backoff_s=args.rollout_retry_backoff_s,
-                temperature=args.temperature,
-                top_p=args.top_p,
+                temperature=eval_temperature,
+                top_p=eval_top_p,
                 max_tokens=args.max_tokens,
                 max_tokens_by_task=args.max_tokens_by_task,
-                reasoning=args.reasoning,
+                reasoning=eval_reasoning,
                 best_move_optimal_reward=args.best_move_optimal_reward,
                 show_progress=show_progress,
+                fixed_indices=fixed_eval_indices_by_split.get(args.val_split),
             )
         baseline_wandb_metrics = _select_eval_wandb_metrics(baseline_metrics)
         wandb.log({f"baseline_{k}": v for k, v in baseline_wandb_metrics.items()}, step=args.resume_step)
@@ -1809,6 +2101,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         baseline_metric = float(baseline_metrics.get(args.best_metric, 0.0))
         best_metric_value = baseline_metric
         best_step = args.resume_step
+        best_eval_reward_seen = float(baseline_metrics.get("eval_reward_mean", 0.0))
         print(
             f"baseline eval step={args.resume_step} reward={baseline_metrics['eval_reward_mean']:.4f} "
             f"obj_parse={baseline_metrics['eval_json_object_rate']:.4f} "
@@ -1838,6 +2131,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
     for step in step_iter:
         global_step = args.resume_step + step
+        completed_steps = step + 1
 
         sampled_tasks = rng.choices(sampling_tasks, weights=sampling_weights, k=args.batch_size)
         batch = [rng.choice(train_examples_by_task[task_name]) for task_name in sampled_tasks]
@@ -1989,13 +2283,14 @@ def main(argv: Optional[list[str]] = None) -> None:
                     max_samples=args.eval_max_samples,
                     rollout_retries=args.rollout_retries,
                     rollout_retry_backoff_s=args.rollout_retry_backoff_s,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
+                    temperature=eval_temperature,
+                    top_p=eval_top_p,
                     max_tokens=args.max_tokens,
                     max_tokens_by_task=args.max_tokens_by_task,
-                    reasoning=args.reasoning,
+                    reasoning=eval_reasoning,
                     best_move_optimal_reward=args.best_move_optimal_reward,
                     show_progress=show_progress,
+                    fixed_indices=fixed_eval_indices_by_split.get(args.val_split),
                 )
             wandb.log(_select_eval_wandb_metrics(eval_metrics), step=global_step)
             metric_value = float(eval_metrics.get(args.best_metric, 0.0))
@@ -2043,55 +2338,106 @@ def main(argv: Optional[list[str]] = None) -> None:
             elif checkpoint_eval_history and "checkpoint_saved" not in checkpoint_eval_history[-1]:
                 checkpoint_eval_history[-1]["checkpoint_saved"] = False
 
+            eval_reward_value = float(eval_metrics.get("eval_reward_mean", 0.0))
+            eval_parse_rate_value = float(eval_metrics.get("eval_json_parse_rate", 0.0))
+            thresholds = _early_stop_thresholds(args.early_stop_mode)
+            prior_best_eval_reward = (
+                eval_reward_value if best_eval_reward_seen is None else float(best_eval_reward_seen)
+            )
+
+            if eval_parse_rate_value < float(thresholds["parse_floor"]):
+                low_parse_streak += 1
+            else:
+                low_parse_streak = 0
+
+            if eval_reward_value <= (prior_best_eval_reward - float(thresholds["reward_drop"])):
+                reward_drop_streak += 1
+            else:
+                reward_drop_streak = 0
+
+            if best_eval_reward_seen is None or eval_reward_value > best_eval_reward_seen:
+                best_eval_reward_seen = eval_reward_value
+
+            recent_eval_rewards.append(eval_reward_value)
+            if args.early_stop:
+                should_stop, stop_reason, collapse_detected = _should_early_stop(
+                    mode=args.early_stop_mode,
+                    parse_streak=low_parse_streak,
+                    reward_drop_streak=reward_drop_streak,
+                    recent_eval_rewards=recent_eval_rewards,
+                )
+                if should_stop:
+                    training_status.update(
+                        {
+                            "stopped_early": True,
+                            "stop_reason": stop_reason,
+                            "completed_steps": int(completed_steps),
+                            "collapse_detected": bool(collapse_detected),
+                        }
+                    )
+                    print(
+                        f"early stop triggered at step={global_step}: reason={stop_reason} "
+                        f"parse_streak={low_parse_streak} reward_drop_streak={reward_drop_streak}"
+                    )
+                    break
+
         if args.save_every > 0 and (global_step + 1) % args.save_every == 0:
             _try_save_checkpoint(
                 finetune=finetune,
                 context=f"save_every checkpoint step={global_step}",
             )
 
+    if not bool(training_status.get("stopped_early")):
+        training_status["completed_steps"] = int(completed_steps)
+
     _try_save_checkpoint(
         finetune=finetune,
         context="final checkpoint save",
     )
 
-    final_eval_step = args.resume_step + args.num_steps
-    for idx, (split_name, split_examples) in enumerate(final_eval_examples.items()):
-        eval_metrics = _evaluate_split(
-            finetune=finetune,
-            examples=split_examples,
-            split_name=split_name,
-            seed=args.seed + 5000 + idx,
-            batch_size=args.eval_batch_size,
-            max_workers=args.max_workers,
-            max_samples=args.eval_max_samples,
-            rollout_retries=args.rollout_retries,
-            rollout_retry_backoff_s=args.rollout_retry_backoff_s,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            max_tokens=args.max_tokens,
-            max_tokens_by_task=args.max_tokens_by_task,
-            reasoning=args.reasoning,
-            best_move_optimal_reward=args.best_move_optimal_reward,
-            show_progress=show_progress,
-        )
-        prefix = _metric_prefix_for_split(split_name)
-        final_eval_wandb_metrics = _select_eval_wandb_metrics(eval_metrics)
-        wandb.log({f"{prefix}{k}": v for k, v in final_eval_wandb_metrics.items()}, step=final_eval_step)
+    final_eval_step = args.resume_step + int(completed_steps)
+    if args.skip_final_eval:
+        print("skip_final_eval=true; skipping final split eval pass.")
+    else:
+        for idx, (split_name, split_examples) in enumerate(final_eval_examples.items()):
+            eval_metrics = _evaluate_split(
+                finetune=finetune,
+                examples=split_examples,
+                split_name=split_name,
+                seed=args.seed + 5000 + idx,
+                batch_size=args.eval_batch_size,
+                max_workers=args.max_workers,
+                max_samples=args.eval_max_samples,
+                rollout_retries=args.rollout_retries,
+                rollout_retry_backoff_s=args.rollout_retry_backoff_s,
+                temperature=eval_temperature,
+                top_p=eval_top_p,
+                max_tokens=args.max_tokens,
+                max_tokens_by_task=args.max_tokens_by_task,
+                reasoning=eval_reasoning,
+                best_move_optimal_reward=args.best_move_optimal_reward,
+                show_progress=show_progress,
+                fixed_indices=fixed_eval_indices_by_split.get(split_name),
+            )
+            prefix = _metric_prefix_for_split(split_name)
+            final_eval_wandb_metrics = _select_eval_wandb_metrics(eval_metrics)
+            wandb.log({f"{prefix}{k}": v for k, v in final_eval_wandb_metrics.items()}, step=final_eval_step)
 
-        print(
-            f"final eval split={split_name} reward={eval_metrics['eval_reward_mean']:.4f} "
-            f"obj_parse={eval_metrics['eval_json_object_rate']:.4f} "
-            f"parse={eval_metrics['eval_json_parse_rate']:.4f} "
-            f"best_move_set={eval_metrics['eval_best_move_set_accuracy']:.4f} "
-            f"best_move_canon={eval_metrics['eval_best_move_canonical_accuracy']:.4f} "
-            f"exact_non_best={eval_metrics['eval_exact_accuracy_non_best_move']:.4f}"
-        )
+            print(
+                f"final eval split={split_name} reward={eval_metrics['eval_reward_mean']:.4f} "
+                f"obj_parse={eval_metrics['eval_json_object_rate']:.4f} "
+                f"parse={eval_metrics['eval_json_parse_rate']:.4f} "
+                f"best_move_set={eval_metrics['eval_best_move_set_accuracy']:.4f} "
+                f"best_move_canon={eval_metrics['eval_best_move_canonical_accuracy']:.4f} "
+                f"exact_non_best={eval_metrics['eval_exact_accuracy_non_best_move']:.4f}"
+            )
 
     ranking_payload = _build_checkpoint_ranking_payload(
         finetune_id=finetune.finetune_id,
         checkpoint_avg_metric=args.checkpoint_avg_metric,
         checkpoint_avg_splits=checkpoint_avg_splits,
         checkpoint_eval_history=checkpoint_eval_history,
+        training_status=training_status,
     )
     checkpoint_ranking = ranking_payload["rankings"]
     best_avg_eval_reward = float(ranking_payload["best_avg_eval_reward"])
@@ -2126,6 +2472,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     run.summary["best_avg_eval_reward_step"] = int(best_avg_eval_reward_step)
     run.summary["best_avg_eval_reward_splits"] = ",".join(checkpoint_avg_splits)
     run.summary["checkpoint_ranking_output"] = str(ranking_output_path)
+    run.summary["stopped_early"] = bool(training_status.get("stopped_early"))
+    run.summary["early_stop_reason"] = str(training_status.get("stop_reason", ""))
+    run.summary["completed_steps"] = int(training_status.get("completed_steps", completed_steps))
+    run.summary["target_steps"] = int(training_status.get("target_steps", args.num_steps))
+    run.summary["collapse_detected"] = bool(training_status.get("collapse_detected"))
 
     run.finish()
     client.close()
@@ -2133,7 +2484,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     print(
         f"done. finetune_id={finetune.finetune_id} best_{args.best_metric}={best_metric_value} "
         f"best_step={best_step} best_avg_eval_reward={best_avg_eval_reward} "
-        f"best_avg_eval_reward_step={best_avg_eval_reward_step}"
+        f"best_avg_eval_reward_step={best_avg_eval_reward_step} "
+        f"stopped_early={training_status.get('stopped_early')} "
+        f"stop_reason={training_status.get('stop_reason', '')}"
     )
 
 

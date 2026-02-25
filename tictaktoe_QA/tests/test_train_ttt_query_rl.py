@@ -336,6 +336,65 @@ class ConfigPrecedenceTests(unittest.TestCase):
             self.assertEqual(args.hf_dataset_revision, "main")
             self.assertEqual(args.checkpoint_avg_splits, ["val", "test"])
 
+    def test_eval_and_skip_final_eval_overrides_parsing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text(
+                json.dumps(
+                    {
+                        "reasoning": True,
+                        "eval_temperature": None,
+                        "eval_top_p": None,
+                        "eval_reasoning": None,
+                        "skip_final_eval": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            args = mod.parse_args(
+                [
+                    "--config",
+                    str(cfg_path),
+                    "--eval-temperature",
+                    "0.0",
+                    "--eval-top-p",
+                    "1.0",
+                    "--no-eval-reasoning",
+                    "--skip-final-eval",
+                ]
+            )
+            self.assertEqual(args.eval_temperature, 0.0)
+            self.assertEqual(args.eval_top_p, 1.0)
+            self.assertFalse(args.eval_reasoning)
+            self.assertTrue(args.skip_final_eval)
+
+    def test_eval_fallback_values_when_unset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text(
+                json.dumps(
+                    {
+                        "temperature": 0.7,
+                        "top_p": 0.95,
+                        "reasoning": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = mod.parse_args(["--config", str(cfg_path)])
+            self.assertIsNone(args.eval_temperature)
+            self.assertIsNone(args.eval_top_p)
+            self.assertIsNone(args.eval_reasoning)
+            self.assertEqual(args.temperature if args.eval_temperature is None else args.eval_temperature, 0.7)
+            self.assertEqual(args.top_p if args.eval_top_p is None else args.eval_top_p, 0.95)
+            self.assertTrue(args.reasoning if args.eval_reasoning is None else args.eval_reasoning)
+
+    def test_eval_override_validation(self) -> None:
+        args = mod.parse_args(["--eval-temperature", "2.5"])
+        with self.assertRaisesRegex(ValueError, "--eval-temperature must be in \\[0,2\\]"):
+            mod._validate_args(args)
+
 
 class CheckpointRankingTests(unittest.TestCase):
     def test_rank_checkpoint_eval_history(self) -> None:
@@ -361,6 +420,27 @@ class CheckpointRankingTests(unittest.TestCase):
         self.assertAlmostEqual(payload["best_avg_eval_reward"], 0.7, places=6)
         self.assertEqual(payload["checkpoint_avg_metric"], "eval_reward_mean")
         self.assertEqual(len(payload["rankings"]), 2)
+        self.assertIn("training_status", payload)
+        self.assertFalse(payload["training_status"]["stopped_early"])
+
+    def test_build_checkpoint_ranking_payload_preserves_training_status(self) -> None:
+        payload = mod._build_checkpoint_ranking_payload(
+            finetune_id="ft_123",
+            checkpoint_avg_metric="eval_reward_mean",
+            checkpoint_avg_splits=["val", "test"],
+            checkpoint_eval_history=[],
+            training_status={
+                "stopped_early": True,
+                "stop_reason": "collapse_parse_floor",
+                "completed_steps": 40,
+                "target_steps": 100,
+                "early_stop_mode": "balanced",
+                "collapse_detected": True,
+            },
+        )
+        self.assertTrue(payload["training_status"]["stopped_early"])
+        self.assertEqual(payload["training_status"]["stop_reason"], "collapse_parse_floor")
+        self.assertTrue(payload["training_status"]["collapse_detected"])
 
     def test_rank_checkpoint_eval_history_prefers_saved_candidates(self) -> None:
         history = [
@@ -433,6 +513,81 @@ class SamplingConfigTests(unittest.TestCase):
 
         self.assertGreater(weighted_counts["legal_moves_list"], uniform_counts["legal_moves_list"])
         self.assertGreater(weighted_counts["best_move"], uniform_counts["best_move"])
+
+
+class EvalSubsetAndEarlyStopTests(unittest.TestCase):
+    def _example(self, idx: int) -> mod.QAExample:
+        return mod.QAExample(
+            row_id=f"row_{idx}",
+            split="val",
+            task_type="best_move",
+            question="q",
+            image_path=Path("/tmp/unused.png"),
+            expected_answer={"row": 2, "col": 2},
+            best_move_canonical=5,
+            best_move_optimal_set=frozenset({5}),
+        )
+
+    def test_fixed_eval_indices_reproducible(self) -> None:
+        split_examples = {
+            "val": [self._example(i) for i in range(20)],
+            "test": [self._example(i + 100) for i in range(10)],
+        }
+        first = mod._build_fixed_eval_indices(
+            split_examples=split_examples,
+            fixed_subset_size=8,
+            fixed_subset_seed=1337,
+            max_samples=12,
+        )
+        second = mod._build_fixed_eval_indices(
+            split_examples=split_examples,
+            fixed_subset_size=8,
+            fixed_subset_seed=1337,
+            max_samples=12,
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(len(first["val"]), 8)
+        self.assertEqual(len(first["test"]), 8)
+
+        third = mod._build_fixed_eval_indices(
+            split_examples=split_examples,
+            fixed_subset_size=8,
+            fixed_subset_seed=777,
+            max_samples=12,
+        )
+        self.assertNotEqual(first["val"], third["val"])
+
+    def test_should_early_stop_collapse_and_plateau(self) -> None:
+        stop, reason, collapse = mod._should_early_stop(
+            mode="balanced",
+            parse_streak=2,
+            reward_drop_streak=0,
+            recent_eval_rewards=[0.4, 0.5],
+        )
+        self.assertTrue(stop)
+        self.assertEqual(reason, "collapse_parse_floor")
+        self.assertTrue(collapse)
+
+        stop, reason, collapse = mod._should_early_stop(
+            mode="balanced",
+            parse_streak=0,
+            reward_drop_streak=0,
+            recent_eval_rewards=[0.50, 0.505, 0.507, 0.506],
+        )
+        self.assertTrue(stop)
+        self.assertEqual(reason, "plateau_no_improvement")
+        self.assertFalse(collapse)
+
+    def test_should_early_stop_not_triggered_with_clean_metrics(self) -> None:
+        stop, reason, collapse = mod._should_early_stop(
+            mode="balanced",
+            parse_streak=0,
+            reward_drop_streak=0,
+            recent_eval_rewards=[0.4, 0.43, 0.45, 0.48],
+        )
+        self.assertFalse(stop)
+        self.assertEqual(reason, "")
+        self.assertFalse(collapse)
 
 
 class OffPolicyMixTests(unittest.TestCase):

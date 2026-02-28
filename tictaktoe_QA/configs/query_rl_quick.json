@@ -1,10 +1,10 @@
 {
   "env_file": ".env",
   "dataset_source": "hf_hub",
-  "hf_dataset_repo_id": "maxs-m87/tictactoe-qa-v1",
+  "hf_dataset_repo_id": "maxs-m87/tictactoe-qa-v2",
   "hf_dataset_revision": "main",
   "hf_cache_dir": "",
-  "dataset_dir": "synth_dataset/outputs/v1",
+  "dataset_dir": "synth_dataset/outputs/v2",
   "train_split": "train",
   "val_split": "val",
   "final_eval_splits": [
@@ -38,7 +38,7 @@
     "test"
   ],
   "checkpoint_avg_metric": "eval_reward_mean",
-  "checkpoint_ranking_output": "tictaktoe_QA/outputs/checkpoint_ranking.json",
+  "checkpoint_ranking_output": "outputs/checkpoint_ranking.json",
   "seed": 42,
   "best_metric": "eval_reward_mean",
   "best_move_optimal_reward": 0.7,

@@ -4,7 +4,7 @@
   "hf_dataset_repo_id": "maxs-m87/tictactoe-qa-v1",
   "hf_dataset_revision": "main",
   "hf_cache_dir": "",
-  "dataset_dir": "synth_dataset/outputs/v1",
+  "dataset_dir": "synth_dataset/outputs/v2",
   "train_split": "train",
   "val_split": "val",
   "final_eval_splits": [
@@ -25,13 +25,13 @@
   "top_p": 0.9,
   "max_tokens": 256,
   "max_tokens_by_task": {
-    "legal_moves_list": 384
+    "available_moves_list": 384
   },
   "reasoning": true,
   "task_sampling_weights": {
     "best_move": 3.0,
-    "legal_moves_count": 3.0,
-    "legal_moves_list": 4.0
+    "available_moves_count": 3.0,
+    "available_moves_list": 4.0
   },
   "off_policy": true,
   "off_policy_mix_ratio": 0.5,

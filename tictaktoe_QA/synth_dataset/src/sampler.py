@@ -11,6 +11,7 @@ from typing import Iterable
 from .label_engine import BoardRecord
 from .renderer import COLORWAYS
 from .templates import TASK_TYPES
+from tictaktoe_QA.task_schema import normalize_task_type
 
 MAIN_TASK_QUOTAS: dict[str, dict[str, int]] = {
     "train": {
@@ -18,27 +19,27 @@ MAIN_TASK_QUOTAS: dict[str, dict[str, int]] = {
         "has_winning_move": 5600,
         "turn_player": 4800,
         "winner": 5600,
-        "is_terminal": 5600,
-        "legal_moves_count": 4800,
-        "legal_moves_list": 4800,
+        "is_game_over": 5600,
+        "available_moves_count": 4800,
+        "available_moves_list": 4800,
     },
     "val": {
         "best_move": 1100,
         "has_winning_move": 700,
         "turn_player": 600,
         "winner": 700,
-        "is_terminal": 700,
-        "legal_moves_count": 600,
-        "legal_moves_list": 600,
+        "is_game_over": 700,
+        "available_moves_count": 600,
+        "available_moves_list": 600,
     },
     "test": {
         "best_move": 1100,
         "has_winning_move": 700,
         "turn_player": 600,
         "winner": 700,
-        "is_terminal": 700,
-        "legal_moves_count": 600,
-        "legal_moves_list": 600,
+        "is_game_over": 700,
+        "available_moves_count": 600,
+        "available_moves_list": 600,
     },
 }
 
@@ -64,6 +65,7 @@ class SamplingOutput:
 
 
 def _eligible(record: BoardRecord, task_type: str) -> bool:
+    task_type = normalize_task_type(task_type, allow_unknown=True)
     if task_type in {"best_move", "has_winning_move", "turn_player"}:
         return not record.is_terminal
     return True
@@ -252,11 +254,13 @@ def _build_main_rows(
                 raise ValueError(f"No eligible states for split={split_name}, task={task_type}")
             rng.shuffle(eligible)
 
-            explicit_cutoff = int(round(target * 0.7))
             for i in range(target):
                 state_key = eligible[i % len(eligible)]
                 explicit_override: bool | None = None
-                if task_type in {"best_move", "has_winning_move"}:
+                if task_type == "best_move":
+                    explicit_override = True
+                elif task_type == "has_winning_move":
+                    explicit_cutoff = int(round(target * 0.7))
                     explicit_override = i < explicit_cutoff
                 rows.append(
                     RowPlan(
@@ -301,16 +305,16 @@ def _build_benchmark_rows(top50_keys: list[str], records: dict[str, BoardRecord]
     benchmark_states_by_task: dict[str, list[str]] = {
         "best_move": top50_sorted,
         "turn_player": top50_sorted,
-        "legal_moves_count": top50_sorted,
-        "legal_moves_list": top50_sorted,
-        # Include probe states so winner/is_terminal are not all in_progress/False.
+        "available_moves_count": top50_sorted,
+        "available_moves_list": top50_sorted,
+        # Include probe states so winner/is_game_over are not all in_progress/False.
         "winner": (
             _pick_n(top50_sorted, 20)
             + _pick_n(terminal_x, 15)
             + _pick_n(terminal_o, 10)
             + _pick_n(terminal_draw, 5)
         ),
-        "is_terminal": (
+        "is_game_over": (
             _pick_n(top50_sorted, 20)
             + _pick_n(terminal_x, 15)
             + _pick_n(terminal_o, 10)

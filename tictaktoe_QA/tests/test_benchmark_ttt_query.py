@@ -15,11 +15,11 @@ class BenchmarkArgTests(unittest.TestCase):
             cfg_path.write_text(
                 json.dumps(
                     {
-                        "dataset_dir": "tictaktoe_QA/synth_dataset/outputs/smoke_full_jsonl",
+                        "dataset_dir": "synth_dataset/outputs/smoke_full_jsonl",
                         "split": "test",
                         "max_tokens": 111,
                         "reasoning": False,
-                        "task_types": ["best_move", "legal_moves_count"],
+                        "task_types": ["best_move", "available_moves_count"],
                         "checkpoint_step": 148,
                     }
                 ),
@@ -34,13 +34,13 @@ class BenchmarkArgTests(unittest.TestCase):
                     "--max-tokens",
                     "222",
                     "--task-types",
-                    "best_move,legal_moves_list",
+                    "best_move,available_moves_list",
                 ]
             )
 
             self.assertEqual(args.max_tokens, 222)
             self.assertTrue(args.reasoning)
-            self.assertEqual(args.task_types, ["best_move", "legal_moves_list"])
+            self.assertEqual(args.task_types, ["best_move", "available_moves_list"])
             self.assertEqual(args.checkpoint_step, 148)
 
     def test_task_types_from_config_when_cli_omitted(self) -> None:
@@ -49,15 +49,19 @@ class BenchmarkArgTests(unittest.TestCase):
             cfg_path.write_text(
                 json.dumps(
                     {
-                        "dataset_dir": "tictaktoe_QA/synth_dataset/outputs/smoke_full_jsonl",
-                        "task_types": ["best_move", "legal_moves_count"],
+                        "dataset_dir": "synth_dataset/outputs/smoke_full_jsonl",
+                        "task_types": ["best_move", "available_moves_count"],
                     }
                 ),
                 encoding="utf-8",
             )
 
             args = mod._parse_args(["--config", str(cfg_path)])
-            self.assertEqual(args.task_types, ["best_move", "legal_moves_count"])
+            self.assertEqual(args.task_types, ["best_move", "available_moves_count"])
+
+    def test_task_types_legacy_aliases_normalized(self) -> None:
+        args = mod._parse_args(["--task-types", "best_move,legal_moves_count,legal_moves_list"])
+        self.assertEqual(args.task_types, ["best_move", "available_moves_count", "available_moves_list"])
 
     def test_task_types_validation(self) -> None:
         with self.assertRaisesRegex(ValueError, "Unknown task_type"):

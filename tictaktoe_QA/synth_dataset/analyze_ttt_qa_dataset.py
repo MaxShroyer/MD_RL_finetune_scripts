@@ -11,6 +11,8 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
+from tictaktoe_QA.task_schema import normalize_answer_payload_for_task, normalize_task_type
+
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -49,31 +51,34 @@ def _parse_final_answer(row: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _distribution_for_task(rows: list[dict[str, Any]], task_type: str) -> dict[str, int]:
+    canonical_task = normalize_task_type(task_type, allow_unknown=True)
     cnt: Counter[str] = Counter()
     for row in rows:
-        if row.get("task_type") != task_type:
+        row_task_type = normalize_task_type(str(row.get("task_type", "")), allow_unknown=True)
+        if row_task_type != canonical_task:
             continue
         ans = _parse_final_answer(row)
         if ans is None:
             cnt["<invalid_json>"] += 1
             continue
+        ans = normalize_answer_payload_for_task(canonical_task, ans)
 
-        if task_type == "winner":
+        if canonical_task == "winner":
             cnt[str(ans.get("winner"))] += 1
-        elif task_type == "is_terminal":
-            cnt[str(bool(ans.get("is_terminal")))] += 1
-        elif task_type == "has_winning_move":
+        elif canonical_task == "is_game_over":
+            cnt[str(bool(ans.get("is_game_over")))] += 1
+        elif canonical_task == "has_winning_move":
             cnt[str(bool(ans.get("has_winning_move")))] += 1
-        elif task_type == "turn_player":
+        elif canonical_task == "turn_player":
             cnt[str(ans.get("player"))] += 1
-        elif task_type == "best_move":
+        elif canonical_task == "best_move":
             row_v = ans.get("row")
             col_v = ans.get("col")
             cnt[f"({row_v},{col_v})"] += 1
-        elif task_type == "legal_moves_count":
-            cnt[str(ans.get("legal_move_count"))] += 1
-        elif task_type == "legal_moves_list":
-            moves = ans.get("legal_moves")
+        elif canonical_task == "available_moves_count":
+            cnt[str(ans.get("available_move_count"))] += 1
+        elif canonical_task == "available_moves_list":
+            moves = ans.get("available_moves")
             if isinstance(moves, list):
                 cnt[f"len={len(moves)}"] += 1
             else:
@@ -101,17 +106,17 @@ def _summarize_rows(rows_by_split: dict[str, list[dict[str, Any]]]) -> dict[str,
     for split, rows in rows_by_split.items():
         label_dists[split] = {
             "winner": _distribution_for_task(rows, "winner"),
-            "is_terminal": _distribution_for_task(rows, "is_terminal"),
+            "is_game_over": _distribution_for_task(rows, "is_game_over"),
             "has_winning_move": _distribution_for_task(rows, "has_winning_move"),
             "turn_player": _distribution_for_task(rows, "turn_player"),
             "best_move": _distribution_for_task(rows, "best_move"),
-            "legal_moves_count": _distribution_for_task(rows, "legal_moves_count"),
-            "legal_moves_list": _distribution_for_task(rows, "legal_moves_list"),
+            "available_moves_count": _distribution_for_task(rows, "available_moves_count"),
+            "available_moves_list": _distribution_for_task(rows, "available_moves_list"),
         }
 
     expected = {
         "winner": {"X", "O", "draw", "in_progress"},
-        "is_terminal": {"True", "False"},
+        "is_game_over": {"True", "False"},
         "has_winning_move": {"True", "False"},
         "turn_player": {"X", "O"},
     }
@@ -132,7 +137,7 @@ def _summarize_rows(rows_by_split: dict[str, list[dict[str, Any]]]) -> dict[str,
                     warnings.append(
                         f"split={split} task={task} appears degenerate; present={sorted(label_dists[split].get(task, {}).keys())}"
                     )
-                if split.startswith("benchmark_top50_") and task in {"winner", "is_terminal", "has_winning_move"}:
+                if split.startswith("benchmark_top50_") and task in {"winner", "is_game_over", "has_winning_move"}:
                     warnings.append(
                         f"benchmark split={split} task={task} missing labels={missing}; present={sorted(label_dists[split].get(task, {}).keys())}"
                     )
@@ -260,7 +265,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze TicTacToe QA dataset")
     parser.add_argument(
         "--dataset-dir",
-        default=str(Path(__file__).resolve().parent / "outputs" / "v1"),
+        default=str(Path(__file__).resolve().parent / "outputs" / "v2"),
         help="Dataset directory that contains jsonl/*.jsonl",
     )
     parser.add_argument(

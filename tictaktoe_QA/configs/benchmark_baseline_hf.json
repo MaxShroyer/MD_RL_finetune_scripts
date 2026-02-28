@@ -1,7 +1,7 @@
 {
   "env_file": ".env",
   "dataset_source": "hf_hub",
-  "hf_dataset_repo_id": "maxs-m87/tictactoe-qa-v1",
+  "hf_dataset_repo_id": "maxs-m87/tictactoe-qa-v2",
   "hf_dataset_revision": "main",
   "hf_cache_dir": "",
   "dataset_dir": "",

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .label_engine import BoardRecord, move_to_row_col
+from tictaktoe_QA.task_schema import normalize_task_type
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,7 @@ def _state_counts(record: BoardRecord) -> tuple[int, int]:
 
 
 def _base_rationale(task_type: str, final_obj: dict[str, Any], record: BoardRecord) -> str:
+    task_type = normalize_task_type(task_type, allow_unknown=True)
     x_count, o_count = _state_counts(record)
 
     if task_type == "best_move":
@@ -93,8 +95,8 @@ def _base_rationale(task_type: str, final_obj: dict[str, Any], record: BoardReco
     if task_type == "has_winning_move":
         has_win = bool(final_obj.get("has_winning_move", False))
         if has_win:
-            return f"At least one legal move completes three-in-a-row immediately for {record.player_to_move}."
-        return f"No legal move produces an immediate three-in-a-row for {record.player_to_move}."
+            return f"At least one available move completes three-in-a-row immediately for {record.player_to_move}."
+        return f"No available move produces an immediate three-in-a-row for {record.player_to_move}."
 
     if task_type == "turn_player":
         return f"X count is {x_count} and O count is {o_count}, so the next player is {record.player_to_move}."
@@ -104,22 +106,24 @@ def _base_rationale(task_type: str, final_obj: dict[str, Any], record: BoardReco
         if winner == "in_progress":
             return "No winning line exists and open cells remain, so the game is still in progress."
         if winner == "draw":
-            return "No winning line exists and no legal moves remain, so the result is a draw."
+            return "No winning line exists and no available moves remain, so the result is a draw."
         return f"A complete three-in-a-row exists for {winner}."
 
-    if task_type == "is_terminal":
-        return "The state is terminal when a win is present or no legal moves remain."
+    if task_type == "is_game_over":
+        return "The game is over when a win is present or no available moves remain."
 
-    if task_type == "legal_moves_count":
-        return f"Legal moves correspond to empty cells; there are {len(record.legal_moves)} available positions."
+    if task_type == "available_moves_count":
+        return f"Available moves correspond to empty cells; there are {len(record.legal_moves)} available positions."
 
-    if task_type == "legal_moves_list":
-        return "Legal moves are the empty cells listed in top-left to bottom-right order."
+    if task_type == "available_moves_list":
+        return "Available moves are the empty cells listed in top-left to bottom-right order."
 
     raise ValueError(f"unknown task_type: {task_type}")
 
 
 def build_final_answer(task_type: str, record: BoardRecord) -> dict[str, Any]:
+    task_type = normalize_task_type(task_type, allow_unknown=True)
+
     if task_type == "best_move":
         if record.best_move_canonical is None:
             raise ValueError("best_move requested for terminal board")
@@ -135,15 +139,15 @@ def build_final_answer(task_type: str, record: BoardRecord) -> dict[str, Any]:
     if task_type == "winner":
         return {"winner": record.winner_label}
 
-    if task_type == "is_terminal":
-        return {"is_terminal": bool(record.is_terminal)}
+    if task_type == "is_game_over":
+        return {"is_game_over": bool(record.is_terminal)}
 
-    if task_type == "legal_moves_count":
-        return {"legal_move_count": len(record.legal_moves)}
+    if task_type == "available_moves_count":
+        return {"available_move_count": len(record.legal_moves)}
 
-    if task_type == "legal_moves_list":
+    if task_type == "available_moves_list":
         moves = [{"row": move_to_row_col(m)[0], "col": move_to_row_col(m)[1]} for m in record.legal_moves]
-        return {"legal_moves": moves}
+        return {"available_moves": moves}
 
     raise ValueError(f"unknown task_type: {task_type}")
 

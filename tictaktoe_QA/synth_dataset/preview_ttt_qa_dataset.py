@@ -59,7 +59,7 @@ def _pick_examples(rows: list[dict[str, Any]], task_type: str, n: int) -> list[d
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Preview TicTacToe QA dataset")
-    parser.add_argument("--dataset-dir", default=str(Path(__file__).resolve().parent / "outputs" / "v1"))
+    parser.add_argument("--dataset-dir", default=str(Path(__file__).resolve().parent / "outputs" / "v2"))
     parser.add_argument("--out-dir", default="")
     parser.add_argument("--samples-per-task", type=int, default=3)
     parser.add_argument("--samples-per-colorway", type=int, default=12)

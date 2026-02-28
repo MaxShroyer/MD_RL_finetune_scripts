@@ -4,7 +4,7 @@
   "hf_dataset_repo_id": "maxs-m87/tictactoe-qa-v1",
   "hf_dataset_revision": "main",
   "hf_cache_dir": "",
-  "dataset_dir": "synth_dataset/outputs/v1",
+  "dataset_dir": "synth_dataset/outputs/v2",
   "train_split": "train",
   "val_split": "val",
   "final_eval_splits": [
@@ -25,13 +25,13 @@
   "top_p": 0.9,
   "max_tokens": 256,
   "max_tokens_by_task": {
-    "legal_moves_list": 384
+    "available_moves_list": 384
   },
   "reasoning": false,
   "task_sampling_weights": {
     "best_move": 3.0,
-    "legal_moves_count": 3.0,
-    "legal_moves_list": 4.0
+    "available_moves_count": 3.0,
+    "available_moves_list": 4.0
   },
   "max_workers": 4,
   "rollout_retries": 2,
@@ -46,7 +46,9 @@
     "test"
   ],
   "checkpoint_avg_metric": "eval_reward_mean",
-  "checkpoint_ranking_output": "tictaktoe_QA/outputs/checkpoint_ranking.json",
+  "checkpoint_ranking_output": "outputs/checkpoint_ranking.json",
+  "auto_benchmark_best_checkpoint": true,
+  "auto_benchmark_config": "configs/benchmark_default.json",
   "seed": 42,
   "best_metric": "eval_reward_mean",
   "best_move_optimal_reward": 0.7,

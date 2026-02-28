@@ -10,8 +10,8 @@
     "max_tokens": 64,
     "max_tokens_by_task": {
       "best_move": 32,
-      "legal_moves_count": 32,
-      "legal_moves_list": 128
+      "available_moves_count": 32,
+      "available_moves_list": 128
     },
     "top_p": 1.0,
     "reasoning": true,

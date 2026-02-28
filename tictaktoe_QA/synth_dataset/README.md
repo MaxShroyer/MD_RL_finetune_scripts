@@ -7,8 +7,8 @@ This folder builds a synthetic tic-tac-toe QA dataset with:
 - JSONL and HF `DatasetDict` exports, plus HF Hub upload
 
 Benchmark note:
-- `best_move`, `turn_player`, and legal-move tasks use Cloudwalk top-50 states directly.
-- `winner`, `is_terminal`, and `has_winning_move` inject probe states (non-top50) so labels are not degenerate.
+- `best_move`, `turn_player`, and available-move tasks use Cloudwalk top-50 states directly.
+- `winner`, `is_game_over`, and `has_winning_move` inject probe states (non-top50) so labels are not degenerate.
 
 ## Install
 
@@ -19,16 +19,16 @@ source .venv/bin/activate
 pip install -r tictaktoe_QA/synth_dataset/requirements.txt
 ```
 
-## Build (full v1)
+## Build (full v2)
 
 ```bash
 python tictaktoe_QA/synth_dataset/build_ttt_qa_dataset.py \
-  --output-dir tictaktoe_QA/synth_dataset/outputs/v1 \
+  --output-dir tictaktoe_QA/synth_dataset/outputs/v2 \
   --cache-dir tictaktoe_QA/synth_dataset/cache/cloudwalk \
-  --hf-repo-id <your_hf_username>/tictactoe-qa-v1 \
+  --hf-repo-id maxs-m87/tictactoe-qa-v2 \
   --seed 42 \
-  --target-states 3000 \
-  --target-rows 50000
+  --target-states 600 \
+  --target-rows 10000
 ```
 
 By default, the builder loads `tictaktoe_QA/.env` (`--env-file` can override).
@@ -70,7 +70,7 @@ python tictaktoe_QA/synth_dataset/build_ttt_qa_dataset.py \
 
 ```bash
 python tictaktoe_QA/synth_dataset/validate_ttt_qa_dataset.py \
-  --dataset-dir tictaktoe_QA/synth_dataset/outputs/v1 \
+  --dataset-dir tictaktoe_QA/synth_dataset/outputs/v2 \
   --cache-dir tictaktoe_QA/synth_dataset/cache/cloudwalk
 ```
 
@@ -78,7 +78,7 @@ Prediction scoring (optional):
 
 ```bash
 python tictaktoe_QA/synth_dataset/validate_ttt_qa_dataset.py \
-  --dataset-dir tictaktoe_QA/synth_dataset/outputs/v1 \
+  --dataset-dir tictaktoe_QA/synth_dataset/outputs/v2 \
   --predictions-jsonl path/to/predictions.jsonl
 ```
 
@@ -86,7 +86,7 @@ python tictaktoe_QA/synth_dataset/validate_ttt_qa_dataset.py \
 
 ```bash
 python tictaktoe_QA/synth_dataset/analyze_ttt_qa_dataset.py \
-  --dataset-dir tictaktoe_QA/synth_dataset/outputs/v1
+  --dataset-dir tictaktoe_QA/synth_dataset/outputs/v2
 ```
 
 Writes `analysis_report.json` in the dataset output directory and prints key warnings:
@@ -99,7 +99,7 @@ Writes `analysis_report.json` in the dataset output directory and prints key war
 
 ```bash
 python tictaktoe_QA/synth_dataset/preview_ttt_qa_dataset.py \
-  --dataset-dir tictaktoe_QA/synth_dataset/outputs/v1
+  --dataset-dir tictaktoe_QA/synth_dataset/outputs/v2
 ```
 
 Outputs:
@@ -118,3 +118,10 @@ Required row fields follow the public contract:
 - `best_move_canonical_json`, `best_move_optimal_set_json`
 - `depth_complexity`, `choice_complexity_num`, `choice_complexity_den`
 - `colorway`, `augmentation_profile`, `prompt_variant_id`, `source_name`
+
+Compatibility note:
+- canonical task name for game-over classification is `is_game_over`.
+- canonical task names are `available_moves_count` and `available_moves_list`.
+- canonical answer key for game-over classification is `is_game_over`.
+- canonical answer keys are `available_move_count` and `available_moves`.
+- legacy names/keys (`is_terminal`, `legal_*`) are still accepted by train/benchmark/validation tooling.

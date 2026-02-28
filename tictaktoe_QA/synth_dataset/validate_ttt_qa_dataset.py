@@ -19,6 +19,7 @@ from tictaktoe_QA.synth_dataset.src.label_engine import build_board_record, move
 from tictaktoe_QA.synth_dataset.src.rationale import build_final_answer
 from tictaktoe_QA.synth_dataset.src.sampler import MAIN_TASK_QUOTAS
 from tictaktoe_QA.synth_dataset.src.state_source import load_cloudwalk_data
+from tictaktoe_QA.task_schema import normalize_answer_payload_for_task, normalize_task_type
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -59,7 +60,7 @@ def _check_main_counts(rows_by_split: dict[str, list[dict[str, Any]]], expected_
 
     for split_name, expected_task_quota in MAIN_TASK_QUOTAS.items():
         rows = rows_by_split.get(split_name, [])
-        obs = Counter(row["task_type"] for row in rows)
+        obs = Counter(normalize_task_type(str(row["task_type"]), allow_unknown=True) for row in rows)
         for task_type, expected in expected_task_quota.items():
             got = obs.get(task_type, 0)
             if got != expected:
@@ -137,7 +138,7 @@ def _check_label_consistency(rows_by_split: dict[str, list[dict[str, Any]]], sou
             legal_set_row = _as_move_set(row["legal_moves_json"])
             legal_set_gt = set(rec.legal_moves)
             if legal_set_row != legal_set_gt:
-                raise ValueError(f"legal moves mismatch split={split_name} row={idx}")
+                raise ValueError(f"available moves mismatch split={split_name} row={idx}")
 
             best_set_row = _as_move_set(row["best_move_optimal_set_json"])
             if best_set_row != set(rec.best_move_optimal_set):
@@ -147,8 +148,12 @@ def _check_label_consistency(rows_by_split: dict[str, list[dict[str, Any]]], sou
             if best_canon != rec.best_move_canonical:
                 raise ValueError(f"best_move_canonical mismatch split={split_name} row={idx}")
 
-            expected_final = build_final_answer(row["task_type"], rec)
-            observed_final = json.loads(row["final_answer_json"])
+            canonical_task = normalize_task_type(str(row["task_type"]), allow_unknown=True)
+            expected_final = normalize_answer_payload_for_task(canonical_task, build_final_answer(canonical_task, rec))
+            observed_final = normalize_answer_payload_for_task(
+                canonical_task,
+                json.loads(row["final_answer_json"]),
+            )
             if expected_final != observed_final:
                 raise ValueError(f"final_answer mismatch split={split_name} row={idx} task={row['task_type']}")
 
@@ -175,7 +180,7 @@ def _label_coverage_report(rows_by_split: dict[str, list[dict[str, Any]]]) -> di
     for split_name, rows in rows_by_split.items():
         task_labels: dict[str, set[str]] = {
             "winner": set(),
-            "is_terminal": set(),
+            "is_game_over": set(),
             "has_winning_move": set(),
             "turn_player": set(),
         }
@@ -186,8 +191,8 @@ def _label_coverage_report(rows_by_split: dict[str, list[dict[str, Any]]]) -> di
             ans = json.loads(row["final_answer_json"])
             if task == "winner":
                 task_labels[task].add(str(ans["winner"]))
-            elif task == "is_terminal":
-                task_labels[task].add(str(bool(ans["is_terminal"])))
+            elif task == "is_game_over":
+                task_labels[task].add(str(bool(ans["is_game_over"])))
             elif task == "has_winning_move":
                 task_labels[task].add(str(bool(ans["has_winning_move"])))
             elif task == "turn_player":
@@ -216,7 +221,7 @@ def _score_predictions(rows_by_split: dict[str, list[dict[str, Any]]], predictio
             if not isinstance(pred_json_raw, str):
                 continue
             counters["evaluated"] += 1
-            task = row["task_type"]
+            task = normalize_task_type(str(row["task_type"]), allow_unknown=True)
             by_task[f"{task}:count"] += 1
 
             try:
@@ -244,7 +249,9 @@ def _score_predictions(rows_by_split: dict[str, list[dict[str, Any]]], predictio
                     counters["best_move_canonical_correct"] += 1
                     by_task["best_move:canonical_correct"] += 1
             else:
-                if guess == gt:
+                gt_norm = normalize_answer_payload_for_task(task, gt)
+                guess_norm = normalize_answer_payload_for_task(task, guess)
+                if guess_norm == gt_norm:
                     counters["exact_correct"] += 1
                     by_task[f"{task}:exact_correct"] += 1
 
@@ -267,7 +274,7 @@ def _score_predictions(rows_by_split: dict[str, list[dict[str, Any]]], predictio
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate TicTacToe QA dataset")
-    parser.add_argument("--dataset-dir", default=str(Path(__file__).resolve().parent / "outputs" / "v1"))
+    parser.add_argument("--dataset-dir", default=str(Path(__file__).resolve().parent / "outputs" / "v2"))
     parser.add_argument("--cache-dir", default=str(Path(__file__).resolve().parent / "cache" / "cloudwalk"))
     parser.add_argument("--allow-network", action="store_true", default=True)
     parser.add_argument("--no-network", dest="allow_network", action="store_false")
@@ -311,12 +318,12 @@ def main() -> None:
 
     if args.strict_label_diversity:
         for split_name, task_labels in coverage.items():
-            for task_name in ("winner", "is_terminal", "has_winning_move", "turn_player"):
+            for task_name in ("winner", "is_game_over", "has_winning_move", "turn_player"):
                 values = task_labels.get(task_name, [])
                 if split_name.startswith("benchmark_top50_"):
                     # benchmark tracks can be intentionally narrow for some tasks.
                     continue
-                if task_name in {"winner", "is_terminal", "has_winning_move"} and len(values) <= 1:
+                if task_name in {"winner", "is_game_over", "has_winning_move"} and len(values) <= 1:
                     raise ValueError(
                         f"low label diversity: split={split_name} task={task_name} labels={values}"
                     )

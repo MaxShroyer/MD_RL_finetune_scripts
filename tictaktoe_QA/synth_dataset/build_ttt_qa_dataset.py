@@ -38,7 +38,7 @@ def _repo_root() -> Path:
 
 
 def _default_output_dir() -> Path:
-    return Path(__file__).resolve().parent / "outputs" / "v1"
+    return Path(__file__).resolve().parent / "outputs" / "v2"
 
 
 def _default_cache_dir() -> Path:

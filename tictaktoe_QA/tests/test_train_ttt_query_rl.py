@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -36,31 +37,32 @@ class RewardPolicyTests(unittest.TestCase):
             task_type="best_move",
             question="q",
             image_path=Path("/tmp/unused.png"),
-            expected_answer={"row": 2, "col": 2},
-            best_move_canonical=5,
-            best_move_optimal_set=frozenset({1, 5}),
+            expected_answer={"row": 1, "col": 1},
+            best_move_canonical=1,
+            best_move_optimal_set=frozenset({1}),
+            best_move_scores=((1, 1, 6), (5, 1, 8), (9, 0, 9)),
         )
 
     def test_best_move_canonical_reward(self) -> None:
         example = self._best_move_example()
         out = mod._score_payload_for_example(
             example,
-            {"row": 2, "col": 2},
+            {"row": 1, "col": 1},
             best_move_optimal_reward=0.7,
         )
         self.assertEqual(out.reward, 1.0)
         self.assertTrue(out.best_move_set_correct)
         self.assertTrue(out.best_move_canonical_correct)
 
-    def test_best_move_optimal_noncanonical_reward(self) -> None:
+    def test_best_move_ranked_noncanonical_reward(self) -> None:
         example = self._best_move_example()
         out = mod._score_payload_for_example(
             example,
-            {"row": 1, "col": 1},
+            {"row": 2, "col": 2},
             best_move_optimal_reward=0.7,
         )
-        self.assertEqual(out.reward, 0.7)
-        self.assertTrue(out.best_move_set_correct)
+        self.assertAlmostEqual(out.reward, 0.5, places=6)
+        self.assertFalse(out.best_move_set_correct)
         self.assertFalse(out.best_move_canonical_correct)
 
     def test_best_move_incorrect_reward(self) -> None:
@@ -72,6 +74,48 @@ class RewardPolicyTests(unittest.TestCase):
         )
         self.assertEqual(out.reward, 0.0)
         self.assertFalse(out.best_move_set_correct)
+        self.assertFalse(out.best_move_canonical_correct)
+
+    def test_best_move_ranked_tied_best_moves_get_full_reward(self) -> None:
+        example = mod.QAExample(
+            row_id="r0_tied",
+            split="train",
+            task_type="best_move",
+            question="q",
+            image_path=Path("/tmp/unused.png"),
+            expected_answer={"row": 1, "col": 1},
+            best_move_canonical=1,
+            best_move_optimal_set=frozenset({1, 5}),
+            best_move_scores=((1, 1, 6), (5, 1, 6), (9, 0, 9)),
+        )
+        out = mod._score_payload_for_example(
+            example,
+            {"row": 2, "col": 2},
+            best_move_optimal_reward=0.7,
+        )
+        self.assertEqual(out.reward, 1.0)
+        self.assertTrue(out.best_move_set_correct)
+        self.assertFalse(out.best_move_canonical_correct)
+
+    def test_best_move_fallback_reward_without_scores(self) -> None:
+        example = mod.QAExample(
+            row_id="r0_fallback",
+            split="train",
+            task_type="best_move",
+            question="q",
+            image_path=Path("/tmp/unused.png"),
+            expected_answer={"row": 2, "col": 2},
+            best_move_canonical=5,
+            best_move_optimal_set=frozenset({1, 5}),
+            best_move_scores=tuple(),
+        )
+        out = mod._score_payload_for_example(
+            example,
+            {"row": 1, "col": 1},
+            best_move_optimal_reward=0.7,
+        )
+        self.assertEqual(out.reward, 0.7)
+        self.assertTrue(out.best_move_set_correct)
         self.assertFalse(out.best_move_canonical_correct)
 
     def test_turn_player_normalization(self) -> None:
@@ -93,32 +137,32 @@ class RewardPolicyTests(unittest.TestCase):
         self.assertEqual(out.reward, 1.0)
         self.assertTrue(out.exact_non_best_correct)
 
-    def test_legal_moves_list_ordered_match(self) -> None:
+    def test_available_moves_list_ordered_match(self) -> None:
         example = mod.QAExample(
             row_id="r2",
             split="train",
-            task_type="legal_moves_list",
+            task_type="available_moves_list",
             question="q",
             image_path=Path("/tmp/unused.png"),
-            expected_answer={"legal_moves": [{"row": 1, "col": 1}, {"row": 2, "col": 3}]},
+            expected_answer={"available_moves": [{"row": 1, "col": 1}, {"row": 2, "col": 3}]},
             best_move_canonical=None,
             best_move_optimal_set=frozenset(),
         )
         out = mod._score_payload_for_example(
             example,
-            {"legal_moves": [{"row": 1, "col": 1}, {"row": 2, "col": 3}]},
+            {"available_moves": [{"row": 1, "col": 1}, {"row": 2, "col": 3}]},
             best_move_optimal_reward=0.7,
         )
         self.assertEqual(out.reward, 1.0)
 
-    def test_legal_moves_list_truncated_dict_fails_parse_success(self) -> None:
+    def test_available_moves_list_truncated_dict_fails_parse_success(self) -> None:
         example = mod.QAExample(
             row_id="r3",
             split="train",
-            task_type="legal_moves_list",
+            task_type="available_moves_list",
             question="q",
             image_path=Path("/tmp/unused.png"),
-            expected_answer={"legal_moves": [{"row": 1, "col": 1}]},
+            expected_answer={"available_moves": [{"row": 1, "col": 1}]},
             best_move_canonical=None,
             best_move_optimal_set=frozenset(),
         )
@@ -130,6 +174,58 @@ class RewardPolicyTests(unittest.TestCase):
         self.assertEqual(out.reward, 0.0)
         self.assertFalse(out.parse_success)
         self.assertTrue(out.json_object_parsed)
+
+    def test_available_move_legacy_answer_keys_are_accepted(self) -> None:
+        count_example = mod.QAExample(
+            row_id="r_legacy_count",
+            split="train",
+            task_type="available_moves_count",
+            question="q",
+            image_path=Path("/tmp/unused.png"),
+            expected_answer={"available_move_count": 2},
+            best_move_canonical=None,
+            best_move_optimal_set=frozenset(),
+        )
+        count_out = mod._score_payload_for_example(
+            count_example,
+            {"legal_move_count": 2},
+            best_move_optimal_reward=0.7,
+        )
+        self.assertEqual(count_out.reward, 1.0)
+
+        game_over_example = mod.QAExample(
+            row_id="r_legacy_game_over",
+            split="train",
+            task_type="is_game_over",
+            question="q",
+            image_path=Path("/tmp/unused.png"),
+            expected_answer={"is_game_over": False},
+            best_move_canonical=None,
+            best_move_optimal_set=frozenset(),
+        )
+        game_over_out = mod._score_payload_for_example(
+            game_over_example,
+            {"is_terminal": False},
+            best_move_optimal_reward=0.7,
+        )
+        self.assertEqual(game_over_out.reward, 1.0)
+
+        list_example = mod.QAExample(
+            row_id="r_legacy_list",
+            split="train",
+            task_type="available_moves_list",
+            question="q",
+            image_path=Path("/tmp/unused.png"),
+            expected_answer={"available_moves": [{"row": 1, "col": 1}]},
+            best_move_canonical=None,
+            best_move_optimal_set=frozenset(),
+        )
+        list_out = mod._score_payload_for_example(
+            list_example,
+            {"legal_moves": [{"row": 1, "col": 1}]},
+            best_move_optimal_reward=0.7,
+        )
+        self.assertEqual(list_out.reward, 1.0)
 
 
 class SchemaValidationTests(unittest.TestCase):
@@ -149,14 +245,14 @@ class SchemaValidationTests(unittest.TestCase):
         cases = [
             ("best_move", {"row": 2, "col": 2}, {"row": 0, "col": 4}),
             ("winner", {"winner": "draw"}, {"winner": "maybe"}),
-            ("is_terminal", {"is_terminal": False}, {"is_terminal": "sometimes"}),
+            ("is_game_over", {"is_game_over": False}, {"is_game_over": "sometimes"}),
             ("has_winning_move", {"has_winning_move": True}, {"has_winning_move": "unknown"}),
             ("turn_player", {"player": "X"}, {"player": "Q"}),
-            ("legal_moves_count", {"legal_move_count": 3}, {"legal_move_count": -2}),
+            ("available_moves_count", {"available_move_count": 3}, {"available_move_count": -2}),
             (
-                "legal_moves_list",
-                {"legal_moves": [{"row": 1, "col": 1}]},
-                {"legal_moves": [{"row": 1, "col": 4}]},
+                "available_moves_list",
+                {"available_moves": [{"row": 1, "col": 1}]},
+                {"available_moves": [{"row": 1, "col": 4}]},
             ),
         ]
 
@@ -197,6 +293,32 @@ class PathResolutionTests(unittest.TestCase):
             resolved = mod._resolve_image_path(row, dataset_dir)
             self.assertEqual(resolved, fallback.resolve())
 
+    def test_build_example_normalizes_legacy_task_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_dir = Path(tmp)
+            image_path = dataset_dir / "img.png"
+            Image.new("RGB", (8, 8), color=(255, 255, 255)).save(image_path)
+
+            row = {
+                "row_id": "r1",
+                "split": "train",
+                "task_type": "legal_moves_count",
+                "question": "q",
+                "final_answer_json": "{\"legal_move_count\":2}",
+                "best_move_canonical_json": "null",
+                "best_move_optimal_set_json": "[]",
+                "image_path": str(image_path),
+            }
+            example = mod._build_example(
+                row,
+                split_name="train",
+                dataset_dir=dataset_dir,
+                line_number=1,
+            )
+            self.assertIsNotNone(example)
+            assert example is not None
+            self.assertEqual(example.task_type, "available_moves_count")
+
 
 class ConfigPrecedenceTests(unittest.TestCase):
     def test_cli_overrides_config_values(self) -> None:
@@ -208,7 +330,7 @@ class ConfigPrecedenceTests(unittest.TestCase):
                         "num_steps": 10,
                         "batch_size": 9,
                         "group_size": 3,
-                        "dataset_dir": "tictaktoe_QA/synth_dataset/outputs/smoke_full_jsonl",
+                        "dataset_dir": "synth_dataset/outputs/smoke_full_jsonl",
                         "final_eval_splits": ["val", "test"],
                     }
                 ),
@@ -237,14 +359,14 @@ class ConfigPrecedenceTests(unittest.TestCase):
             cfg_path.write_text(
                 json.dumps(
                     {
-                        "dataset_dir": "tictaktoe_QA/synth_dataset/outputs/smoke_full_jsonl",
+                        "dataset_dir": "synth_dataset/outputs/smoke_full_jsonl",
                         "reasoning": False,
                         "task_sampling_weights": {
                             "best_move": 2.0,
-                            "legal_moves_count": 2.5,
-                            "legal_moves_list": 3.0,
+                            "available_moves_count": 2.5,
+                            "available_moves_list": 3.0,
                         },
-                        "max_tokens_by_task": {"legal_moves_list": 512},
+                        "max_tokens_by_task": {"available_moves_list": 512},
                     }
                 ),
                 encoding="utf-8",
@@ -265,7 +387,7 @@ class ConfigPrecedenceTests(unittest.TestCase):
             self.assertTrue(args.reasoning)
             self.assertEqual(args.task_sampling_weights["best_move"], 7.0)
             self.assertEqual(args.task_sampling_weights["winner"], 1.0)
-            self.assertEqual(args.max_tokens_by_task["legal_moves_list"], 512)
+            self.assertEqual(args.max_tokens_by_task["available_moves_list"], 512)
             self.assertEqual(args.max_tokens_by_task["best_move"], 196)
 
     def test_off_policy_config_and_cli_override_precedence(self) -> None:
@@ -299,13 +421,31 @@ class ConfigPrecedenceTests(unittest.TestCase):
             self.assertEqual(args.off_policy_warmup_steps, 12)
             self.assertEqual(args.off_policy_min_buffer_groups, 96)
 
+    def test_warn_on_off_policy_reasoning_combo(self) -> None:
+        with patch("builtins.print") as mock_print:
+            mod._warn_on_unsafe_mode_combo(off_policy=True, reasoning=True)
+        self.assertTrue(
+            any(
+                "off-policy + reasoning" in str(call.args[0])
+                for call in mock_print.call_args_list
+                if call.args
+            )
+        )
+
+    def test_no_warn_without_off_policy_reasoning_combo(self) -> None:
+        with patch("builtins.print") as mock_print:
+            mod._warn_on_unsafe_mode_combo(off_policy=False, reasoning=True)
+            mod._warn_on_unsafe_mode_combo(off_policy=True, reasoning=False)
+            mod._warn_on_unsafe_mode_combo(off_policy=False, reasoning=False)
+        self.assertFalse(mock_print.called)
+
     def test_unknown_config_key_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = Path(tmp) / "cfg.json"
             cfg_path.write_text(
                 json.dumps(
                     {
-                        "dataset_dir": "tictaktoe_QA/synth_dataset/outputs/smoke_full_jsonl",
+                        "dataset_dir": "synth_dataset/outputs/smoke_full_jsonl",
                         "resoning": True,
                     }
                 ),
@@ -452,6 +592,60 @@ class CheckpointRankingTests(unittest.TestCase):
         self.assertEqual([item["step"] for item in ranked], [30, 20])
 
 
+class AutoBenchmarkTests(unittest.TestCase):
+    def test_parse_args_auto_benchmark_defaults_and_overrides(self) -> None:
+        args_default = mod.parse_args([])
+        self.assertTrue(args_default.auto_benchmark_best_checkpoint)
+
+        args_disabled = mod.parse_args(["--no-auto-benchmark-best-checkpoint"])
+        self.assertFalse(args_disabled.auto_benchmark_best_checkpoint)
+
+    def test_select_checkpoint_step_for_auto_benchmark(self) -> None:
+        selected = mod._select_checkpoint_step_for_auto_benchmark(
+            ranking_payload={"best_avg_eval_reward_step": 148},
+            fallback_step=129,
+        )
+        self.assertEqual(selected, 148)
+
+        fallback = mod._select_checkpoint_step_for_auto_benchmark(
+            ranking_payload={"best_avg_eval_reward_step": -1},
+            fallback_step=129,
+        )
+        self.assertEqual(fallback, 129)
+
+        missing = mod._select_checkpoint_step_for_auto_benchmark(
+            ranking_payload={"best_avg_eval_reward_step": -1},
+            fallback_step=None,
+        )
+        self.assertIsNone(missing)
+
+    def test_build_auto_benchmark_command_uses_checkpoint_and_dataset_overrides(self) -> None:
+        args = SimpleNamespace(
+            auto_benchmark_config="configs/benchmark_default.json",
+            env_file=".env",
+            base_url="https://api.moondream.ai/v1",
+            dataset_source="local_jsonl",
+            best_move_optimal_reward=0.7,
+            hf_dataset_repo_id="repo",
+            hf_dataset_revision="main",
+            hf_cache_dir="",
+            no_progress=True,
+        )
+        cmd = mod._build_auto_benchmark_command(
+            args=args,
+            finetune_id="ft_123",
+            checkpoint_step=149,
+            dataset_dir=Path("/tmp/ds"),
+            output_json=Path("/tmp/metrics.json"),
+            predictions_jsonl=Path("/tmp/preds.jsonl"),
+        )
+        self.assertIn("--checkpoint-step", cmd)
+        self.assertIn("149", cmd)
+        self.assertIn("--dataset-dir", cmd)
+        self.assertIn("/tmp/ds", cmd)
+        self.assertIn("--no-progress", cmd)
+
+
 class CheckpointSaveTests(unittest.TestCase):
     def test_try_save_checkpoint_handles_checkpoint_not_found(self) -> None:
         finetune = SimpleNamespace(
@@ -464,6 +658,20 @@ class CheckpointSaveTests(unittest.TestCase):
 
 
 class SamplingConfigTests(unittest.TestCase):
+    def test_legacy_task_names_normalize_in_weight_and_token_maps(self) -> None:
+        weights = mod._resolve_task_sampling_weights(
+            config_map={"legal_moves_count": 2.0, "legal_moves_list": 3.0},
+            cli_override_json="",
+        )
+        self.assertEqual(weights["available_moves_count"], 2.0)
+        self.assertEqual(weights["available_moves_list"], 3.0)
+
+        max_tokens_by_task = mod._resolve_max_tokens_by_task(
+            config_map={"legal_moves_list": 512},
+            cli_override_json="",
+        )
+        self.assertEqual(max_tokens_by_task["available_moves_list"], 512)
+
     def test_task_sampling_weights_validation(self) -> None:
         with self.assertRaisesRegex(ValueError, "unknown task_type"):
             mod._resolve_task_sampling_weights(
@@ -471,11 +679,18 @@ class SamplingConfigTests(unittest.TestCase):
                 cli_override_json="",
             )
 
-        with self.assertRaisesRegex(ValueError, "must be > 0"):
+        with self.assertRaisesRegex(ValueError, "must be >= 0"):
             mod._resolve_task_sampling_weights(
-                config_map={"best_move": 0.0},
+                config_map={"best_move": -0.5},
                 cli_override_json="",
             )
+
+    def test_task_sampling_weights_allows_zero(self) -> None:
+        weights = mod._resolve_task_sampling_weights(
+            config_map={"best_move": 0.0},
+            cli_override_json="",
+        )
+        self.assertEqual(weights["best_move"], 0.0)
 
     def test_max_tokens_by_task_validation(self) -> None:
         with self.assertRaisesRegex(ValueError, "unknown task_type"):
@@ -494,8 +709,8 @@ class SamplingConfigTests(unittest.TestCase):
         weights = mod._resolve_task_sampling_weights(
             config_map={
                 "best_move": 2.0,
-                "legal_moves_count": 2.0,
-                "legal_moves_list": 5.0,
+                "available_moves_count": 2.0,
+                "available_moves_list": 5.0,
             },
             cli_override_json="",
         )
@@ -511,8 +726,53 @@ class SamplingConfigTests(unittest.TestCase):
         weighted_counts = {task: weighted_draws.count(task) for task in tasks}
         uniform_counts = {task: uniform_draws.count(task) for task in tasks}
 
-        self.assertGreater(weighted_counts["legal_moves_list"], uniform_counts["legal_moves_list"])
+        self.assertGreater(weighted_counts["available_moves_list"], uniform_counts["available_moves_list"])
         self.assertGreater(weighted_counts["best_move"], uniform_counts["best_move"])
+
+    def test_weights_for_sampling_tasks_requires_positive_total(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must include at least one positive weight"):
+            mod._weights_for_sampling_tasks(
+                tasks=["best_move", "turn_player"],
+                task_sampling_weights={"best_move": 0.0, "turn_player": 0.0},
+            )
+
+        weights = mod._weights_for_sampling_tasks(
+            tasks=["best_move", "turn_player"],
+            task_sampling_weights={"best_move": 1.0, "turn_player": 0.0},
+        )
+        self.assertEqual(weights, [1.0, 0.0])
+
+    def test_active_tasks_from_sampling_weights(self) -> None:
+        weights = {task: 0.0 for task in mod.SUPPORTED_TASKS}
+        weights["best_move"] = 1.0
+        active_tasks = mod._active_tasks_from_sampling_weights(weights)
+        self.assertEqual(active_tasks, {"best_move"})
+
+    def test_filter_examples_by_active_tasks(self) -> None:
+        examples = [
+            mod.QAExample(
+                row_id="r_best",
+                split="val",
+                task_type="best_move",
+                question="q",
+                image_path=Path("/tmp/unused.png"),
+                expected_answer={"row": 1, "col": 1},
+                best_move_canonical=1,
+                best_move_optimal_set=frozenset({1}),
+            ),
+            mod.QAExample(
+                row_id="r_turn",
+                split="val",
+                task_type="turn_player",
+                question="q",
+                image_path=Path("/tmp/unused.png"),
+                expected_answer={"player": "X"},
+                best_move_canonical=None,
+                best_move_optimal_set=frozenset(),
+            ),
+        ]
+        filtered = mod._filter_examples_by_active_tasks(examples, active_tasks={"best_move"})
+        self.assertEqual([item.row_id for item in filtered], ["r_best"])
 
 
 class EvalSubsetAndEarlyStopTests(unittest.TestCase):

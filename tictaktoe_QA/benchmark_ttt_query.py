@@ -41,6 +41,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tictaktoe_QA import data_loader as dataset_loader  # noqa: E402
+from tictaktoe_QA.task_schema import normalize_task_type  # noqa: E402
 from tictaktoe_QA import train_ttt_query_rl as train_utils  # noqa: E402
 
 DEFAULT_BASE_URL = "https://api.moondream.ai/v1"
@@ -262,8 +263,10 @@ def _normalize_task_types(raw_values: Optional[list[str]]) -> Optional[list[str]
             task_type = piece.strip()
             if not task_type:
                 continue
-            if task_type not in train_utils.SUPPORTED_TASKS:
-                raise ValueError(f"Unknown task_type in --task-types/config: {task_type}")
+            try:
+                task_type = normalize_task_type(task_type)
+            except ValueError as exc:
+                raise ValueError(f"Unknown task_type in --task-types/config: {task_type}") from exc
             if task_type in seen:
                 continue
             seen.add(task_type)
@@ -436,7 +439,7 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
     )
     parser.add_argument(
         "--dataset-dir",
-        default=_cfg_str(config, "dataset_dir", str(_repo_relative("synth_dataset/outputs/v1"))),
+        default=_cfg_str(config, "dataset_dir", str(_repo_relative("synth_dataset/outputs/v2"))),
         help="Local dataset dir (required when --dataset-source=local_jsonl).",
     )
     parser.add_argument(
@@ -781,6 +784,8 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     metrics: dict[str, Any] = {
         "model": model,
+        "finetune_id": str(args.finetune_id or ""),
+        "checkpoint_step": int(args.checkpoint_step) if args.checkpoint_step is not None else -1,
         "config": args.config,
         "split": args.split,
         "dataset_source": args.dataset_source,

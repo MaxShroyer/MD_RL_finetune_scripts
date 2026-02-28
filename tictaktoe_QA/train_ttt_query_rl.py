@@ -9,6 +9,8 @@ import io
 import json
 import os
 import random
+import shlex
+import subprocess
 import string
 import sys
 import time
@@ -66,6 +68,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tictaktoe_QA import data_loader as dataset_loader  # noqa: E402
+from tictaktoe_QA.task_schema import (  # noqa: E402
+    CANONICAL_TASK_TYPES,
+    normalize_answer_payload_for_task,
+    normalize_task_type,
+)
 from tuna_sdk import QueryOutput, QueryRequest, QuerySettings, TunaClient  # noqa: E402
 from tuna_sdk.errors import TunaAPIError, TunaNetworkError  # noqa: E402
 
@@ -81,23 +88,16 @@ DEFAULT_FINAL_EVAL_SPLITS = [
 ]
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "query_rl_default.json"
 DEFAULT_REASONING = False
+DEFAULT_BENCHMARK_CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "benchmark_default.json"
 
-SUPPORTED_TASKS = {
-    "best_move",
-    "has_winning_move",
-    "is_terminal",
-    "legal_moves_count",
-    "legal_moves_list",
-    "turn_player",
-    "winner",
-}
+SUPPORTED_TASKS = set(CANONICAL_TASK_TYPES)
 DEFAULT_TASK_SAMPLING_WEIGHTS: dict[str, float] = {
     "best_move": 1.0,
-    "legal_moves_count": 1.0,
-    "legal_moves_list": 1.0,
+    "available_moves_count": 1.0,
+    "available_moves_list": 1.0,
 }
 DEFAULT_MAX_TOKENS_BY_TASK: dict[str, int] = {
-    "legal_moves_list": 800,
+    "available_moves_list": 800,
 }
 MAIN_TRAIN_WANDB_METRIC_KEYS = (
     "reward_mean",
@@ -130,6 +130,10 @@ REQUIRED_ROW_FIELDS = (
 
 TRAIN_CONFIG_ALLOWED_KEYS = {
     "api_key",
+    "auto_benchmark_best_checkpoint",
+    "auto_benchmark_config",
+    "auto_benchmark_output_json",
+    "auto_benchmark_predictions_jsonl",
     "base_url",
     "batch_size",
     "best_metric",
@@ -200,6 +204,8 @@ class QAExample:
     expected_answer: dict[str, Any]
     best_move_canonical: Optional[int]
     best_move_optimal_set: frozenset[int]
+    # Tuple entries are (move, value, depth), parsed from scores_by_move_json.
+    best_move_scores: tuple[tuple[int, int, int], ...] = tuple()
 
 
 @dataclass(frozen=True)
@@ -376,15 +382,16 @@ def _parse_json_object_arg(raw_value: str, arg_name: str) -> dict[str, Any]:
 def _normalize_task_sampling_weights(raw_map: dict[str, Any], *, source: str) -> dict[str, float]:
     out: dict[str, float] = {}
     for raw_task, raw_weight in raw_map.items():
-        task = str(raw_task).strip()
-        if task not in SUPPORTED_TASKS:
-            raise ValueError(f"{source}: unknown task_type '{task}'")
+        try:
+            task = normalize_task_type(str(raw_task).strip())
+        except ValueError as exc:
+            raise ValueError(f"{source}: unknown task_type '{raw_task}'") from exc
         try:
             weight = float(raw_weight)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"{source}: weight for task_type '{task}' must be numeric") from exc
-        if weight <= 0.0:
-            raise ValueError(f"{source}: weight for task_type '{task}' must be > 0")
+        if weight < 0.0:
+            raise ValueError(f"{source}: weight for task_type '{task}' must be >= 0")
         out[task] = weight
     return out
 
@@ -392,9 +399,10 @@ def _normalize_task_sampling_weights(raw_map: dict[str, Any], *, source: str) ->
 def _normalize_max_tokens_by_task(raw_map: dict[str, Any], *, source: str) -> dict[str, int]:
     out: dict[str, int] = {}
     for raw_task, raw_max_tokens in raw_map.items():
-        task = str(raw_task).strip()
-        if task not in SUPPORTED_TASKS:
-            raise ValueError(f"{source}: unknown task_type '{task}'")
+        try:
+            task = normalize_task_type(str(raw_task).strip())
+        except ValueError as exc:
+            raise ValueError(f"{source}: unknown task_type '{raw_task}'") from exc
         max_tokens = _parse_int(raw_max_tokens)
         if max_tokens is None or max_tokens <= 0:
             raise ValueError(f"{source}: max_tokens for task_type '{task}' must be > 0")
@@ -419,6 +427,37 @@ def _resolve_task_sampling_weights(
             )
         )
     return resolved
+
+
+def _weights_for_sampling_tasks(
+    *,
+    tasks: list[str],
+    task_sampling_weights: dict[str, float],
+) -> list[float]:
+    weights = [float(task_sampling_weights.get(task, 1.0)) for task in tasks]
+    if tasks and not any(weight > 0.0 for weight in weights):
+        raise ValueError(
+            "effective task_sampling_weights for available train tasks must include at least one positive weight"
+        )
+    return weights
+
+
+def _active_tasks_from_sampling_weights(task_sampling_weights: dict[str, float]) -> set[str]:
+    return {
+        task
+        for task in SUPPORTED_TASKS
+        if float(task_sampling_weights.get(task, 1.0)) > 0.0
+    }
+
+
+def _filter_examples_by_active_tasks(
+    examples: list[QAExample],
+    *,
+    active_tasks: set[str],
+) -> list[QAExample]:
+    if not active_tasks:
+        return []
+    return [item for item in examples if item.task_type in active_tasks]
 
 
 def _resolve_max_tokens_by_task(
@@ -454,7 +493,7 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
     )
     parser.add_argument(
         "--dataset-dir",
-        default=_cfg_str(config, "dataset_dir", str(_repo_relative("synth_dataset/outputs/v1"))),
+        default=_cfg_str(config, "dataset_dir", str(_repo_relative("synth_dataset/outputs/v2"))),
         help="Local dataset dir (required when --dataset-source=local_jsonl).",
     )
     parser.add_argument(
@@ -697,6 +736,37 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
         help="Run final post-training split evals.",
     )
     parser.set_defaults(skip_final_eval=_cfg_bool(config, "skip_final_eval", False))
+    auto_bench_group = parser.add_mutually_exclusive_group()
+    auto_bench_group.add_argument(
+        "--auto-benchmark-best-checkpoint",
+        dest="auto_benchmark_best_checkpoint",
+        action="store_true",
+        help="After training, benchmark the best checkpoint automatically.",
+    )
+    auto_bench_group.add_argument(
+        "--no-auto-benchmark-best-checkpoint",
+        dest="auto_benchmark_best_checkpoint",
+        action="store_false",
+        help="Disable automatic post-training benchmark execution.",
+    )
+    parser.set_defaults(
+        auto_benchmark_best_checkpoint=_cfg_bool(config, "auto_benchmark_best_checkpoint", True)
+    )
+    parser.add_argument(
+        "--auto-benchmark-config",
+        default=_cfg_str(config, "auto_benchmark_config", str(DEFAULT_BENCHMARK_CONFIG_PATH)),
+        help="Benchmark config file used for automatic post-training benchmark.",
+    )
+    parser.add_argument(
+        "--auto-benchmark-output-json",
+        default=_cfg_str(config, "auto_benchmark_output_json", ""),
+        help="Optional metrics path override for automatic post-training benchmark.",
+    )
+    parser.add_argument(
+        "--auto-benchmark-predictions-jsonl",
+        default=_cfg_str(config, "auto_benchmark_predictions_jsonl", ""),
+        help="Optional predictions path override for automatic post-training benchmark.",
+    )
 
     parser.add_argument("--wandb-project", default=_cfg_str(config, "wandb_project", "moondream-ttt-query-rl"))
     parser.add_argument("--wandb-run-name", default=_cfg_str(config, "wandb_run_name", ""))
@@ -722,6 +792,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
 
     args.config = str(_resolve_config_path(args.config))
+    args.auto_benchmark_config = str(_resolve_config_path(args.auto_benchmark_config))
     args.task_sampling_weights = _resolve_task_sampling_weights(
         config_map=_cfg_dict(
             config,
@@ -832,6 +903,20 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--dataset-dir is required when --dataset-source=local_jsonl")
     if args.dataset_source == "hf_hub" and not str(args.hf_dataset_repo_id).strip():
         raise ValueError("--hf-dataset-repo-id is required when --dataset-source=hf_hub")
+    if bool(args.auto_benchmark_best_checkpoint):
+        auto_benchmark_config_path = Path(str(args.auto_benchmark_config)).expanduser().resolve()
+        if not auto_benchmark_config_path.exists():
+            raise FileNotFoundError(
+                f"--auto-benchmark-config not found: {auto_benchmark_config_path}"
+            )
+
+
+def _warn_on_unsafe_mode_combo(*, off_policy: bool, reasoning: bool) -> None:
+    if bool(off_policy) and bool(reasoning):
+        print(
+            "WARNING: off-policy + reasoning is an unsafe combination for this trainer; "
+            "do not run with both enabled."
+        )
 
 
 
@@ -974,9 +1059,66 @@ def _as_move_set(payload_json: str) -> set[int]:
     return out
 
 
+def _scores_by_move_from_json(payload_json: str) -> tuple[tuple[int, int, int], ...]:
+    try:
+        payload = json.loads(payload_json)
+    except json.JSONDecodeError:
+        return tuple()
+    if not isinstance(payload, dict):
+        return tuple()
+
+    out: list[tuple[int, int, int]] = []
+    for move_key, score_payload in payload.items():
+        move = _parse_int(move_key)
+        if move is None or move < 1 or move > 9:
+            continue
+        if not isinstance(score_payload, dict):
+            continue
+        value = _parse_int(score_payload.get("value"))
+        depth = _parse_int(score_payload.get("depth"))
+        if value is None or depth is None:
+            continue
+        out.append((move, int(value), int(depth)))
+
+    out.sort(key=lambda item: item[0])
+    return tuple(out)
+
+
+def _best_move_rank_key(*, value: int, depth: int) -> tuple[int, int]:
+    # For winning lines (value=1), faster wins are better (lower depth).
+    if value == 1:
+        return (value, -depth)
+    return (value, depth)
+
+
+def _ranked_best_move_reward(
+    move: int,
+    *,
+    scores_by_move: dict[int, tuple[int, int]],
+) -> float:
+    pred = scores_by_move.get(move)
+    if pred is None:
+        return 0.0
+
+    total = len(scores_by_move)
+    if total <= 1:
+        return 1.0
+
+    pred_key = _best_move_rank_key(value=int(pred[0]), depth=int(pred[1]))
+    better_count = sum(
+        1
+        for value, depth in scores_by_move.values()
+        if _best_move_rank_key(value=int(value), depth=int(depth)) > pred_key
+    )
+    reward = 1.0 - (float(better_count) / float(total - 1))
+    return max(0.0, min(1.0, reward))
+
+
 def _normalize_non_best_answer(task_type: str, payload: Any) -> Optional[Any]:
     if not isinstance(payload, dict):
         return None
+    task_type = normalize_task_type(task_type, allow_unknown=True)
+    payload = normalize_answer_payload_for_task(task_type, payload)
 
     if task_type == "winner":
         winner = _coerce_winner(payload.get("winner"))
@@ -984,11 +1126,11 @@ def _normalize_non_best_answer(task_type: str, payload: Any) -> Optional[Any]:
             return None
         return {"winner": winner}
 
-    if task_type == "is_terminal":
-        is_terminal = _coerce_bool(payload.get("is_terminal"))
-        if is_terminal is None:
+    if task_type == "is_game_over":
+        is_game_over = _coerce_bool(payload.get("is_game_over"))
+        if is_game_over is None:
             return None
-        return {"is_terminal": is_terminal}
+        return {"is_game_over": is_game_over}
 
     if task_type == "has_winning_move":
         has_winning_move = _coerce_bool(payload.get("has_winning_move"))
@@ -1002,17 +1144,17 @@ def _normalize_non_best_answer(task_type: str, payload: Any) -> Optional[Any]:
             return None
         return {"player": player}
 
-    if task_type == "legal_moves_count":
-        count = _parse_int(payload.get("legal_move_count"))
+    if task_type == "available_moves_count":
+        count = _parse_int(payload.get("available_move_count"))
         if count is None or count < 0 or count > 9:
             return None
-        return {"legal_move_count": count}
+        return {"available_move_count": count}
 
-    if task_type == "legal_moves_list":
-        legal_moves = _normalize_legal_moves(payload.get("legal_moves"))
-        if legal_moves is None:
+    if task_type == "available_moves_list":
+        available_moves = _normalize_legal_moves(payload.get("available_moves"))
+        if available_moves is None:
             return None
-        return {"legal_moves": legal_moves}
+        return {"available_moves": available_moves}
 
     return None
 
@@ -1105,7 +1247,10 @@ def _score_payload_for_example(
             )
         set_correct = move in example.best_move_optimal_set if move is not None else False
         canonical_correct = move == example.best_move_canonical if move is not None else False
-        if canonical_correct:
+        scores_by_move = {m: (value, depth) for m, value, depth in example.best_move_scores}
+        if scores_by_move:
+            reward = _ranked_best_move_reward(move, scores_by_move=scores_by_move)
+        elif canonical_correct:
             reward = 1.0
         elif set_correct:
             reward = float(best_move_optimal_reward)
@@ -1206,10 +1351,12 @@ def _build_example(
             f"split={split_name} line={line_number} missing required fields: {missing}"
         )
 
-    task_type = str(row["task_type"]).strip()
-    if task_type not in SUPPORTED_TASKS:
+    raw_task_type = str(row["task_type"]).strip()
+    try:
+        task_type = normalize_task_type(raw_task_type)
+    except ValueError:
         print(
-            f"split={split_name} line={line_number} unsupported task_type='{task_type}'; skipping row"
+            f"split={split_name} line={line_number} unsupported task_type='{raw_task_type}'; skipping row"
         )
         return None
 
@@ -1230,6 +1377,7 @@ def _build_example(
 
     best_move_canonical = _best_move_from_json(str(row["best_move_canonical_json"]))
     best_move_optimal_set = frozenset(_as_move_set(str(row["best_move_optimal_set_json"])))
+    best_move_scores = _scores_by_move_from_json(str(row.get("scores_by_move_json", "")))
 
     return QAExample(
         row_id=str(row["row_id"]),
@@ -1240,6 +1388,7 @@ def _build_example(
         expected_answer=expected_answer,
         best_move_canonical=best_move_canonical,
         best_move_optimal_set=best_move_optimal_set,
+        best_move_scores=best_move_scores,
     )
 
 
@@ -1811,6 +1960,172 @@ def _try_save_checkpoint(
         return False
 
 
+def _select_checkpoint_step_for_auto_benchmark(
+    *,
+    ranking_payload: dict[str, Any],
+    fallback_step: Optional[int],
+) -> Optional[int]:
+    ranked_step = _parse_int(ranking_payload.get("best_avg_eval_reward_step"))
+    if ranked_step is not None and ranked_step >= 0:
+        return int(ranked_step)
+    if fallback_step is not None and int(fallback_step) >= 0:
+        return int(fallback_step)
+    return None
+
+
+def _default_auto_benchmark_artifact_paths(
+    *,
+    finetune_id: str,
+    checkpoint_step: Optional[int],
+) -> tuple[Path, Path]:
+    step_tag = f"step{checkpoint_step}" if checkpoint_step is not None else "latest"
+    run_tag = time.strftime("%Y%m%d_%H%M%S")
+    metrics_path = _resolve_output_path(
+        "",
+        fallback_name=f"benchmark_auto_{finetune_id}_{step_tag}_{run_tag}.json",
+    )
+    predictions_path = _resolve_output_path(
+        "",
+        fallback_name=f"benchmark_auto_{finetune_id}_{step_tag}_{run_tag}_predictions.jsonl",
+    )
+    return metrics_path, predictions_path
+
+
+def _build_auto_benchmark_command(
+    *,
+    args: argparse.Namespace,
+    finetune_id: str,
+    checkpoint_step: Optional[int],
+    dataset_dir: Optional[Path],
+    output_json: Path,
+    predictions_jsonl: Path,
+) -> list[str]:
+    cmd = [
+        sys.executable,
+        str(_repo_relative("benchmark_ttt_query.py").resolve()),
+        "--config",
+        str(args.auto_benchmark_config),
+        "--env-file",
+        str(args.env_file),
+        "--base-url",
+        str(args.base_url),
+        "--finetune-id",
+        str(finetune_id),
+        "--dataset-source",
+        str(args.dataset_source),
+        "--best-move-optimal-reward",
+        str(float(args.best_move_optimal_reward)),
+        "--output-json",
+        str(output_json),
+        "--predictions-jsonl",
+        str(predictions_jsonl),
+    ]
+    if checkpoint_step is not None:
+        cmd.extend(["--checkpoint-step", str(int(checkpoint_step))])
+    if args.dataset_source == "local_jsonl":
+        if dataset_dir is not None:
+            cmd.extend(["--dataset-dir", str(dataset_dir)])
+    else:
+        cmd.extend(["--hf-dataset-repo-id", str(args.hf_dataset_repo_id)])
+        cmd.extend(["--hf-dataset-revision", str(args.hf_dataset_revision)])
+        if str(args.hf_cache_dir).strip():
+            cmd.extend(["--hf-cache-dir", str(args.hf_cache_dir)])
+    if bool(args.no_progress):
+        cmd.append("--no-progress")
+    return cmd
+
+
+def _run_auto_benchmark(
+    *,
+    args: argparse.Namespace,
+    finetune_id: str,
+    checkpoint_step: Optional[int],
+    dataset_dir: Optional[Path],
+    output_json_override: str,
+    predictions_jsonl_override: str,
+) -> tuple[bool, Path, Path, Optional[dict[str, Any]]]:
+    default_output_json_path, default_predictions_jsonl_path = _default_auto_benchmark_artifact_paths(
+        finetune_id=finetune_id,
+        checkpoint_step=checkpoint_step,
+    )
+
+    if str(output_json_override or "").strip():
+        output_json_path = _resolve_output_path(
+            output_json_override,
+            fallback_name=f"benchmark_auto_{finetune_id}.json",
+        )
+    else:
+        output_json_path = default_output_json_path
+
+    if str(predictions_jsonl_override or "").strip():
+        predictions_jsonl_path = _resolve_output_path(
+            predictions_jsonl_override,
+            fallback_name=f"benchmark_auto_{finetune_id}_predictions.jsonl",
+        )
+    else:
+        predictions_jsonl_path = default_predictions_jsonl_path
+
+    output_json_path.parent.mkdir(parents=True, exist_ok=True)
+    predictions_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = _build_auto_benchmark_command(
+        args=args,
+        finetune_id=finetune_id,
+        checkpoint_step=checkpoint_step,
+        dataset_dir=dataset_dir,
+        output_json=output_json_path,
+        predictions_jsonl=predictions_jsonl_path,
+    )
+
+    env = dict(os.environ)
+    if str(args.api_key).strip():
+        env["MOONDREAM_API_KEY"] = str(args.api_key).strip()
+    if str(args.hf_token).strip():
+        env.setdefault("HF_TOKEN", str(args.hf_token).strip())
+
+    print("auto benchmark: running command")
+    print("  " + " ".join(shlex.quote(part) for part in cmd))
+
+    completed = subprocess.run(
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if completed.returncode != 0:
+        print(f"auto benchmark failed with exit_code={completed.returncode}")
+        if completed.stdout.strip():
+            print("auto benchmark stdout:")
+            print(_truncate(completed.stdout.strip(), limit=1200))
+        if completed.stderr.strip():
+            print("auto benchmark stderr:")
+            print(_truncate(completed.stderr.strip(), limit=1200))
+        return False, output_json_path, predictions_jsonl_path, None
+
+    metrics_payload: Optional[dict[str, Any]] = None
+    try:
+        if output_json_path.exists():
+            parsed = json.loads(output_json_path.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                metrics_payload = parsed
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"auto benchmark: unable to parse metrics JSON ({output_json_path}): {exc}")
+
+    if completed.stdout.strip():
+        print("auto benchmark stdout:")
+        print(_truncate(completed.stdout.strip(), limit=1200))
+    if completed.stderr.strip():
+        print("auto benchmark stderr:")
+        print(_truncate(completed.stderr.strip(), limit=1200))
+
+    print(
+        "auto benchmark completed: "
+        f"metrics={output_json_path} predictions={predictions_jsonl_path}"
+    )
+    return True, output_json_path, predictions_jsonl_path, metrics_payload
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     args = parse_args(argv)
     args.env_file = _resolve_env_file(args.env_file)
@@ -1823,6 +2138,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         args.base_url = os.environ.get("TUNA_BASE_URL", DEFAULT_BASE_URL)
 
     _validate_args(args)
+    _warn_on_unsafe_mode_combo(off_policy=bool(args.off_policy), reasoning=bool(args.reasoning))
     if not args.api_key:
         raise ValueError("MOONDREAM_API_KEY is required")
     args.hf_token = dataset_loader.resolve_hf_token(args.hf_token)
@@ -1876,18 +2192,33 @@ def main(argv: Optional[list[str]] = None) -> None:
         raise ValueError("train split has no task-indexable examples")
 
     sampling_tasks = sorted(train_examples_by_task.keys())
-    sampling_weights = [float(args.task_sampling_weights.get(task, 1.0)) for task in sampling_tasks]
+    sampling_weights = _weights_for_sampling_tasks(
+        tasks=sampling_tasks,
+        task_sampling_weights=args.task_sampling_weights,
+    )
     if not sampling_tasks:
         raise ValueError("no tasks available for weighted sampling")
 
+    active_eval_tasks = _active_tasks_from_sampling_weights(args.task_sampling_weights)
+    print(
+        "eval task filter (weight>0): "
+        + ", ".join(sorted(active_eval_tasks))
+    )
+    val_before_filter = len(val_examples)
+    val_examples = _filter_examples_by_active_tasks(val_examples, active_tasks=active_eval_tasks)
+    if len(val_examples) != val_before_filter:
+        print(
+            f"filtered eval split={args.val_split}: kept={len(val_examples)} "
+            f"dropped={val_before_filter - len(val_examples)}"
+        )
+
     split_examples_cache: dict[str, list[QAExample]] = {
-        args.train_split: train_examples,
         args.val_split: val_examples,
     }
 
     def _examples_for_split(split_name: str) -> list[QAExample]:
         if split_name not in split_examples_cache:
-            split_examples_cache[split_name] = _load_split_examples(
+            raw_examples = _load_split_examples(
                 split_name=split_name,
                 dataset_source=args.dataset_source,
                 dataset_dir=dataset_dir,
@@ -1896,6 +2227,16 @@ def main(argv: Optional[list[str]] = None) -> None:
                 hf_token=args.hf_token,
                 hf_cache_dir=args.hf_cache_dir,
             )
+            filtered_examples = _filter_examples_by_active_tasks(
+                raw_examples,
+                active_tasks=active_eval_tasks,
+            )
+            if len(filtered_examples) != len(raw_examples):
+                print(
+                    f"filtered eval split={split_name}: kept={len(filtered_examples)} "
+                    f"dropped={len(raw_examples) - len(filtered_examples)}"
+                )
+            split_examples_cache[split_name] = filtered_examples
         return split_examples_cache[split_name]
 
     final_eval_examples: dict[str, list[QAExample]] = {}
@@ -1992,6 +2333,10 @@ def main(argv: Optional[list[str]] = None) -> None:
             "best_metric": args.best_metric,
             "best_move_optimal_reward": args.best_move_optimal_reward,
             "checkpoint_ranking_output": args.checkpoint_ranking_output,
+            "auto_benchmark_best_checkpoint": bool(args.auto_benchmark_best_checkpoint),
+            "auto_benchmark_config": str(args.auto_benchmark_config),
+            "auto_benchmark_output_json": str(args.auto_benchmark_output_json or ""),
+            "auto_benchmark_predictions_jsonl": str(args.auto_benchmark_predictions_jsonl or ""),
         },
     )
     run.summary["finetune_id"] = finetune.finetune_id
@@ -2462,6 +2807,38 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
     print(f"wrote checkpoint ranking JSON: {ranking_output_path}")
 
+    auto_benchmark_ran = False
+    auto_benchmark_success = False
+    auto_benchmark_checkpoint_step: Optional[int] = None
+    auto_benchmark_metrics_path: Optional[Path] = None
+    auto_benchmark_predictions_path: Optional[Path] = None
+    auto_benchmark_metrics: Optional[dict[str, Any]] = None
+    if bool(args.auto_benchmark_best_checkpoint):
+        auto_benchmark_checkpoint_step = _select_checkpoint_step_for_auto_benchmark(
+            ranking_payload=ranking_payload,
+            fallback_step=best_step,
+        )
+        auto_benchmark_ran = True
+        try:
+            (
+                auto_benchmark_success,
+                auto_benchmark_metrics_path,
+                auto_benchmark_predictions_path,
+                auto_benchmark_metrics,
+            ) = _run_auto_benchmark(
+                args=args,
+                finetune_id=finetune.finetune_id,
+                checkpoint_step=auto_benchmark_checkpoint_step,
+                dataset_dir=dataset_dir,
+                output_json_override=str(args.auto_benchmark_output_json),
+                predictions_jsonl_override=str(args.auto_benchmark_predictions_jsonl),
+            )
+        except Exception as exc:
+            auto_benchmark_success = False
+            print(f"auto benchmark failed with unexpected exception: {exc}")
+    else:
+        print("auto benchmark disabled (auto_benchmark_best_checkpoint=false).")
+
     run.summary["best_metric_name"] = args.best_metric
     run.summary["best_metric_value"] = float(best_metric_value or 0.0)
     run.summary["best_metric_step"] = int(best_step if best_step is not None else -1)
@@ -2477,6 +2854,28 @@ def main(argv: Optional[list[str]] = None) -> None:
     run.summary["completed_steps"] = int(training_status.get("completed_steps", completed_steps))
     run.summary["target_steps"] = int(training_status.get("target_steps", args.num_steps))
     run.summary["collapse_detected"] = bool(training_status.get("collapse_detected"))
+    run.summary["auto_benchmark_enabled"] = bool(args.auto_benchmark_best_checkpoint)
+    run.summary["auto_benchmark_ran"] = bool(auto_benchmark_ran)
+    run.summary["auto_benchmark_success"] = bool(auto_benchmark_success)
+    run.summary["auto_benchmark_checkpoint_step"] = int(
+        auto_benchmark_checkpoint_step if auto_benchmark_checkpoint_step is not None else -1
+    )
+    run.summary["auto_benchmark_output_json"] = (
+        str(auto_benchmark_metrics_path) if auto_benchmark_metrics_path is not None else ""
+    )
+    run.summary["auto_benchmark_predictions_jsonl"] = (
+        str(auto_benchmark_predictions_path) if auto_benchmark_predictions_path is not None else ""
+    )
+    if auto_benchmark_metrics is not None:
+        for key in (
+            "eval_reward_mean",
+            "eval_json_parse_rate",
+            "eval_best_move_set_accuracy",
+            "eval_best_move_canonical_accuracy",
+            "eval_exact_accuracy_non_best_move",
+        ):
+            if isinstance(auto_benchmark_metrics.get(key), (int, float)):
+                run.summary[f"auto_benchmark_{key}"] = float(auto_benchmark_metrics[key])
 
     run.finish()
     client.close()
@@ -2485,6 +2884,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         f"done. finetune_id={finetune.finetune_id} best_{args.best_metric}={best_metric_value} "
         f"best_step={best_step} best_avg_eval_reward={best_avg_eval_reward} "
         f"best_avg_eval_reward_step={best_avg_eval_reward_step} "
+        f"auto_benchmark_success={auto_benchmark_success} "
+        f"auto_benchmark_step={auto_benchmark_checkpoint_step} "
         f"stopped_early={training_status.get('stopped_early')} "
         f"stop_reason={training_status.get('stop_reason', '')}"
     )

@@ -638,12 +638,62 @@ class AutoBenchmarkTests(unittest.TestCase):
             dataset_dir=Path("/tmp/ds"),
             output_json=Path("/tmp/metrics.json"),
             predictions_jsonl=Path("/tmp/preds.jsonl"),
+            task_types=None,
         )
         self.assertIn("--checkpoint-step", cmd)
         self.assertIn("149", cmd)
         self.assertIn("--dataset-dir", cmd)
         self.assertIn("/tmp/ds", cmd)
         self.assertIn("--no-progress", cmd)
+
+    def test_build_auto_benchmark_command_includes_task_types_override(self) -> None:
+        args = SimpleNamespace(
+            auto_benchmark_config="configs/benchmark_default.json",
+            env_file=".env",
+            base_url="https://api.moondream.ai/v1",
+            dataset_source="hf_hub",
+            best_move_optimal_reward=0.7,
+            hf_dataset_repo_id="repo",
+            hf_dataset_revision="main",
+            hf_cache_dir="",
+            no_progress=False,
+        )
+        cmd = mod._build_auto_benchmark_command(
+            args=args,
+            finetune_id="ft_123",
+            checkpoint_step=149,
+            dataset_dir=None,
+            output_json=Path("/tmp/metrics.json"),
+            predictions_jsonl=Path("/tmp/preds.jsonl"),
+            task_types=["best_move"],
+        )
+        self.assertIn("--task-types", cmd)
+        task_arg_idx = cmd.index("--task-types")
+        self.assertEqual(cmd[task_arg_idx + 1], "best_move")
+
+    def test_infer_auto_benchmark_task_types_from_single_active_train_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "benchmark.json"
+            cfg_path.write_text(json.dumps({"task_types": []}), encoding="utf-8")
+            weights = {task: 0.0 for task in mod.SUPPORTED_TASKS}
+            weights["best_move"] = 1.0
+            args = SimpleNamespace(
+                auto_benchmark_config=str(cfg_path),
+                task_sampling_weights=weights,
+            )
+            self.assertEqual(mod._infer_auto_benchmark_task_types(args), ["best_move"])
+
+    def test_infer_auto_benchmark_task_types_respects_explicit_benchmark_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "benchmark.json"
+            cfg_path.write_text(json.dumps({"task_types": ["winner"]}), encoding="utf-8")
+            weights = {task: 0.0 for task in mod.SUPPORTED_TASKS}
+            weights["best_move"] = 1.0
+            args = SimpleNamespace(
+                auto_benchmark_config=str(cfg_path),
+                task_sampling_weights=weights,
+            )
+            self.assertIsNone(mod._infer_auto_benchmark_task_types(args))
 
 
 class CheckpointSaveTests(unittest.TestCase):

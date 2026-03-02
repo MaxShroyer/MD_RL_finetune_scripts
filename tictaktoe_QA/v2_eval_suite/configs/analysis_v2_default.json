@@ -1,0 +1,10 @@
+{
+  "outputs_dir": "tictaktoe_QA/outputs",
+  "dataset_dir": "tictaktoe_QA/synth_dataset/outputs/v2",
+  "out_dir": "tictaktoe_QA/v2_eval_suite/outputs/analysis",
+  "split": "test",
+  "v2_only": true,
+  "include_runs": "",
+  "force_include_runs": [],
+  "expected_hf_dataset_repo_id": "maxs-m87/tictactoe-qa-v2"
+}

@@ -1991,6 +1991,45 @@ def _default_auto_benchmark_artifact_paths(
     return metrics_path, predictions_path
 
 
+def _benchmark_config_task_types(config_path: str) -> Optional[list[str]]:
+    path = Path(str(config_path)).expanduser().resolve()
+    config = _load_json_config(path)
+    raw_values = config.get("task_types")
+    if not isinstance(raw_values, list):
+        return None
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in raw_values:
+        for piece in str(value).split(","):
+            task_type = piece.strip()
+            if not task_type:
+                continue
+            try:
+                task_type = normalize_task_type(task_type)
+            except ValueError as exc:
+                raise ValueError(
+                    f"auto benchmark config has unknown task_type '{task_type}' in {path}"
+                ) from exc
+            if task_type in seen:
+                continue
+            seen.add(task_type)
+            out.append(task_type)
+
+    return out or None
+
+
+def _infer_auto_benchmark_task_types(args: argparse.Namespace) -> Optional[list[str]]:
+    configured_task_types = _benchmark_config_task_types(str(args.auto_benchmark_config))
+    if configured_task_types:
+        return None
+
+    active_tasks = sorted(_active_tasks_from_sampling_weights(args.task_sampling_weights))
+    if len(active_tasks) == 1:
+        return active_tasks
+    return None
+
+
 def _build_auto_benchmark_command(
     *,
     args: argparse.Namespace,
@@ -1999,6 +2038,7 @@ def _build_auto_benchmark_command(
     dataset_dir: Optional[Path],
     output_json: Path,
     predictions_jsonl: Path,
+    task_types: Optional[list[str]],
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -2030,6 +2070,8 @@ def _build_auto_benchmark_command(
         cmd.extend(["--hf-dataset-revision", str(args.hf_dataset_revision)])
         if str(args.hf_cache_dir).strip():
             cmd.extend(["--hf-cache-dir", str(args.hf_cache_dir)])
+    if task_types:
+        cmd.extend(["--task-types", ",".join(task_types)])
     if bool(args.no_progress):
         cmd.append("--no-progress")
     return cmd
@@ -2068,6 +2110,13 @@ def _run_auto_benchmark(
     output_json_path.parent.mkdir(parents=True, exist_ok=True)
     predictions_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
 
+    inferred_task_types = _infer_auto_benchmark_task_types(args)
+    if inferred_task_types:
+        print(
+            "auto benchmark: inferred task filter from training weights: "
+            + ",".join(inferred_task_types)
+        )
+
     cmd = _build_auto_benchmark_command(
         args=args,
         finetune_id=finetune_id,
@@ -2075,6 +2124,7 @@ def _run_auto_benchmark(
         dataset_dir=dataset_dir,
         output_json=output_json_path,
         predictions_jsonl=predictions_jsonl_path,
+        task_types=inferred_task_types,
     )
 
     env = dict(os.environ)

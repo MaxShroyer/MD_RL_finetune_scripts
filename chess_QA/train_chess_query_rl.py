@@ -1,0 +1,4052 @@
+#!/usr/bin/env python3
+"""Query-skill RL finetuning for Chess QA."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import io
+import json
+import os
+import random
+import shlex
+import subprocess
+import string
+import sys
+import time
+from collections import Counter, defaultdict, deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional
+
+import numpy as np
+from PIL import Image
+
+try:
+    from dotenv import load_dotenv as _third_party_load_dotenv
+except ModuleNotFoundError:  # pragma: no cover
+    _third_party_load_dotenv = None
+
+try:
+    from tqdm.auto import tqdm  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    class _SimpleTqdm:  # pragma: no cover
+        def __init__(self, iterable, *args: Any, **kwargs: Any) -> None:
+            self._iterable = iterable
+
+        def __iter__(self):
+            return iter(self._iterable)
+
+        def set_postfix(self, *args: Any, **kwargs: Any) -> None:
+            return
+
+    def tqdm(iterable=None, *args, **kwargs):  # type: ignore
+        if iterable is None:
+            iterable = []
+        return _SimpleTqdm(iterable, *args, **kwargs)
+
+try:
+    import wandb  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    class _WandbRun:
+        def __init__(self) -> None:
+            self.summary: dict[str, Any] = {}
+
+        def finish(self) -> None:
+            return
+
+    class _WandbShim:
+        @staticmethod
+        def init(*args: Any, **kwargs: Any) -> _WandbRun:
+            print("wandb not installed; continuing without remote logging.")
+            return _WandbRun()
+
+        @staticmethod
+        def log(*args: Any, **kwargs: Any) -> None:
+            return
+
+    wandb = _WandbShim()
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from chess_QA import data_loader as dataset_loader  # noqa: E402
+from chess_QA.task_schema import (  # noqa: E402
+    CANONICAL_TASK_TYPES,
+    normalize_answer_payload_for_task,
+    normalize_task_type,
+)
+from tuna_sdk import QueryOutput, QueryRequest, QuerySettings, TunaClient  # noqa: E402
+from tuna_sdk.errors import TunaAPIError, TunaNetworkError  # noqa: E402
+
+DEFAULT_BASE_URL = "https://api.moondream.ai/v1"
+DEFAULT_DATASET_SOURCE = dataset_loader.DEFAULT_DATASET_SOURCE
+DEFAULT_HF_DATASET_REPO_ID = dataset_loader.DEFAULT_HF_DATASET_REPO_ID
+DEFAULT_HF_DATASET_REVISION = dataset_loader.DEFAULT_HF_DATASET_REVISION
+DEFAULT_DATASET_VARIANT_TAG = dataset_loader.DEFAULT_DATASET_VARIANT_TAG
+DEFAULT_FINAL_EVAL_SPLITS = [
+    "val",
+    "test",
+]
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "query_rl_chess_default.json"
+DEFAULT_REASONING = False
+DEFAULT_BENCHMARK_CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "benchmark_chess_default.json"
+
+SUPPORTED_TASKS = set(CANONICAL_TASK_TYPES)
+DEFAULT_TASK_SAMPLING_WEIGHTS: dict[str, float] = {
+    "list_all_pieces": 1.0,
+    "count_by_color": 1.0,
+    "list_color_pieces": 1.0,
+    "color_presence_check": 1.0,
+}
+DEFAULT_MAX_TOKENS_BY_TASK: dict[str, int] = {
+    "list_all_pieces": 900,
+    "list_color_pieces": 900,
+    "count_by_color": 200,
+    "color_presence_check": 200,
+}
+LIST_PIECE_REWARD_MODES = ("dense_partial_v1", "dense_partial_v2", "exact_binary")
+DEFAULT_LIST_PIECE_REWARD_MODE = "dense_partial_v1"
+DEFAULT_LIST_PIECE_REWARD_WEIGHTS: dict[str, float] = {
+    "typed_f1": 0.60,
+    "square_f1": 0.20,
+    "piece_recall": 0.20,
+}
+LIST_PIECE_REWARD_WEIGHT_KEYS = tuple(DEFAULT_LIST_PIECE_REWARD_WEIGHTS.keys())
+MAIN_TRAIN_WANDB_METRIC_KEYS = (
+    "reward_mean",
+    "train_json_object_rate",
+    "train_json_parse_rate",
+    "off_policy_group_fraction",
+    "replay_buffer_size",
+    "kl",
+)
+MAIN_EVAL_WANDB_METRIC_KEYS = (
+    "eval_samples",
+    "eval_reward_mean",
+    "eval_json_object_rate",
+    "eval_json_parse_rate",
+    "eval_exact_accuracy",
+)
+BOARD_EVAL_WANDB_METRIC_KEYS = (
+    "eval_board_metric_samples",
+    "eval_board_at_1_accuracy",
+    "eval_board_at_2_accuracy",
+    "eval_square_accuracy",
+    "eval_typed_square_precision",
+    "eval_typed_square_recall",
+    "eval_typed_square_f1",
+    "eval_square_precision",
+    "eval_square_recall",
+    "eval_square_f1",
+    "eval_piece_count_mae",
+    "eval_piece_type_count_l1",
+)
+CHECKPOINT_AVG_METRIC_CHOICES = (
+    "eval_reward_mean",
+    "eval_exact_accuracy",
+    "eval_json_parse_rate",
+    "eval_board_at_1_accuracy",
+    "eval_board_at_2_accuracy",
+    "eval_square_accuracy",
+    "eval_typed_square_precision",
+    "eval_typed_square_recall",
+    "eval_typed_square_f1",
+    "eval_square_precision",
+    "eval_square_recall",
+    "eval_square_f1",
+    "eval_task_accuracy_list_all_pieces",
+    "eval_task_accuracy_count_by_color",
+    "eval_task_accuracy_list_color_pieces",
+    "eval_task_accuracy_color_presence_check",
+)
+WANDB_LOG_PROFILES = ("legacy", "lean")
+
+REQUIRED_ROW_FIELDS = (
+    "row_id",
+    "split",
+    "task_type",
+    "question",
+    "final_answer_json",
+)
+BOARD_SQUARES: tuple[str, ...] = tuple(
+    f"{file_char}{rank_char}"
+    for rank_char in "12345678"
+    for file_char in "abcdefgh"
+)
+BOARD_COLLISION_LABEL = "__collision__"
+
+TRAIN_CONFIG_ALLOWED_KEYS = {
+    "api_key",
+    "api_key_env_var",
+    "auto_benchmark_best_checkpoint",
+    "auto_benchmark_config",
+    "auto_benchmark_output_json",
+    "auto_benchmark_predictions_jsonl",
+    "base_url",
+    "batch_size",
+    "best_metric",
+    "checkpoint_avg_metric",
+    "checkpoint_avg_splits",
+    "checkpoint_ranking_output",
+    "dataset_dir",
+    "dataset_source",
+    "dataset_variant_tag",
+    "early_stop",
+    "early_stop_mode",
+    "env_file",
+    "eval_batch_size",
+    "eval_every",
+    "eval_fixed_subset_seed",
+    "eval_fixed_subset_size",
+    "eval_max_samples",
+    "eval_predictions_output_dir",
+    "eval_reasoning",
+    "save_eval_predictions",
+    "eval_temperature",
+    "eval_top_p",
+    "final_eval_splits",
+    "finetune_id",
+    "finetune_name",
+    "group_size",
+    "hf_cache_dir",
+    "hf_dataset_repo_id",
+    "hf_dataset_revision",
+    "hf_token",
+    "image_jpeg_quality",
+    "lr",
+    "list_piece_reward_mode",
+    "list_piece_reward_weights",
+    "max_tokens",
+    "max_tokens_by_task",
+    "max_workers",
+    "no_progress",
+    "num_steps",
+    "off_policy",
+    "off_policy_buffer_size",
+    "off_policy_min_buffer_groups",
+    "off_policy_mix_ratio",
+    "off_policy_warmup_steps",
+    "rank",
+    "reasoning",
+    "resume_step",
+    "rollout_retries",
+    "rollout_retry_backoff_s",
+    "save_every",
+    "skip_final_eval",
+    "save_on_eval",
+    "seed",
+    "task_sampling_weights",
+    "temperature",
+    "top_p",
+    "train_split",
+    "val_split",
+    "wandb_project",
+    "wandb_run_name",
+    "wandb_log_profile",
+}
+
+EARLY_STOP_MODES = ("conservative", "balanced", "aggressive")
+
+
+def _strip_inline_env_comment(value: str) -> str:
+    quote_char = ""
+    for idx, char in enumerate(value):
+        if char in {"'", '"'}:
+            if not quote_char:
+                quote_char = char
+            elif quote_char == char:
+                quote_char = ""
+        if char == "#" and not quote_char:
+            if idx == 0 or value[idx - 1].isspace():
+                return value[:idx].rstrip()
+    return value.rstrip()
+
+
+def _decode_env_value(value: str) -> str:
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1]
+    return bytes(text, "utf-8").decode("unicode_escape")
+
+
+def _load_simple_dotenv(dotenv_path: str | Path, *, override: bool = False) -> bool:
+    path = Path(dotenv_path).expanduser()
+    if not path.exists():
+        return False
+
+    loaded_any = False
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        if "=" not in line:
+            continue
+
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+
+        value = _decode_env_value(_strip_inline_env_comment(raw_value))
+        if override or key not in os.environ:
+            os.environ[key] = value
+            loaded_any = True
+    return loaded_any
+
+
+def _load_dotenv_compat(dotenv_path: str | Path, *, override: bool = False) -> bool:
+    if _third_party_load_dotenv is not None:
+        return bool(_third_party_load_dotenv(dotenv_path, override=override))
+    return _load_simple_dotenv(dotenv_path, override=override)
+
+
+def _fingerprint_secret(secret: str) -> str:
+    text = str(secret or "").strip()
+    if not text:
+        return "missing"
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    return f"set(len={len(text)} sha256_12={digest})"
+
+
+def _format_auth_failure_message(
+    *,
+    operation: str,
+    env_file: str,
+    base_url: str,
+    api_key: str,
+    request_id: str | None,
+) -> str:
+    request_suffix = f" request_id={request_id}." if request_id else ""
+    check_cmd = (
+        "python check_moondream_key.py "
+        f"--env-file {shlex.quote(env_file)} "
+        f"--base-url {shlex.quote(base_url)}"
+    )
+    return (
+        f"Unauthorized while {operation} against {base_url}. "
+        f"env_file={env_file} api_key={_fingerprint_secret(api_key)}.{request_suffix} "
+        "Verify that the resolved MOONDREAM_API_KEY is valid for this environment. "
+        f"Quick check: {check_cmd}"
+    )
+
+
+def _resolve_finetune_with_auth_context(args: argparse.Namespace) -> tuple[TunaClient, Any]:
+    client = TunaClient(api_key=args.api_key, base_url=args.base_url)
+    try:
+        if args.finetune_id:
+            finetune = client.get_finetune(args.finetune_id)
+            return client, finetune
+        finetune = client.create_finetune(name=args.finetune_name, rank=args.rank)
+        return client, finetune
+    except TunaAPIError as exc:
+        if exc.status_code in {401, 403}:
+            operation = (
+                f"loading finetune {args.finetune_id}"
+                if args.finetune_id
+                else f"creating finetune {args.finetune_name!r}"
+            )
+            raise SystemExit(
+                _format_auth_failure_message(
+                    operation=operation,
+                    env_file=args.env_file,
+                    base_url=args.base_url,
+                    api_key=args.api_key,
+                    request_id=exc.request_id,
+                )
+            ) from exc
+        raise
+
+
+def _strip_json_line_comments(text: str) -> str:
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    idx = 0
+    text_len = len(text)
+    while idx < text_len:
+        char = text[idx]
+        next_char = text[idx + 1] if idx + 1 < text_len else ""
+        if in_string:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            idx += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            idx += 1
+            continue
+        if char == "/" and next_char == "/":
+            idx += 2
+            while idx < text_len and text[idx] not in {"\n", "\r"}:
+                idx += 1
+            continue
+        out.append(char)
+        idx += 1
+    return "".join(out)
+
+
+@dataclass(frozen=True)
+class QAExample:
+    row_id: str
+    split: str
+    task_type: str
+    question: str
+    image_path: Path
+    expected_answer: dict[str, Any]
+    queried_piece: Optional[str] = None
+    source_image_id: str = ""
+
+
+@dataclass(frozen=True)
+class ScoreOutcome:
+    reward: float
+    parse_success: bool
+    task_correct: bool
+    json_object_parsed: bool = False
+    exact_match: bool = False
+    board_metrics: Optional["BoardMetrics"] = None
+
+
+@dataclass(frozen=True)
+class BoardMetrics:
+    board_square_errors: int
+    board_at_1: bool
+    board_at_2: bool
+    square_accuracy: float
+    typed_square_precision: float
+    typed_square_recall: float
+    typed_square_f1: float
+    square_precision: float
+    square_recall: float
+    square_f1: float
+    gt_piece_count: int
+    pred_piece_count: int
+    piece_count_abs_error: int
+    piece_type_count_l1: int
+    pred_square_collision_count: int
+
+
+@dataclass(frozen=True)
+class CheckpointSaveOutcome:
+    saved: bool
+    checkpoint_id: str = ""
+    checkpoint_step: int = -1
+
+
+def _repo_relative(*parts: str) -> Path:
+    return Path(__file__).resolve().parent.joinpath(*parts)
+
+
+def _random_suffix(length: int = 6) -> str:
+    chars = string.ascii_lowercase + string.digits
+    return "".join(random.choices(chars, k=length))
+
+
+def _resolve_config_path(raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    if path.is_absolute():
+        return path
+
+    from_cwd = (Path.cwd() / path).resolve()
+    if from_cwd.exists():
+        return from_cwd
+
+    from_repo = (REPO_ROOT / path).resolve()
+    if from_repo.exists():
+        return from_repo
+
+    from_script = (_repo_relative(path.as_posix())).resolve()
+    if from_script.exists():
+        return from_script
+
+    return from_cwd
+
+
+def _load_json_config(config_path: Path) -> dict[str, Any]:
+    if not config_path.exists():
+        if config_path == DEFAULT_CONFIG_PATH:
+            return {}
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    payload = json.loads(_strip_json_line_comments(config_path.read_text(encoding="utf-8")))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Config must be a JSON object: {config_path}")
+    return payload
+
+
+def _validate_config_keys(config: dict[str, Any], *, config_path: Path) -> None:
+    unknown = sorted(key for key in config.keys() if key not in TRAIN_CONFIG_ALLOWED_KEYS)
+    if unknown:
+        raise ValueError(
+            f"Unknown config key(s) in {config_path}: {unknown}. "
+            "Remove typos or update script support."
+        )
+
+
+def _cfg_str(config: dict[str, Any], key: str, fallback: str) -> str:
+    value = config.get(key, fallback)
+    return str(value) if value is not None else fallback
+
+
+def _cfg_int(config: dict[str, Any], key: str, fallback: int) -> int:
+    value = config.get(key, fallback)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _cfg_float(config: dict[str, Any], key: str, fallback: float) -> float:
+    value = config.get(key, fallback)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _cfg_list_str(config: dict[str, Any], key: str, fallback: list[str]) -> list[str]:
+    value = config.get(key)
+    if not isinstance(value, list):
+        return list(fallback)
+    out: list[str] = []
+    for item in value:
+        text = str(item).strip()
+        if text:
+            out.append(text)
+    return out or list(fallback)
+
+
+def _cfg_dict(config: dict[str, Any], key: str, fallback: dict[str, Any]) -> dict[str, Any]:
+    value = config.get(key)
+    if not isinstance(value, dict):
+        return dict(fallback)
+    return dict(value)
+
+
+def _cfg_bool(config: dict[str, Any], key: str, fallback: bool) -> bool:
+    value = config.get(key, fallback)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "n", "off"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return fallback
+
+
+def _cfg_optional_float(config: dict[str, Any], key: str) -> Optional[float]:
+    value = config.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"", "none", "null", "inherit"}:
+            return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _cfg_optional_bool(config: dict[str, Any], key: str) -> Optional[bool]:
+    value = config.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"", "none", "null", "inherit"}:
+            return None
+        if lowered in {"true", "1", "yes", "y", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "n", "off"}:
+            return False
+    if isinstance(value, (int, float)):
+        if value == 0:
+            return False
+        if value == 1:
+            return True
+    return None
+
+
+def _parse_optional_float_arg(raw_value: str) -> Optional[float]:
+    text = str(raw_value or "").strip().lower()
+    if text in {"", "none", "null", "inherit"}:
+        return None
+    try:
+        return float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected float or inherit/none/null, got: {raw_value!r}") from exc
+
+
+def _parse_json_object_arg(raw_value: str, arg_name: str) -> dict[str, Any]:
+    text = str(raw_value or "").strip()
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{arg_name} must be valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{arg_name} must decode to a JSON object")
+    return payload
+
+
+def _normalize_task_sampling_weights(raw_map: dict[str, Any], *, source: str) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for raw_task, raw_weight in raw_map.items():
+        try:
+            task = normalize_task_type(str(raw_task).strip())
+        except ValueError as exc:
+            raise ValueError(f"{source}: unknown task_type '{raw_task}'") from exc
+        try:
+            weight = float(raw_weight)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{source}: weight for task_type '{task}' must be numeric") from exc
+        if weight < 0.0:
+            raise ValueError(f"{source}: weight for task_type '{task}' must be >= 0")
+        out[task] = weight
+    return out
+
+
+def _normalize_max_tokens_by_task(raw_map: dict[str, Any], *, source: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for raw_task, raw_max_tokens in raw_map.items():
+        try:
+            task = normalize_task_type(str(raw_task).strip())
+        except ValueError as exc:
+            raise ValueError(f"{source}: unknown task_type '{raw_task}'") from exc
+        max_tokens = _parse_int(raw_max_tokens)
+        if max_tokens is None or max_tokens <= 0:
+            raise ValueError(f"{source}: max_tokens for task_type '{task}' must be > 0")
+        out[task] = int(max_tokens)
+    return out
+
+
+def _resolve_task_sampling_weights(
+    *,
+    config_map: dict[str, Any],
+    cli_override_json: str,
+) -> dict[str, float]:
+    resolved = {task: 1.0 for task in SUPPORTED_TASKS}
+    resolved.update(_normalize_task_sampling_weights(config_map, source="config task_sampling_weights"))
+
+    if str(cli_override_json or "").strip():
+        cli_map = _parse_json_object_arg(cli_override_json, "--task-sampling-weights-json")
+        resolved.update(
+            _normalize_task_sampling_weights(
+                cli_map,
+                source="--task-sampling-weights-json",
+            )
+        )
+    return resolved
+
+
+def _weights_for_sampling_tasks(
+    *,
+    tasks: list[str],
+    task_sampling_weights: dict[str, float],
+) -> list[float]:
+    weights = [float(task_sampling_weights.get(task, 1.0)) for task in tasks]
+    if tasks and not any(weight > 0.0 for weight in weights):
+        raise ValueError(
+            "effective task_sampling_weights for available train tasks must include at least one positive weight"
+        )
+    return weights
+
+
+def _active_tasks_from_sampling_weights(task_sampling_weights: dict[str, float]) -> set[str]:
+    return {
+        task
+        for task in SUPPORTED_TASKS
+        if float(task_sampling_weights.get(task, 1.0)) > 0.0
+    }
+
+
+def _filter_examples_by_active_tasks(
+    examples: list[QAExample],
+    *,
+    active_tasks: set[str],
+) -> list[QAExample]:
+    if not active_tasks:
+        return []
+    return [item for item in examples if item.task_type in active_tasks]
+
+
+def _sample_training_example(
+    *,
+    task_name: str,
+    train_examples_by_task: dict[str, list[QAExample]],
+    rng: random.Random,
+) -> QAExample:
+    return rng.choice(train_examples_by_task[task_name])
+
+
+def _resolve_max_tokens_by_task(
+    *,
+    config_map: dict[str, Any],
+    cli_override_json: str,
+) -> dict[str, int]:
+    resolved = _normalize_max_tokens_by_task(config_map, source="config max_tokens_by_task")
+
+    if str(cli_override_json or "").strip():
+        cli_map = _parse_json_object_arg(cli_override_json, "--max-tokens-by-task-json")
+        resolved.update(
+            _normalize_max_tokens_by_task(
+                cli_map,
+                source="--max-tokens-by-task-json",
+            )
+        )
+    return resolved
+
+
+def _normalize_list_piece_reward_weights(raw_map: dict[str, Any], *, source: str) -> dict[str, float]:
+    expected = set(LIST_PIECE_REWARD_WEIGHT_KEYS)
+    actual = set(raw_map.keys())
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise ValueError(
+            f"{source}: reward weight keys must exactly match {sorted(expected)} "
+            f"(missing={missing}, extra={extra})"
+        )
+
+    out: dict[str, float] = {}
+    for key in LIST_PIECE_REWARD_WEIGHT_KEYS:
+        raw_value = raw_map[key]
+        try:
+            weight = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{source}: reward weight '{key}' must be numeric") from exc
+        if weight < 0.0:
+            raise ValueError(f"{source}: reward weight '{key}' must be >= 0")
+        out[key] = weight
+
+    total = float(sum(out.values()))
+    if total <= 0.0:
+        raise ValueError(f"{source}: reward weights must sum to > 0")
+    return {key: float(out[key] / total) for key in LIST_PIECE_REWARD_WEIGHT_KEYS}
+
+
+def _resolve_list_piece_reward_weights(
+    *,
+    config_map: dict[str, Any],
+    cli_override_json: str,
+) -> dict[str, float]:
+    resolved = _normalize_list_piece_reward_weights(
+        config_map,
+        source="config list_piece_reward_weights",
+    )
+    if str(cli_override_json or "").strip():
+        cli_map = _parse_json_object_arg(cli_override_json, "--list-piece-reward-weights-json")
+        resolved = _normalize_list_piece_reward_weights(
+            cli_map,
+            source="--list-piece-reward-weights-json",
+        )
+    return resolved
+
+
+def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="RL query finetuning for Chess QA")
+    parser.add_argument("--config", default=str(config_path))
+    parser.add_argument("--env-file", default=_cfg_str(config, "env_file", str(_repo_relative(".env"))))
+    parser.add_argument("--api-key", default=_cfg_str(config, "api_key", ""))
+    parser.add_argument(
+        "--api-key-env-var",
+        default=_cfg_str(config, "api_key_env_var", "MOONDREAM_API_KEY"),
+    )
+    parser.add_argument("--base-url", default=_cfg_str(config, "base_url", ""))
+
+    parser.add_argument(
+        "--dataset-source",
+        choices=sorted(dataset_loader.SUPPORTED_DATASET_SOURCES),
+        default=_cfg_str(config, "dataset_source", DEFAULT_DATASET_SOURCE),
+        help="Dataset source: HF Hub or local JSONL directory.",
+    )
+    parser.add_argument(
+        "--dataset-dir",
+        default=_cfg_str(config, "dataset_dir", str(_repo_relative("synth-chess-dataset/outputs"))),
+        help="Local dataset dir (required when --dataset-source=local_jsonl).",
+    )
+    parser.add_argument(
+        "--dataset-variant-tag",
+        default=_cfg_str(config, "dataset_variant_tag", DEFAULT_DATASET_VARIANT_TAG),
+        help=(
+            "Dataset variant tag under dataset root. "
+            "Expected local path contract: <dataset_dir>/<dataset_variant_tag>/jsonl/<split>.jsonl"
+        ),
+    )
+    parser.add_argument(
+        "--hf-dataset-repo-id",
+        default=_cfg_str(config, "hf_dataset_repo_id", DEFAULT_HF_DATASET_REPO_ID),
+    )
+    parser.add_argument(
+        "--hf-dataset-revision",
+        default=_cfg_str(config, "hf_dataset_revision", DEFAULT_HF_DATASET_REVISION),
+    )
+    parser.add_argument("--hf-token", default=_cfg_str(config, "hf_token", ""))
+    parser.add_argument("--hf-cache-dir", default=_cfg_str(config, "hf_cache_dir", ""))
+    parser.add_argument("--train-split", default=_cfg_str(config, "train_split", "train"))
+    parser.add_argument("--val-split", default=_cfg_str(config, "val_split", "val"))
+    parser.add_argument(
+        "--final-eval-splits",
+        nargs="+",
+        default=_cfg_list_str(config, "final_eval_splits", DEFAULT_FINAL_EVAL_SPLITS),
+        help="Split names to evaluate after training.",
+    )
+
+    parser.add_argument("--finetune-id", default=_cfg_str(config, "finetune_id", ""))
+    parser.add_argument("--finetune-name", default=_cfg_str(config, "finetune_name", ""))
+    parser.add_argument("--rank", type=int, default=_cfg_int(config, "rank", 16))
+
+    parser.add_argument("--seed", type=int, default=_cfg_int(config, "seed", 42))
+    parser.add_argument("--num-steps", type=int, default=_cfg_int(config, "num_steps", 100))
+    parser.add_argument("--resume-step", type=int, default=_cfg_int(config, "resume_step", 0))
+    parser.add_argument("--batch-size", type=int, default=_cfg_int(config, "batch_size", 16))
+    parser.add_argument("--group-size", type=int, default=_cfg_int(config, "group_size", 4))
+    parser.add_argument("--lr", type=float, default=_cfg_float(config, "lr", 2e-3))
+    parser.add_argument("--max-workers", type=int, default=_cfg_int(config, "max_workers", 4))
+    parser.add_argument("--rollout-retries", type=int, default=_cfg_int(config, "rollout_retries", 2))
+    parser.add_argument(
+        "--rollout-retry-backoff-s",
+        type=float,
+        default=_cfg_float(config, "rollout_retry_backoff_s", 1.0),
+    )
+
+    parser.add_argument("--temperature", type=float, default=_cfg_float(config, "temperature", 1.0))
+    parser.add_argument("--top-p", type=float, default=_cfg_float(config, "top_p", 0.9))
+    parser.add_argument("--max-tokens", type=int, default=_cfg_int(config, "max_tokens", 256))
+    parser.add_argument(
+        "--image-jpeg-quality",
+        type=int,
+        default=_cfg_int(config, "image_jpeg_quality", 92),
+        help="JPEG quality used when embedding images as data URLs for rollouts/train_step payloads.",
+    )
+    parser.add_argument(
+        "--eval-temperature",
+        type=_parse_optional_float_arg,
+        default=_cfg_optional_float(config, "eval_temperature"),
+        help="Eval temperature override. Use inherit/none/null to reuse rollout temperature.",
+    )
+    parser.add_argument(
+        "--eval-top-p",
+        type=_parse_optional_float_arg,
+        default=_cfg_optional_float(config, "eval_top_p"),
+        help="Eval top-p override. Use inherit/none/null to reuse rollout top-p.",
+    )
+    parser.add_argument(
+        "--task-sampling-weights-json",
+        default="",
+        help="JSON object override for task sampling weights: {\"task_type\": weight}.",
+    )
+    parser.add_argument(
+        "--max-tokens-by-task-json",
+        default="",
+        help="JSON object override for per-task max token caps: {\"task_type\": int}.",
+    )
+    parser.add_argument(
+        "--list-piece-reward-mode",
+        choices=list(LIST_PIECE_REWARD_MODES),
+        default=_cfg_str(config, "list_piece_reward_mode", DEFAULT_LIST_PIECE_REWARD_MODE),
+        help="Reward mode for list_* piece tasks.",
+    )
+    parser.add_argument(
+        "--list-piece-reward-weights-json",
+        default="",
+        help=(
+            "JSON object override for dense list-piece reward weights: "
+            "{\"typed_f1\":0.6,\"square_f1\":0.2,\"piece_recall\":0.2}."
+        ),
+    )
+
+    off_policy_group = parser.add_mutually_exclusive_group()
+    off_policy_group.add_argument(
+        "--off-policy",
+        dest="off_policy",
+        action="store_true",
+        help="Enable off-policy replay mixing in train_step updates.",
+    )
+    off_policy_group.add_argument(
+        "--no-off-policy",
+        dest="off_policy",
+        action="store_false",
+        help="Disable off-policy replay mixing in train_step updates.",
+    )
+    parser.set_defaults(off_policy=_cfg_bool(config, "off_policy", False))
+    parser.add_argument(
+        "--off-policy-mix-ratio",
+        type=float,
+        default=_cfg_float(config, "off_policy_mix_ratio", 0.5),
+        help="Fraction of train groups sourced from replay when off-policy is active.",
+    )
+    parser.add_argument(
+        "--off-policy-buffer-size",
+        type=int,
+        default=_cfg_int(config, "off_policy_buffer_size", 4096),
+        help="Max number of train groups stored in off-policy replay buffer.",
+    )
+    parser.add_argument(
+        "--off-policy-warmup-steps",
+        type=int,
+        default=_cfg_int(config, "off_policy_warmup_steps", 10),
+        help="Minimum number of train steps before off-policy replay can be used.",
+    )
+    parser.add_argument(
+        "--off-policy-min-buffer-groups",
+        type=int,
+        default=_cfg_int(config, "off_policy_min_buffer_groups", 64),
+        help="Minimum replay groups required before off-policy replay is used.",
+    )
+
+    reasoning_group = parser.add_mutually_exclusive_group()
+    reasoning_group.add_argument(
+        "--reasoning",
+        dest="reasoning",
+        action="store_true",
+        help="Enable reasoning mode in query requests.",
+    )
+    reasoning_group.add_argument(
+        "--no-reasoning",
+        dest="reasoning",
+        action="store_false",
+        help="Disable reasoning mode in query requests.",
+    )
+    parser.set_defaults(reasoning=_cfg_bool(config, "reasoning", DEFAULT_REASONING))
+    eval_reasoning_group = parser.add_mutually_exclusive_group()
+    eval_reasoning_group.add_argument(
+        "--eval-reasoning",
+        dest="eval_reasoning",
+        action="store_true",
+        help="Force reasoning=true for eval requests.",
+    )
+    eval_reasoning_group.add_argument(
+        "--no-eval-reasoning",
+        dest="eval_reasoning",
+        action="store_false",
+        help="Force reasoning=false for eval requests.",
+    )
+    eval_reasoning_group.add_argument(
+        "--eval-reasoning-inherit",
+        dest="eval_reasoning",
+        action="store_const",
+        const=None,
+        help="Inherit eval reasoning from rollout --reasoning.",
+    )
+    parser.set_defaults(eval_reasoning=_cfg_optional_bool(config, "eval_reasoning"))
+
+    parser.add_argument("--eval-every", type=int, default=_cfg_int(config, "eval_every", 20))
+    parser.add_argument("--save-every", type=int, default=_cfg_int(config, "save_every", 20))
+    save_on_eval_group = parser.add_mutually_exclusive_group()
+    save_on_eval_group.add_argument(
+        "--save-on-eval",
+        dest="save_on_eval",
+        action="store_true",
+        help="Save a checkpoint at each periodic evaluation.",
+    )
+    save_on_eval_group.add_argument(
+        "--no-save-on-eval",
+        dest="save_on_eval",
+        action="store_false",
+        help="Disable automatic checkpoint save at periodic evaluations.",
+    )
+    parser.set_defaults(save_on_eval=_cfg_bool(config, "save_on_eval", True))
+    parser.add_argument("--eval-batch-size", type=int, default=_cfg_int(config, "eval_batch_size", 32))
+    parser.add_argument(
+        "--eval-max-samples",
+        type=int,
+        default=_cfg_int(config, "eval_max_samples", 1000),
+        help="Max samples per eval split. <=0 means full split.",
+    )
+    save_eval_predictions_group = parser.add_mutually_exclusive_group()
+    save_eval_predictions_group.add_argument(
+        "--save-eval-predictions",
+        dest="save_eval_predictions",
+        action="store_true",
+        help="Write scored eval predictions as JSONL artifacts.",
+    )
+    save_eval_predictions_group.add_argument(
+        "--no-save-eval-predictions",
+        dest="save_eval_predictions",
+        action="store_false",
+        help="Disable eval prediction artifact writing.",
+    )
+    parser.set_defaults(save_eval_predictions=_cfg_bool(config, "save_eval_predictions", False))
+    parser.add_argument(
+        "--eval-predictions-output-dir",
+        default=_cfg_str(config, "eval_predictions_output_dir", ""),
+        help="Directory where eval prediction JSONL artifacts are written when enabled.",
+    )
+    parser.add_argument(
+        "--eval-fixed-subset-size",
+        type=int,
+        default=_cfg_int(config, "eval_fixed_subset_size", 0),
+        help="Fixed deterministic eval subset size per split. <=0 disables fixed subsets.",
+    )
+    parser.add_argument(
+        "--eval-fixed-subset-seed",
+        type=int,
+        default=_cfg_int(config, "eval_fixed_subset_seed", 1337),
+        help="Seed used for deterministic eval fixed subset index generation.",
+    )
+    parser.add_argument(
+        "--checkpoint-avg-splits",
+        nargs="+",
+        default=_cfg_list_str(config, "checkpoint_avg_splits", ["val", "test"]),
+        help="Splits used for periodic checkpoint average ranking.",
+    )
+    parser.add_argument(
+        "--checkpoint-avg-metric",
+        choices=list(CHECKPOINT_AVG_METRIC_CHOICES),
+        default=_cfg_str(config, "checkpoint_avg_metric", "eval_reward_mean"),
+    )
+    parser.add_argument(
+        "--checkpoint-ranking-output",
+        default=_cfg_str(config, "checkpoint_ranking_output", ""),
+        help="Path to write periodic checkpoint ranking JSON.",
+    )
+
+    parser.add_argument(
+        "--best-metric",
+        choices=list(CHECKPOINT_AVG_METRIC_CHOICES),
+        default=_cfg_str(config, "best_metric", "eval_reward_mean"),
+    )
+    early_stop_group = parser.add_mutually_exclusive_group()
+    early_stop_group.add_argument(
+        "--early-stop",
+        dest="early_stop",
+        action="store_true",
+        help="Enable periodic eval-based early termination rules.",
+    )
+    early_stop_group.add_argument(
+        "--no-early-stop",
+        dest="early_stop",
+        action="store_false",
+        help="Disable eval-based early termination rules.",
+    )
+    parser.set_defaults(early_stop=_cfg_bool(config, "early_stop", False))
+    parser.add_argument(
+        "--early-stop-mode",
+        choices=list(EARLY_STOP_MODES),
+        default=_cfg_str(config, "early_stop_mode", "balanced"),
+        help="Threshold profile for early-stop collapse/plateau checks.",
+    )
+    skip_final_eval_group = parser.add_mutually_exclusive_group()
+    skip_final_eval_group.add_argument(
+        "--skip-final-eval",
+        dest="skip_final_eval",
+        action="store_true",
+        help="Skip final post-training split evals (useful for sweep screening).",
+    )
+    skip_final_eval_group.add_argument(
+        "--no-skip-final-eval",
+        dest="skip_final_eval",
+        action="store_false",
+        help="Run final post-training split evals.",
+    )
+    parser.set_defaults(skip_final_eval=_cfg_bool(config, "skip_final_eval", False))
+    auto_bench_group = parser.add_mutually_exclusive_group()
+    auto_bench_group.add_argument(
+        "--auto-benchmark-best-checkpoint",
+        dest="auto_benchmark_best_checkpoint",
+        action="store_true",
+        help="After training, benchmark the best checkpoint automatically.",
+    )
+    auto_bench_group.add_argument(
+        "--no-auto-benchmark-best-checkpoint",
+        dest="auto_benchmark_best_checkpoint",
+        action="store_false",
+        help="Disable automatic post-training benchmark execution.",
+    )
+    parser.set_defaults(
+        auto_benchmark_best_checkpoint=_cfg_bool(config, "auto_benchmark_best_checkpoint", False)
+    )
+    parser.add_argument(
+        "--auto-benchmark-config",
+        default=_cfg_str(config, "auto_benchmark_config", str(DEFAULT_BENCHMARK_CONFIG_PATH)),
+        help="Benchmark config file used for automatic post-training benchmark.",
+    )
+    parser.add_argument(
+        "--auto-benchmark-output-json",
+        default=_cfg_str(config, "auto_benchmark_output_json", ""),
+        help="Optional metrics path override for automatic post-training benchmark.",
+    )
+    parser.add_argument(
+        "--auto-benchmark-predictions-jsonl",
+        default=_cfg_str(config, "auto_benchmark_predictions_jsonl", ""),
+        help="Optional predictions path override for automatic post-training benchmark.",
+    )
+
+    parser.add_argument("--wandb-project", default=_cfg_str(config, "wandb_project", "moondream-chess-query-rl"))
+    parser.add_argument("--wandb-run-name", default=_cfg_str(config, "wandb_run_name", ""))
+    parser.add_argument(
+        "--wandb-log-profile",
+        choices=list(WANDB_LOG_PROFILES),
+        default=_cfg_str(config, "wandb_log_profile", "legacy"),
+        help="legacy keeps all prefixed eval streams; lean keeps only core streams.",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        default=_cfg_bool(config, "no_progress", False),
+        help="Disable tqdm progress bars.",
+    )
+
+    return parser
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
+    pre_args, _ = pre_parser.parse_known_args(argv)
+
+    config_path = _resolve_config_path(pre_args.config)
+    config = _load_json_config(config_path)
+    _validate_config_keys(config, config_path=config_path)
+    parser = _build_parser(config, config_path)
+    args = parser.parse_args(argv)
+
+    args.config = str(_resolve_config_path(args.config))
+    args.auto_benchmark_config = str(_resolve_config_path(args.auto_benchmark_config))
+    args.dataset_variant_tag = dataset_loader.normalize_dataset_variant_tag(
+        args.dataset_variant_tag,
+        allow_unknown=(str(args.dataset_source).strip().lower() == "hf_hub"),
+    )
+    args.task_sampling_weights = _resolve_task_sampling_weights(
+        config_map=_cfg_dict(
+            config,
+            "task_sampling_weights",
+            DEFAULT_TASK_SAMPLING_WEIGHTS,
+        ),
+        cli_override_json=args.task_sampling_weights_json,
+    )
+    args.max_tokens_by_task = _resolve_max_tokens_by_task(
+        config_map=_cfg_dict(
+            config,
+            "max_tokens_by_task",
+            DEFAULT_MAX_TOKENS_BY_TASK,
+        ),
+        cli_override_json=args.max_tokens_by_task_json,
+    )
+    args.list_piece_reward_mode = str(args.list_piece_reward_mode).strip().lower()
+    args.list_piece_reward_weights = _resolve_list_piece_reward_weights(
+        config_map=_cfg_dict(
+            config,
+            "list_piece_reward_weights",
+            DEFAULT_LIST_PIECE_REWARD_WEIGHTS,
+        ),
+        cli_override_json=args.list_piece_reward_weights_json,
+    )
+    return args
+
+
+def _resolve_env_file(env_file: str) -> str:
+    path = Path(env_file).expanduser()
+    if path.is_absolute():
+        return str(path)
+
+    from_cwd = (Path.cwd() / path).resolve()
+    if from_cwd.exists():
+        return str(from_cwd)
+
+    from_repo = (REPO_ROOT / path).resolve()
+    if from_repo.exists():
+        return str(from_repo)
+
+    from_script = (_repo_relative(path.as_posix())).resolve()
+    if from_script.exists():
+        return str(from_script)
+
+    return str(from_cwd)
+
+
+def _resolve_dataset_dir(dataset_dir: str) -> Path:
+    path = Path(str(dataset_dir or "").strip()).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+
+    from_cwd = (Path.cwd() / path).resolve()
+    if from_cwd.exists():
+        return from_cwd
+
+    from_repo = (REPO_ROOT / path).resolve()
+    if from_repo.exists():
+        return from_repo
+
+    from_script = (_repo_relative(path.as_posix())).resolve()
+    if from_script.exists():
+        return from_script
+
+    return from_cwd
+
+
+def _resolve_output_path(raw_path: str, *, fallback_name: str) -> Path:
+    text = str(raw_path or "").strip()
+    if text:
+        path = Path(text).expanduser()
+        if path.is_absolute():
+            return path
+        if path.parts and path.parts[0] == "chess_QA":
+            return (REPO_ROOT / path).resolve()
+        return (Path.cwd() / path).resolve()
+    return _repo_relative("outputs", fallback_name).resolve()
+
+
+def _resolve_output_dir(raw_path: str, *, fallback_name: str) -> Path:
+    text = str(raw_path or "").strip()
+    if text:
+        path = Path(text).expanduser()
+        if path.is_absolute():
+            return path
+        if path.parts and path.parts[0] == "chess_QA":
+            return (REPO_ROOT / path).resolve()
+        return (Path.cwd() / path).resolve()
+    return _repo_relative("outputs", fallback_name).resolve()
+
+
+def _eval_predictions_path(
+    *,
+    output_dir: Path,
+    stage_label: str,
+    split_name: str,
+    step_for_log: int,
+) -> Path:
+    safe_stage = "".join(ch if ch.isalnum() else "_" for ch in str(stage_label).strip())
+    safe_split = _sanitize_split_name(split_name)
+    file_name = f"{safe_stage}_step{int(step_for_log):06d}_{safe_split}.jsonl"
+    return output_dir / file_name
+
+
+def _write_jsonl_records(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            handle.write("\n")
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    args.dataset_source = dataset_loader.normalize_dataset_source(args.dataset_source)
+    args.dataset_variant_tag = dataset_loader.normalize_dataset_variant_tag(
+        args.dataset_variant_tag,
+        allow_unknown=(args.dataset_source == "hf_hub"),
+    )
+    if args.num_steps < 0:
+        raise ValueError("--num-steps must be >= 0")
+    if args.resume_step < 0:
+        raise ValueError("--resume-step must be >= 0")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be > 0")
+    if args.group_size <= 0:
+        raise ValueError("--group-size must be > 0")
+    if args.max_workers <= 0:
+        raise ValueError("--max-workers must be > 0")
+    if args.lr <= 0.0:
+        raise ValueError("--lr must be > 0")
+    if not (0.0 <= args.temperature <= 2.0):
+        raise ValueError("--temperature must be in [0,2]")
+    if not (0.0 < args.top_p <= 1.0):
+        raise ValueError("--top-p must be in (0,1]")
+    if not (1 <= int(args.image_jpeg_quality) <= 100):
+        raise ValueError("--image-jpeg-quality must be in [1,100]")
+    if args.eval_temperature is not None and not (0.0 <= float(args.eval_temperature) <= 2.0):
+        raise ValueError("--eval-temperature must be in [0,2] when set")
+    if args.eval_top_p is not None and not (0.0 < float(args.eval_top_p) <= 1.0):
+        raise ValueError("--eval-top-p must be in (0,1] when set")
+    if args.max_tokens <= 0:
+        raise ValueError("--max-tokens must be > 0")
+    if args.eval_every < 0:
+        raise ValueError("--eval-every must be >= 0")
+    if args.save_every < 0:
+        raise ValueError("--save-every must be >= 0")
+    if args.eval_batch_size <= 0:
+        raise ValueError("--eval-batch-size must be > 0")
+    if args.eval_fixed_subset_size < 0:
+        raise ValueError("--eval-fixed-subset-size must be >= 0")
+    if args.rollout_retries < 0:
+        raise ValueError("--rollout-retries must be >= 0")
+    if args.rollout_retry_backoff_s <= 0.0:
+        raise ValueError("--rollout-retry-backoff-s must be > 0")
+    if not (0.0 <= args.off_policy_mix_ratio <= 1.0):
+        raise ValueError("--off-policy-mix-ratio must be in [0,1]")
+    if args.off_policy_buffer_size <= 0:
+        raise ValueError("--off-policy-buffer-size must be > 0")
+    if args.off_policy_warmup_steps < 0:
+        raise ValueError("--off-policy-warmup-steps must be >= 0")
+    if args.off_policy_min_buffer_groups <= 0:
+        raise ValueError("--off-policy-min-buffer-groups must be > 0")
+    if args.off_policy_min_buffer_groups > args.off_policy_buffer_size:
+        raise ValueError(
+            "--off-policy-min-buffer-groups must be <= --off-policy-buffer-size"
+        )
+    if args.list_piece_reward_mode not in LIST_PIECE_REWARD_MODES:
+        raise ValueError(f"--list-piece-reward-mode must be one of {list(LIST_PIECE_REWARD_MODES)}")
+    args.list_piece_reward_weights = _normalize_list_piece_reward_weights(
+        args.list_piece_reward_weights,
+        source="resolved list_piece_reward_weights",
+    )
+    if args.wandb_log_profile not in WANDB_LOG_PROFILES:
+        raise ValueError(f"--wandb-log-profile must be one of {list(WANDB_LOG_PROFILES)}")
+    if args.early_stop_mode not in EARLY_STOP_MODES:
+        raise ValueError(f"--early-stop-mode must be one of {list(EARLY_STOP_MODES)}")
+    if not args.checkpoint_avg_splits:
+        raise ValueError("--checkpoint-avg-splits must contain at least one split")
+
+    if args.finetune_id and args.finetune_name:
+        raise ValueError("Provide either --finetune-id or --finetune-name, not both")
+    if args.dataset_source == "local_jsonl" and not str(args.dataset_dir).strip():
+        raise ValueError("--dataset-dir is required when --dataset-source=local_jsonl")
+    if args.dataset_source == "hf_hub" and not str(args.hf_dataset_repo_id).strip():
+        raise ValueError("--hf-dataset-repo-id is required when --dataset-source=hf_hub")
+    if bool(args.auto_benchmark_best_checkpoint):
+        auto_benchmark_config_path = Path(str(args.auto_benchmark_config)).expanduser().resolve()
+        if not auto_benchmark_config_path.exists():
+            raise FileNotFoundError(
+                f"--auto-benchmark-config not found: {auto_benchmark_config_path}"
+            )
+
+
+def _warn_on_unsafe_mode_combo(*, off_policy: bool, reasoning: bool) -> None:
+    if bool(off_policy) and bool(reasoning):
+        print(
+            "WARNING: off-policy + reasoning is an experimental combination for this trainer; "
+            "expect higher variance and review eval artifacts closely."
+        )
+
+
+
+def _progress_enabled(no_progress: bool) -> bool:
+    if no_progress:
+        return False
+    return sys.stderr.isatty()
+
+
+def _dedupe_splits(splits: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for split in splits:
+        item = str(split).strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _to_data_url(image: Image.Image, *, quality: int = 92) -> str:
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=max(1, min(100, int(quality))))
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def _parse_int(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if value == 0:
+            return False
+        if value == 1:
+            return True
+        return None
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "t", "yes", "y", "1"}:
+            return True
+        if lowered in {"false", "f", "no", "n", "0"}:
+            return False
+    return None
+
+
+def _coerce_color(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"white", "black"}:
+        return normalized
+    return None
+
+
+def _normalize_piece_key(value: Any) -> Optional[str]:
+    text = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    while "__" in text:
+        text = text.replace("__", "_")
+    return text or None
+
+
+def _normalize_square(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    square = value.strip().lower()
+    if not square:
+        return None
+    if len(square) != 2 or square[0] not in "abcdefgh" or square[1] not in "12345678":
+        return None
+    return square
+
+
+def _normalize_square_set(value: Any) -> Optional[frozenset[str]]:
+    if isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        raw_items = [value]
+    squares: set[str] = set()
+    for item in raw_items:
+        square = _normalize_square(item)
+        if square is None:
+            return None
+        squares.add(square)
+    return frozenset(squares)
+
+
+def _normalize_piece_map(pieces_payload: Any) -> Optional[tuple[tuple[str, tuple[str, ...]], ...]]:
+    if isinstance(pieces_payload, dict):
+        maps = [pieces_payload]
+    elif isinstance(pieces_payload, tuple):
+        # Accept canonicalized tuple representation so normalization is idempotent.
+        maybe_map: dict[Any, Any] = {}
+        for item in pieces_payload:
+            if not isinstance(item, tuple) or len(item) != 2:
+                return None
+            maybe_map[item[0]] = item[1]
+        maps = [maybe_map]
+    elif isinstance(pieces_payload, list):
+        maps = pieces_payload
+    else:
+        return None
+
+    merged: dict[str, set[str]] = {}
+    for piece_map in maps:
+        if not isinstance(piece_map, dict):
+            return None
+        for raw_piece_key, raw_squares in piece_map.items():
+            piece_key = _normalize_piece_key(raw_piece_key)
+            if piece_key is None:
+                return None
+            square_set = _normalize_square_set(raw_squares)
+            if square_set is None:
+                return None
+            merged.setdefault(piece_key, set()).update(square_set)
+
+    canonical: list[tuple[str, tuple[str, ...]]] = []
+    for piece_key, squares in merged.items():
+        canonical.append((piece_key, tuple(sorted(squares))))
+    canonical.sort(key=lambda item: item[0])
+    return tuple(canonical)
+
+
+def _normalize_answer_for_task(task_type: str, payload: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+
+    task = normalize_task_type(task_type, allow_unknown=True)
+    payload = normalize_answer_payload_for_task(task, payload)
+
+    if task == "count_by_color":
+        white_piece_count = _parse_int(payload.get("white_piece_count"))
+        black_piece_count = _parse_int(payload.get("black_piece_count"))
+        if (
+            white_piece_count is None
+            or black_piece_count is None
+            or white_piece_count < 0
+            or black_piece_count < 0
+        ):
+            return None
+        return {
+            "white_piece_count": int(white_piece_count),
+            "black_piece_count": int(black_piece_count),
+        }
+
+    if task == "color_presence_check":
+        color = _coerce_color(payload.get("color"))
+        present = _coerce_bool(payload.get("present"))
+        if color is None or present is None:
+            return None
+        normalized: dict[str, Any] = {
+            "color": color,
+            "present": bool(present),
+        }
+        if "count" in payload:
+            count = _parse_int(payload.get("count"))
+            if count is None or count < 0:
+                return None
+            normalized["count"] = int(count)
+        return normalized
+
+    if task == "list_all_pieces":
+        raw_pieces = payload.get("pieces", payload)
+        pieces = _normalize_piece_map(raw_pieces)
+        if pieces is None:
+            return None
+        return {"pieces": pieces}
+
+    if task == "list_color_pieces":
+        color = _coerce_color(payload.get("color"))
+        if color is None:
+            return None
+        if "pieces" in payload:
+            raw_pieces = payload.get("pieces")
+        else:
+            raw_pieces = {k: v for k, v in payload.items() if str(k).strip().lower() != "color"}
+        pieces = _normalize_piece_map(raw_pieces)
+        if pieces is None:
+            return None
+        return {
+            "color": color,
+            "pieces": pieces,
+        }
+
+    return None
+
+
+def _f1_from_sets(pred: set[Any], gt: set[Any]) -> float:
+    if not pred and not gt:
+        return 1.0
+    if not pred or not gt:
+        return 0.0
+    intersection = len(pred.intersection(gt))
+    precision = float(intersection) / float(len(pred))
+    recall = float(intersection) / float(len(gt))
+    if precision <= 0.0 and recall <= 0.0:
+        return 0.0
+    return (2.0 * precision * recall) / (precision + recall)
+
+
+def _typed_square_set_from_piece_map(
+    piece_map: tuple[tuple[str, tuple[str, ...]], ...],
+) -> set[tuple[str, str]]:
+    out: set[tuple[str, str]] = set()
+    for piece_key, squares in piece_map:
+        for square in squares:
+            out.add((piece_key, square))
+    return out
+
+
+def _square_set_from_piece_map(
+    piece_map: tuple[tuple[str, tuple[str, ...]], ...],
+) -> set[str]:
+    out: set[str] = set()
+    for _, squares in piece_map:
+        out.update(squares)
+    return out
+
+
+def _piece_counts_from_piece_map(
+    piece_map: tuple[tuple[str, tuple[str, ...]], ...],
+) -> dict[str, int]:
+    return {piece_key: len(squares) for piece_key, squares in piece_map}
+
+
+def _square_label_map_from_piece_map(
+    piece_map: tuple[tuple[str, tuple[str, ...]], ...],
+) -> tuple[dict[str, str], int]:
+    claims_by_square: dict[str, set[str]] = defaultdict(set)
+    for piece_key, squares in piece_map:
+        for square in squares:
+            claims_by_square[square].add(piece_key)
+
+    labels = {square: "" for square in BOARD_SQUARES}
+    collision_count = 0
+    for square, claimed_piece_keys in claims_by_square.items():
+        if len(claimed_piece_keys) == 1:
+            labels[square] = next(iter(claimed_piece_keys))
+        elif claimed_piece_keys:
+            labels[square] = BOARD_COLLISION_LABEL
+            collision_count += 1
+    return labels, collision_count
+
+
+def _worst_case_board_metrics(
+    *,
+    gt_piece_map: tuple[tuple[str, tuple[str, ...]], ...],
+) -> BoardMetrics:
+    gt_piece_count = _total_piece_count(gt_piece_map)
+    return BoardMetrics(
+        board_square_errors=len(BOARD_SQUARES),
+        board_at_1=False,
+        board_at_2=False,
+        square_accuracy=0.0,
+        typed_square_precision=0.0,
+        typed_square_recall=0.0,
+        typed_square_f1=0.0,
+        square_precision=0.0,
+        square_recall=0.0,
+        square_f1=0.0,
+        gt_piece_count=gt_piece_count,
+        pred_piece_count=0,
+        piece_count_abs_error=gt_piece_count,
+        piece_type_count_l1=gt_piece_count,
+        pred_square_collision_count=0,
+    )
+
+
+def _board_metrics_for_piece_maps(
+    *,
+    gt_piece_map: tuple[tuple[str, tuple[str, ...]], ...],
+    pred_piece_map: Optional[tuple[tuple[str, tuple[str, ...]], ...]],
+) -> BoardMetrics:
+    if pred_piece_map is None:
+        return _worst_case_board_metrics(gt_piece_map=gt_piece_map)
+
+    gt_labels, _ = _square_label_map_from_piece_map(gt_piece_map)
+    pred_labels, pred_square_collision_count = _square_label_map_from_piece_map(pred_piece_map)
+    board_square_errors = sum(
+        1 for square in BOARD_SQUARES if pred_labels[square] != gt_labels[square]
+    )
+    square_accuracy = (
+        float(len(BOARD_SQUARES) - board_square_errors) / float(len(BOARD_SQUARES))
+        if BOARD_SQUARES
+        else 0.0
+    )
+
+    gt_typed_square_set = _typed_square_set_from_piece_map(gt_piece_map)
+    pred_typed_square_set = _typed_square_set_from_piece_map(pred_piece_map)
+    typed_matches = len(pred_typed_square_set.intersection(gt_typed_square_set))
+    typed_square_precision = (
+        float(typed_matches) / float(len(pred_typed_square_set))
+        if pred_typed_square_set
+        else (1.0 if not gt_typed_square_set else 0.0)
+    )
+    typed_square_recall = (
+        float(typed_matches) / float(len(gt_typed_square_set))
+        if gt_typed_square_set
+        else (1.0 if not pred_typed_square_set else 0.0)
+    )
+    typed_square_f1 = _f1_from_sets(pred_typed_square_set, gt_typed_square_set)
+
+    gt_square_set = {square for square, label in gt_labels.items() if label != ""}
+    pred_square_set = {square for square, label in pred_labels.items() if label != ""}
+    square_matches = len(pred_square_set.intersection(gt_square_set))
+    square_precision = (
+        float(square_matches) / float(len(pred_square_set))
+        if pred_square_set
+        else (1.0 if not gt_square_set else 0.0)
+    )
+    square_recall = (
+        float(square_matches) / float(len(gt_square_set))
+        if gt_square_set
+        else (1.0 if not pred_square_set else 0.0)
+    )
+    square_f1 = _f1_from_sets(pred_square_set, gt_square_set)
+
+    gt_piece_count = _total_piece_count(gt_piece_map)
+    pred_piece_count = _total_piece_count(pred_piece_map)
+    gt_counts = _piece_counts_from_piece_map(gt_piece_map)
+    pred_counts = _piece_counts_from_piece_map(pred_piece_map)
+    piece_type_count_l1 = sum(
+        abs(int(pred_counts.get(piece_key, 0)) - int(gt_counts.get(piece_key, 0)))
+        for piece_key in set(gt_counts).union(pred_counts)
+    )
+
+    return BoardMetrics(
+        board_square_errors=int(board_square_errors),
+        board_at_1=board_square_errors <= 1,
+        board_at_2=board_square_errors <= 2,
+        square_accuracy=max(0.0, min(1.0, float(square_accuracy))),
+        typed_square_precision=max(0.0, min(1.0, float(typed_square_precision))),
+        typed_square_recall=max(0.0, min(1.0, float(typed_square_recall))),
+        typed_square_f1=max(0.0, min(1.0, float(typed_square_f1))),
+        square_precision=max(0.0, min(1.0, float(square_precision))),
+        square_recall=max(0.0, min(1.0, float(square_recall))),
+        square_f1=max(0.0, min(1.0, float(square_f1))),
+        gt_piece_count=gt_piece_count,
+        pred_piece_count=pred_piece_count,
+        piece_count_abs_error=abs(pred_piece_count - gt_piece_count),
+        piece_type_count_l1=int(piece_type_count_l1),
+        pred_square_collision_count=int(pred_square_collision_count),
+    )
+
+
+def _piece_recall_score(pred_counts: dict[str, int], gt_counts: dict[str, int]) -> float:
+    gt_total = sum(int(count) for count in gt_counts.values())
+    matched = sum(min(int(pred_counts.get(key, 0)), int(gt_counts.get(key, 0))) for key in gt_counts.keys())
+    return float(matched) / float(max(1, gt_total))
+
+
+def _count_similarity(*, pred_count: int, gt_count: int) -> float:
+    return max(0.0, 1.0 - (abs(int(pred_count) - int(gt_count)) / float(max(1, int(gt_count)))))
+
+
+def _total_piece_count(piece_map: tuple[tuple[str, tuple[str, ...]], ...]) -> int:
+    return sum(len(squares) for _, squares in piece_map)
+
+
+def _answer_to_jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _answer_to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        if len(value) == 2 and isinstance(value[0], str):
+            return [_answer_to_jsonable(value[0]), _answer_to_jsonable(value[1])]
+        return [_answer_to_jsonable(item) for item in value]
+    if isinstance(value, list):
+        return [_answer_to_jsonable(item) for item in value]
+    return value
+
+
+def _normalized_answer_to_jsonable(task_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    task = normalize_task_type(task_type, allow_unknown=True)
+    if task == "count_by_color":
+        return {
+            "white_piece_count": int(payload.get("white_piece_count", 0)),
+            "black_piece_count": int(payload.get("black_piece_count", 0)),
+        }
+    if task == "color_presence_check":
+        out = {
+            "color": str(payload.get("color", "")),
+            "present": bool(payload.get("present", False)),
+        }
+        if "count" in payload:
+            out["count"] = int(payload.get("count", 0))
+        return out
+    if task in {"list_all_pieces", "list_color_pieces"}:
+        raw_piece_map = payload.get("pieces")
+        piece_map_json: dict[str, Any] = {}
+        if isinstance(raw_piece_map, tuple):
+            for piece_key, squares in raw_piece_map:
+                if len(squares) == 1:
+                    piece_map_json[str(piece_key)] = str(squares[0])
+                else:
+                    piece_map_json[str(piece_key)] = [str(square) for square in squares]
+        if task == "list_color_pieces":
+            return {
+                "color": str(payload.get("color", "")),
+                "pieces": [piece_map_json],
+            }
+        return {"pieces": [piece_map_json]}
+    return _answer_to_jsonable(payload)
+
+
+def _dense_list_piece_reward(
+    *,
+    gt_piece_map: tuple[tuple[str, tuple[str, ...]], ...],
+    pred_piece_map: tuple[tuple[str, tuple[str, ...]], ...],
+    weights: dict[str, float],
+) -> float:
+    typed_f1 = _f1_from_sets(
+        _typed_square_set_from_piece_map(pred_piece_map),
+        _typed_square_set_from_piece_map(gt_piece_map),
+    )
+    square_f1 = _f1_from_sets(
+        _square_set_from_piece_map(pred_piece_map),
+        _square_set_from_piece_map(gt_piece_map),
+    )
+    piece_recall = _piece_recall_score(
+        _piece_counts_from_piece_map(pred_piece_map),
+        _piece_counts_from_piece_map(gt_piece_map),
+    )
+    dense = (
+        float(weights["typed_f1"]) * float(typed_f1)
+        + float(weights["square_f1"]) * float(square_f1)
+        + float(weights["piece_recall"]) * float(piece_recall)
+    )
+    return max(0.0, min(1.0, float(dense)))
+
+
+def _dense_count_by_color_reward(
+    *,
+    gt_payload: dict[str, Any],
+    pred_payload: dict[str, Any],
+) -> float:
+    white_sim = _count_similarity(
+        pred_count=int(pred_payload.get("white_piece_count", 0)),
+        gt_count=int(gt_payload.get("white_piece_count", 0)),
+    )
+    black_sim = _count_similarity(
+        pred_count=int(pred_payload.get("black_piece_count", 0)),
+        gt_count=int(gt_payload.get("black_piece_count", 0)),
+    )
+    return max(0.0, min(1.0, (white_sim + black_sim) / 2.0))
+
+
+def _presence_reward(
+    *,
+    gt_payload: dict[str, Any],
+    pred_payload: dict[str, Any],
+) -> float:
+    if str(gt_payload.get("color", "")) != str(pred_payload.get("color", "")):
+        return 0.0
+    return 1.0 if bool(gt_payload.get("present")) == bool(pred_payload.get("present")) else 0.0
+
+
+def _json_object_candidates(text: str) -> list[str]:
+    candidates: list[str] = []
+    n = len(text)
+    for start in range(n):
+        if text[start] != "{":
+            continue
+
+        depth = 0
+        in_string = False
+        escaped = False
+        for idx in range(start, n):
+            char = text[idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+                continue
+            if char == "{":
+                depth += 1
+                continue
+            if char == "}":
+                depth -= 1
+                if depth == 0:
+                    candidates.append(text[start : idx + 1])
+                    break
+                if depth < 0:
+                    break
+    return candidates
+
+
+def _parse_prediction_json(answer_text: str) -> Optional[dict[str, Any]]:
+    if not isinstance(answer_text, str):
+        return None
+
+    stripped = answer_text.strip()
+    if not stripped:
+        return None
+
+    try:
+        payload = json.loads(stripped)
+        if isinstance(payload, dict):
+            return payload
+    except json.JSONDecodeError:
+        pass
+
+    for candidate in _json_object_candidates(stripped):
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+
+    return None
+
+
+def _score_payload_for_example(
+    example: QAExample,
+    pred_payload: Optional[dict[str, Any]],
+    *,
+    list_piece_reward_mode: str = DEFAULT_LIST_PIECE_REWARD_MODE,
+    list_piece_reward_weights: Optional[dict[str, float]] = None,
+) -> ScoreOutcome:
+    canonical_task = normalize_task_type(example.task_type, allow_unknown=True)
+    gt_norm = _normalize_answer_for_task(example.task_type, example.expected_answer)
+    gt_piece_map = gt_norm.get("pieces") if isinstance(gt_norm, dict) else None
+
+    if pred_payload is None:
+        board_metrics = None
+        if canonical_task == "list_all_pieces" and isinstance(gt_piece_map, tuple):
+            board_metrics = _board_metrics_for_piece_maps(
+                gt_piece_map=gt_piece_map,
+                pred_piece_map=None,
+            )
+        return ScoreOutcome(
+            reward=0.0,
+            parse_success=False,
+            task_correct=False,
+            json_object_parsed=False,
+            board_metrics=board_metrics,
+        )
+
+    pred_norm = _normalize_answer_for_task(example.task_type, pred_payload)
+    if pred_norm is None:
+        board_metrics = None
+        if canonical_task == "list_all_pieces" and isinstance(gt_piece_map, tuple):
+            board_metrics = _board_metrics_for_piece_maps(
+                gt_piece_map=gt_piece_map,
+                pred_piece_map=None,
+            )
+        return ScoreOutcome(
+            reward=0.0,
+            parse_success=False,
+            task_correct=False,
+            json_object_parsed=True,
+            board_metrics=board_metrics,
+        )
+    exact_match = gt_norm is not None and gt_norm == pred_norm
+    reward = 1.0 if exact_match else 0.0
+
+    effective_weights = (
+        dict(DEFAULT_LIST_PIECE_REWARD_WEIGHTS)
+        if list_piece_reward_weights is None
+        else _normalize_list_piece_reward_weights(
+            list_piece_reward_weights,
+            source="list_piece_reward_weights",
+        )
+    )
+    reward_mode = str(list_piece_reward_mode).strip().lower()
+    board_metrics: Optional[BoardMetrics] = None
+    if canonical_task in {"list_all_pieces", "list_color_pieces"}:
+        pred_piece_map = pred_norm.get("pieces") if isinstance(pred_norm, dict) else None
+        if reward_mode == "exact_binary":
+            reward = 1.0 if exact_match else 0.0
+        else:
+            if not isinstance(gt_piece_map, tuple) or not isinstance(pred_piece_map, tuple):
+                reward = 0.0
+            elif canonical_task == "list_color_pieces":
+                gt_color = gt_norm.get("color")
+                pred_color = pred_norm.get("color")
+                if gt_color != pred_color:
+                    reward = 0.0
+                else:
+                    base_reward = _dense_list_piece_reward(
+                        gt_piece_map=gt_piece_map,
+                        pred_piece_map=pred_piece_map,
+                        weights=effective_weights,
+                    )
+                    if reward_mode == "dense_partial_v2":
+                        reward = (0.9 * base_reward) + (
+                            0.1
+                            * _count_similarity(
+                                pred_count=_total_piece_count(pred_piece_map),
+                                gt_count=_total_piece_count(gt_piece_map),
+                            )
+                        )
+                    else:
+                        reward = base_reward
+            else:
+                base_reward = _dense_list_piece_reward(
+                    gt_piece_map=gt_piece_map,
+                    pred_piece_map=pred_piece_map,
+                    weights=effective_weights,
+                )
+                if reward_mode == "dense_partial_v2":
+                    reward = (0.9 * base_reward) + (
+                        0.1
+                        * _count_similarity(
+                            pred_count=_total_piece_count(pred_piece_map),
+                            gt_count=_total_piece_count(gt_piece_map),
+                        )
+                    )
+                else:
+                    reward = base_reward
+                board_metrics = _board_metrics_for_piece_maps(
+                    gt_piece_map=gt_piece_map,
+                    pred_piece_map=pred_piece_map,
+                )
+        if (
+            canonical_task == "list_all_pieces"
+            and board_metrics is None
+            and isinstance(gt_piece_map, tuple)
+            and isinstance(pred_piece_map, tuple)
+        ):
+            board_metrics = _board_metrics_for_piece_maps(
+                gt_piece_map=gt_piece_map,
+                pred_piece_map=pred_piece_map,
+            )
+    elif canonical_task == "count_by_color":
+        if isinstance(gt_norm, dict) and isinstance(pred_norm, dict):
+            reward = _dense_count_by_color_reward(gt_payload=gt_norm, pred_payload=pred_norm)
+    elif canonical_task == "color_presence_check":
+        if isinstance(gt_norm, dict) and isinstance(pred_norm, dict):
+            reward = _presence_reward(gt_payload=gt_norm, pred_payload=pred_norm)
+
+    return ScoreOutcome(
+        reward=max(0.0, min(1.0, float(reward))),
+        parse_success=True,
+        task_correct=exact_match,
+        json_object_parsed=True,
+        exact_match=exact_match,
+        board_metrics=board_metrics,
+    )
+
+
+def _extract_rollout_answer(rollout: Any) -> str:
+    output = getattr(rollout, "output", None)
+    if isinstance(output, QueryOutput):
+        return output.answer or ""
+
+    answer = getattr(output, "answer", None)
+    if isinstance(answer, str):
+        return answer
+    return ""
+
+
+def _score_rollout_for_example(
+    rollout: Any,
+    example: QAExample,
+    *,
+    list_piece_reward_mode: str = DEFAULT_LIST_PIECE_REWARD_MODE,
+    list_piece_reward_weights: Optional[dict[str, float]] = None,
+) -> ScoreOutcome:
+    answer_text = _extract_rollout_answer(rollout)
+    pred_payload = _parse_prediction_json(answer_text)
+    return _score_payload_for_example(
+        example,
+        pred_payload,
+        list_piece_reward_mode=list_piece_reward_mode,
+        list_piece_reward_weights=list_piece_reward_weights,
+    )
+
+
+def _resolve_image_path(
+    row: dict[str, Any],
+    *,
+    dataset_dir: Optional[Path],
+    dataset_variant_tag: str,
+) -> Optional[Path]:
+    dataset_variant_dir: Optional[Path] = None
+    if dataset_dir is not None:
+        try:
+            dataset_variant_dir = dataset_loader.resolve_dataset_variant_dir(
+                dataset_dir=dataset_dir,
+                dataset_variant_tag=dataset_variant_tag,
+            )
+        except FileNotFoundError:
+            dataset_variant_dir = None
+
+    candidates: list[str] = []
+    for key in ("image_path", "image"):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            candidates.append(value.strip())
+
+    for raw in candidates:
+        if raw.startswith("/imges/") and dataset_dir is not None:
+            mapped = (dataset_dir / raw.lstrip("/")).resolve()
+            if mapped.is_file():
+                return mapped
+
+        path = Path(raw).expanduser()
+        if path.is_file():
+            return path.resolve()
+
+        if not path.is_absolute():
+            if dataset_variant_dir is not None:
+                in_variant = (dataset_variant_dir / path).resolve()
+                if in_variant.is_file():
+                    return in_variant
+            if dataset_dir is not None:
+                joined = (dataset_dir / path).resolve()
+                if joined.is_file():
+                    return joined
+
+        basename = path.name
+        if basename:
+            if dataset_dir is not None:
+                for parent_name in ("imges", "images"):
+                    fallback = (dataset_dir / parent_name / basename).resolve()
+                    if fallback.is_file():
+                        return fallback
+            if dataset_variant_dir is not None:
+                fallback = (dataset_variant_dir / "images" / basename).resolve()
+                if fallback.is_file():
+                    return fallback
+
+    return None
+
+
+def _build_example(
+    row: dict[str, Any],
+    *,
+    split_name: str,
+    dataset_dir: Optional[Path],
+    dataset_variant_tag: str,
+    line_number: int,
+) -> Optional[QAExample]:
+    missing = [field for field in REQUIRED_ROW_FIELDS if field not in row]
+    if missing:
+        raise ValueError(
+            f"split={split_name} line={line_number} missing required fields: {missing}"
+        )
+
+    raw_task_type = str(row["task_type"]).strip()
+    try:
+        task_type = normalize_task_type(raw_task_type)
+    except ValueError:
+        print(
+            f"split={split_name} line={line_number} unsupported task_type='{raw_task_type}'; skipping row"
+        )
+        return None
+
+    image_path = _resolve_image_path(
+        row,
+        dataset_dir=dataset_dir,
+        dataset_variant_tag=dataset_variant_tag,
+    )
+    if image_path is None:
+        print(f"split={split_name} line={line_number} missing image file; skipping row")
+        return None
+
+    try:
+        expected_answer = json.loads(str(row["final_answer_json"]))
+    except json.JSONDecodeError:
+        print(f"split={split_name} line={line_number} invalid final_answer_json; skipping row")
+        return None
+
+    if not isinstance(expected_answer, dict):
+        print(f"split={split_name} line={line_number} final_answer_json is not an object; skipping row")
+        return None
+
+    normalized_expected = _normalize_answer_for_task(task_type, expected_answer)
+    if normalized_expected is None:
+        print(
+            f"split={split_name} line={line_number} invalid expected payload for task_type='{task_type}'; "
+            "skipping row"
+        )
+        return None
+
+    queried_piece: Optional[str] = None
+    raw_queried_piece = row.get("queried_piece")
+    if raw_queried_piece is not None:
+        text = str(raw_queried_piece).strip()
+        if text:
+            queried_piece = text
+
+    return QAExample(
+        row_id=str(row["row_id"]),
+        split=str(row["split"]),
+        task_type=task_type,
+        question=str(row["question"]),
+        image_path=image_path,
+        expected_answer=normalized_expected,
+        queried_piece=queried_piece,
+        source_image_id=str(row.get("source_image_id", "")),
+    )
+
+
+def _load_split_examples(
+    *,
+    split_name: str,
+    dataset_source: str,
+    dataset_variant_tag: str,
+    dataset_dir: Optional[Path],
+    hf_dataset_repo_id: str,
+    hf_dataset_revision: str,
+    hf_token: str,
+    hf_cache_dir: str,
+) -> list[QAExample]:
+    rows = dataset_loader.load_split_rows(
+        dataset_source=dataset_source,
+        dataset_variant_tag=dataset_variant_tag,
+        split_name=split_name,
+        dataset_dir=dataset_dir,
+        hf_dataset_repo_id=hf_dataset_repo_id,
+        hf_dataset_revision=hf_dataset_revision,
+        hf_token=hf_token,
+        hf_cache_dir=hf_cache_dir,
+    )
+
+    examples: list[QAExample] = []
+    skipped = 0
+    for line_number, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            skipped += 1
+            continue
+        example = _build_example(
+            row,
+            split_name=split_name,
+            dataset_dir=dataset_dir,
+            dataset_variant_tag=dataset_variant_tag,
+            line_number=line_number,
+        )
+        if example is None:
+            skipped += 1
+            continue
+        examples.append(example)
+
+    print(f"usable split={split_name} examples={len(examples)} skipped={skipped}")
+    if not examples:
+        raise ValueError(f"split={split_name} contains no usable rows")
+    return examples
+
+
+def _prepare_requests(
+    examples: list[QAExample],
+    *,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    max_tokens_by_task: dict[str, int],
+    reasoning: bool,
+    image_jpeg_quality: int,
+) -> tuple[list[QueryRequest], list[QAExample]]:
+    requests: list[QueryRequest] = []
+    active: list[QAExample] = []
+
+    for item in examples:
+        try:
+            image = Image.open(item.image_path).convert("RGB")
+        except (FileNotFoundError, OSError) as exc:
+            print(f"image load failed for {item.image_path}: {exc}; skipping")
+            continue
+
+        requests.append(
+            QueryRequest(
+                question=item.question,
+                image_url=_to_data_url(image, quality=image_jpeg_quality),
+                reasoning=bool(reasoning),
+                settings=QuerySettings(
+                    temperature=float(temperature),
+                    top_p=float(top_p),
+                    max_tokens=int(max_tokens_by_task.get(item.task_type, max_tokens)),
+                ),
+            )
+        )
+        active.append(item)
+
+    return requests, active
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    if isinstance(exc, TunaAPIError) and exc.status_code == 429:
+        return True
+    return "too many requests" in str(exc).lower()
+
+
+def _truncate(value: str, limit: int = 600) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "...<truncated>"
+
+
+def _error_details(exc: Exception) -> str:
+    if isinstance(exc, TunaAPIError):
+        parts = [
+            f"type=TunaAPIError",
+            f"message={exc}",
+            f"status_code={exc.status_code}",
+        ]
+        if exc.request_id:
+            parts.append(f"request_id={exc.request_id}")
+        body = exc.response_body
+        if body is not None:
+            if isinstance(body, (dict, list)):
+                body_text = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+            else:
+                body_text = str(body)
+            parts.append(f"response_body={_truncate(body_text)}")
+        return " | ".join(parts)
+
+    if isinstance(exc, TunaNetworkError):
+        cause = getattr(exc, "cause", None)
+        if cause is None:
+            return f"type=TunaNetworkError | message={exc}"
+        return f"type=TunaNetworkError | message={exc} | cause={type(cause).__name__}: {cause}"
+
+    return f"type={type(exc).__name__} | message={exc}"
+
+
+def _rollouts_batch_with_retry(
+    *,
+    finetune: Any,
+    requests: list[QueryRequest],
+    num_rollouts: int,
+    max_workers: int,
+    retries: int,
+    backoff_s: float,
+    context: str,
+):
+    worker_count = max(1, min(max_workers, len(requests)))
+    attempt = 0
+    total_attempts = retries + 1
+    while True:
+        try:
+            return finetune.rollouts_batch(
+                requests=requests,
+                num_rollouts=num_rollouts,
+                max_workers=worker_count,
+            )
+        except (TunaAPIError, TunaNetworkError) as exc:
+            should_retry = isinstance(exc, TunaNetworkError) or _is_rate_limit_error(exc)
+            if (not should_retry) or attempt >= retries:
+                print(
+                    f"{context}: rollouts_batch failed with no further retries. "
+                    f"attempt={attempt + 1}/{total_attempts} "
+                    f"workers={worker_count} "
+                    f"details: {_error_details(exc)}"
+                )
+                raise
+            delay = max(0.1, float(backoff_s)) * (2**attempt)
+            next_worker_count = max(1, worker_count // 2)
+            print(
+                f"{context}: retrying rollouts_batch. "
+                f"attempt={attempt + 1}/{total_attempts} "
+                f"workers={worker_count}->{next_worker_count} "
+                f"sleep={delay:.2f}s "
+                f"details: {_error_details(exc)}"
+            )
+            time.sleep(delay)
+            worker_count = next_worker_count
+            attempt += 1
+
+
+def _evaluate_split(
+    *,
+    finetune: Any,
+    examples: list[QAExample],
+    split_name: str,
+    seed: int,
+    batch_size: int,
+    max_workers: int,
+    max_samples: Optional[int],
+    rollout_retries: int,
+    rollout_retry_backoff_s: float,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    max_tokens_by_task: dict[str, int],
+    reasoning: bool,
+    image_jpeg_quality: int,
+    show_progress: bool,
+    list_piece_reward_mode: str = DEFAULT_LIST_PIECE_REWARD_MODE,
+    list_piece_reward_weights: Optional[dict[str, float]] = None,
+    fixed_indices: Optional[list[int]] = None,
+    save_predictions: bool = False,
+    predictions_output_dir: Optional[Path] = None,
+    step_for_log: int = -1,
+    stage_label: str = "eval",
+) -> dict[str, float]:
+    if fixed_indices is not None:
+        indices = [idx for idx in fixed_indices if 0 <= idx < len(examples)]
+    else:
+        rng = random.Random(seed)
+        indices = list(range(len(examples)))
+        rng.shuffle(indices)
+    if max_samples is not None:
+        indices = indices[: max(0, min(max_samples, len(indices)))]
+
+    total_scored = 0
+    reward_sum = 0.0
+    object_parse_count = 0
+    parse_success_count = 0
+    exact_correct_count = 0
+    board_metric_samples = 0
+    board_at_1_count = 0
+    board_at_2_count = 0
+    square_accuracy_sum = 0.0
+    typed_square_precision_sum = 0.0
+    typed_square_recall_sum = 0.0
+    typed_square_f1_sum = 0.0
+    square_precision_sum = 0.0
+    square_recall_sum = 0.0
+    square_f1_sum = 0.0
+    piece_count_mae_sum = 0.0
+    piece_type_count_l1_sum = 0.0
+
+    per_task_total: Counter[str] = Counter()
+    per_task_correct: Counter[str] = Counter()
+    prediction_rows: list[dict[str, Any]] = []
+
+    def _consume_batch(batch_examples: list[QAExample]) -> None:
+        nonlocal total_scored, reward_sum, object_parse_count, parse_success_count, exact_correct_count
+        nonlocal board_metric_samples, board_at_1_count, board_at_2_count, square_accuracy_sum
+        nonlocal typed_square_precision_sum, typed_square_recall_sum, typed_square_f1_sum
+        nonlocal square_precision_sum, square_recall_sum, square_f1_sum
+        nonlocal piece_count_mae_sum, piece_type_count_l1_sum
+
+        if not batch_examples:
+            return
+
+        requests, active_examples = _prepare_requests(
+            batch_examples,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            max_tokens_by_task=max_tokens_by_task,
+            reasoning=reasoning,
+            image_jpeg_quality=image_jpeg_quality,
+        )
+        if not requests:
+            return
+
+        try:
+            results = _rollouts_batch_with_retry(
+                finetune=finetune,
+                requests=requests,
+                num_rollouts=1,
+                max_workers=min(max_workers, len(requests)),
+                retries=rollout_retries,
+                backoff_s=rollout_retry_backoff_s,
+                context=f"eval split={split_name}",
+            )
+        except (TunaAPIError, TunaNetworkError) as exc:
+            print(
+                f"eval split={split_name}: rollouts_batch failed; skipping batch. "
+                f"details: {_error_details(exc)}"
+            )
+            return
+
+        if len(results) != len(active_examples):
+            print(
+                f"warning: eval split={split_name} got {len(results)} results for "
+                f"{len(active_examples)} requests; scoring aligned subset"
+            )
+
+        for item, result in zip(active_examples, results):
+            per_task_total[item.task_type] += 1
+            total_scored += 1
+            answer_text = ""
+            pred_payload: Optional[dict[str, Any]] = None
+            normalized_pred: Optional[dict[str, Any]] = None
+
+            if not result.rollouts:
+                outcome = ScoreOutcome(reward=0.0, parse_success=False, task_correct=False)
+            else:
+                rollout = result.rollouts[0]
+                answer_text = _extract_rollout_answer(rollout)
+                pred_payload = _parse_prediction_json(answer_text)
+                if pred_payload is not None:
+                    normalized_pred = _normalize_answer_for_task(item.task_type, pred_payload)
+                outcome = _score_payload_for_example(
+                    item,
+                    pred_payload,
+                    list_piece_reward_mode=list_piece_reward_mode,
+                    list_piece_reward_weights=list_piece_reward_weights,
+                )
+
+            reward_sum += float(outcome.reward)
+            if outcome.json_object_parsed:
+                object_parse_count += 1
+            if outcome.parse_success:
+                parse_success_count += 1
+            if outcome.task_correct:
+                per_task_correct[item.task_type] += 1
+            if outcome.exact_match:
+                exact_correct_count += 1
+            if outcome.board_metrics is not None:
+                board_metric_samples += 1
+                board_at_1_count += int(outcome.board_metrics.board_at_1)
+                board_at_2_count += int(outcome.board_metrics.board_at_2)
+                square_accuracy_sum += float(outcome.board_metrics.square_accuracy)
+                typed_square_precision_sum += float(outcome.board_metrics.typed_square_precision)
+                typed_square_recall_sum += float(outcome.board_metrics.typed_square_recall)
+                typed_square_f1_sum += float(outcome.board_metrics.typed_square_f1)
+                square_precision_sum += float(outcome.board_metrics.square_precision)
+                square_recall_sum += float(outcome.board_metrics.square_recall)
+                square_f1_sum += float(outcome.board_metrics.square_f1)
+                piece_count_mae_sum += float(outcome.board_metrics.piece_count_abs_error)
+                piece_type_count_l1_sum += float(outcome.board_metrics.piece_type_count_l1)
+            if save_predictions:
+                board_row: dict[str, Any] = {
+                    "board_square_errors": None,
+                    "board_at_1": None,
+                    "board_at_2": None,
+                    "square_accuracy": None,
+                    "typed_square_precision": None,
+                    "typed_square_recall": None,
+                    "typed_square_f1": None,
+                    "square_precision": None,
+                    "square_recall": None,
+                    "square_f1": None,
+                    "gt_piece_count": None,
+                    "pred_piece_count": None,
+                    "piece_count_abs_error": None,
+                    "piece_type_count_l1": None,
+                    "pred_square_collision_count": None,
+                }
+                if outcome.board_metrics is not None:
+                    board_row = {
+                        "board_square_errors": int(outcome.board_metrics.board_square_errors),
+                        "board_at_1": bool(outcome.board_metrics.board_at_1),
+                        "board_at_2": bool(outcome.board_metrics.board_at_2),
+                        "square_accuracy": float(outcome.board_metrics.square_accuracy),
+                        "typed_square_precision": float(outcome.board_metrics.typed_square_precision),
+                        "typed_square_recall": float(outcome.board_metrics.typed_square_recall),
+                        "typed_square_f1": float(outcome.board_metrics.typed_square_f1),
+                        "square_precision": float(outcome.board_metrics.square_precision),
+                        "square_recall": float(outcome.board_metrics.square_recall),
+                        "square_f1": float(outcome.board_metrics.square_f1),
+                        "gt_piece_count": int(outcome.board_metrics.gt_piece_count),
+                        "pred_piece_count": int(outcome.board_metrics.pred_piece_count),
+                        "piece_count_abs_error": int(outcome.board_metrics.piece_count_abs_error),
+                        "piece_type_count_l1": int(outcome.board_metrics.piece_type_count_l1),
+                        "pred_square_collision_count": int(outcome.board_metrics.pred_square_collision_count),
+                    }
+                prediction_rows.append(
+                    {
+                        "stage_label": str(stage_label),
+                        "step": int(step_for_log),
+                        "split": split_name,
+                        "row_id": item.row_id,
+                        "task_type": item.task_type,
+                        "question": item.question,
+                        "image_path": str(item.image_path),
+                        "source_image_id": str(item.source_image_id),
+                        "queried_piece": item.queried_piece or "",
+                        "expected_answer": _normalized_answer_to_jsonable(item.task_type, item.expected_answer),
+                        "raw_answer_text": answer_text,
+                        "parsed_payload": pred_payload,
+                        "normalized_prediction": (
+                            None
+                            if normalized_pred is None
+                            else _normalized_answer_to_jsonable(item.task_type, normalized_pred)
+                        ),
+                        "reward": float(outcome.reward),
+                        "json_object_parsed": bool(outcome.json_object_parsed),
+                        "parse_success": bool(outcome.parse_success),
+                        "task_correct": bool(outcome.task_correct),
+                        "exact_match": bool(outcome.exact_match),
+                        **board_row,
+                    }
+                )
+
+    batch: list[QAExample] = []
+    eval_iter = tqdm(
+        indices,
+        desc=f"eval:{split_name}",
+        total=len(indices),
+        dynamic_ncols=True,
+        leave=False,
+        disable=not show_progress,
+    )
+    for idx in eval_iter:
+        batch.append(examples[idx])
+        if len(batch) >= batch_size:
+            _consume_batch(batch)
+            batch = []
+
+    if batch:
+        _consume_batch(batch)
+
+    if total_scored == 0:
+        metrics: dict[str, float] = {
+            "eval_samples": 0,
+            "eval_reward_mean": 0.0,
+            "eval_json_object_rate": 0.0,
+            "eval_json_parse_rate": 0.0,
+            "eval_exact_accuracy": 0.0,
+            "eval_board_metric_samples": 0.0,
+            "eval_board_at_1_accuracy": 0.0,
+            "eval_board_at_2_accuracy": 0.0,
+            "eval_square_accuracy": 0.0,
+            "eval_typed_square_precision": 0.0,
+            "eval_typed_square_recall": 0.0,
+            "eval_typed_square_f1": 0.0,
+            "eval_square_precision": 0.0,
+            "eval_square_recall": 0.0,
+            "eval_square_f1": 0.0,
+            "eval_piece_count_mae": 0.0,
+            "eval_piece_type_count_l1": 0.0,
+        }
+        for task in sorted(SUPPORTED_TASKS):
+            metrics[f"eval_task_accuracy_{task}"] = 0.0
+            metrics[f"eval_task_count_{task}"] = 0.0
+        if save_predictions and predictions_output_dir is not None:
+            output_path = _eval_predictions_path(
+                output_dir=predictions_output_dir,
+                stage_label=stage_label,
+                split_name=split_name,
+                step_for_log=step_for_log,
+            )
+            _write_jsonl_records(output_path, prediction_rows)
+            print(f"wrote eval predictions JSONL: {output_path}")
+        return metrics
+
+    metrics = {
+        "eval_samples": float(total_scored),
+        "eval_reward_mean": reward_sum / total_scored,
+        "eval_json_object_rate": object_parse_count / total_scored,
+        "eval_json_parse_rate": parse_success_count / total_scored,
+        "eval_exact_accuracy": exact_correct_count / total_scored,
+        "eval_board_metric_samples": float(board_metric_samples),
+        "eval_board_at_1_accuracy": (
+            float(board_at_1_count) / float(board_metric_samples)
+            if board_metric_samples > 0
+            else 0.0
+        ),
+        "eval_board_at_2_accuracy": (
+            float(board_at_2_count) / float(board_metric_samples)
+            if board_metric_samples > 0
+            else 0.0
+        ),
+        "eval_square_accuracy": (
+            square_accuracy_sum / float(board_metric_samples)
+            if board_metric_samples > 0
+            else 0.0
+        ),
+        "eval_typed_square_precision": (
+            typed_square_precision_sum / float(board_metric_samples)
+            if board_metric_samples > 0
+            else 0.0
+        ),
+        "eval_typed_square_recall": (
+            typed_square_recall_sum / float(board_metric_samples)
+            if board_metric_samples > 0
+            else 0.0
+        ),
+        "eval_typed_square_f1": (
+            typed_square_f1_sum / float(board_metric_samples)
+            if board_metric_samples > 0
+            else 0.0
+        ),
+        "eval_square_precision": (
+            square_precision_sum / float(board_metric_samples)
+            if board_metric_samples > 0
+            else 0.0
+        ),
+        "eval_square_recall": (
+            square_recall_sum / float(board_metric_samples)
+            if board_metric_samples > 0
+            else 0.0
+        ),
+        "eval_square_f1": (
+            square_f1_sum / float(board_metric_samples)
+            if board_metric_samples > 0
+            else 0.0
+        ),
+        "eval_piece_count_mae": (
+            piece_count_mae_sum / float(board_metric_samples)
+            if board_metric_samples > 0
+            else 0.0
+        ),
+        "eval_piece_type_count_l1": (
+            piece_type_count_l1_sum / float(board_metric_samples)
+            if board_metric_samples > 0
+            else 0.0
+        ),
+    }
+
+    for task in sorted(SUPPORTED_TASKS):
+        task_total = per_task_total[task]
+        metrics[f"eval_task_accuracy_{task}"] = (
+            per_task_correct[task] / task_total if task_total > 0 else 0.0
+        )
+        metrics[f"eval_task_count_{task}"] = float(task_total)
+
+    if save_predictions and predictions_output_dir is not None:
+        output_path = _eval_predictions_path(
+            output_dir=predictions_output_dir,
+            stage_label=stage_label,
+            split_name=split_name,
+            step_for_log=step_for_log,
+        )
+        _write_jsonl_records(output_path, prediction_rows)
+        print(f"wrote eval predictions JSONL: {output_path}")
+
+    return metrics
+
+
+def _metric_prefix_for_split(split_name: str) -> str:
+    sanitized = "".join(ch if ch.isalnum() else "_" for ch in split_name.strip())
+    return f"final_{sanitized}_"
+
+
+def _sanitize_split_name(split_name: str) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in split_name.strip())
+
+
+def _numeric_metrics_only(metrics: dict[str, Any]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for key, value in metrics.items():
+        if isinstance(value, (int, float)):
+            out[key] = float(value)
+    return out
+
+
+def _split_seed_offset(split_name: str) -> int:
+    return sum((idx + 1) * ord(ch) for idx, ch in enumerate(str(split_name)))
+
+
+def _build_fixed_eval_indices(
+    *,
+    split_examples: dict[str, list[QAExample]],
+    fixed_subset_size: int,
+    fixed_subset_seed: int,
+    max_samples: Optional[int],
+) -> dict[str, list[int]]:
+    if fixed_subset_size <= 0:
+        return {}
+
+    out: dict[str, list[int]] = {}
+    for split_name, examples in split_examples.items():
+        if not examples:
+            out[split_name] = []
+            continue
+        indices = list(range(len(examples)))
+        rng = random.Random(int(fixed_subset_seed) + _split_seed_offset(split_name))
+        rng.shuffle(indices)
+        limit = min(len(indices), int(fixed_subset_size))
+        if max_samples is not None:
+            limit = min(limit, int(max_samples))
+        out[split_name] = indices[:limit]
+    return out
+
+
+def _early_stop_thresholds(mode: str) -> dict[str, float]:
+    normalized = str(mode).strip().lower()
+    if normalized == "conservative":
+        return {
+            "parse_floor": 0.50,
+            "parse_streak": 3.0,
+            "reward_drop": 0.30,
+            "reward_drop_streak": 3.0,
+            "plateau_window": 5.0,
+            "plateau_min_improvement": 0.005,
+        }
+    if normalized == "aggressive":
+        return {
+            "parse_floor": 0.70,
+            "parse_streak": 2.0,
+            "reward_drop": 0.15,
+            "reward_drop_streak": 2.0,
+            "plateau_window": 3.0,
+            "plateau_min_improvement": 0.02,
+        }
+    return {
+        "parse_floor": 0.60,
+        "parse_streak": 2.0,
+        "reward_drop": 0.20,
+        "reward_drop_streak": 2.0,
+        "plateau_window": 4.0,
+        "plateau_min_improvement": 0.01,
+    }
+
+
+def _should_early_stop(
+    *,
+    mode: str,
+    parse_streak: int,
+    reward_drop_streak: int,
+    recent_eval_rewards: list[float],
+) -> tuple[bool, str, bool]:
+    thresholds = _early_stop_thresholds(mode)
+    if parse_streak >= int(thresholds["parse_streak"]):
+        return True, "collapse_parse_floor", True
+    if reward_drop_streak >= int(thresholds["reward_drop_streak"]):
+        return True, "collapse_reward_drop", True
+
+    plateau_window = int(thresholds["plateau_window"])
+    if plateau_window > 0 and len(recent_eval_rewards) >= plateau_window:
+        window = recent_eval_rewards[-plateau_window:]
+        if window and (max(window) - min(window)) < float(thresholds["plateau_min_improvement"]):
+            return True, "plateau_no_improvement", False
+
+    return False, "", False
+
+
+def _default_training_status(*, target_steps: int, early_stop_mode: str) -> dict[str, Any]:
+    return {
+        "stopped_early": False,
+        "stop_reason": "",
+        "completed_steps": 0,
+        "target_steps": int(target_steps),
+        "early_stop_mode": str(early_stop_mode),
+        "collapse_detected": False,
+    }
+
+
+def _compose_train_groups(
+    *,
+    on_policy_groups: list[Any],
+    replay_groups: list[Any],
+    off_policy: bool,
+    off_policy_mix_ratio: float,
+    off_policy_warmup_steps: int,
+    off_policy_min_buffer_groups: int,
+    global_step: int,
+    rng: random.Random,
+) -> tuple[list[Any], int]:
+    if not on_policy_groups:
+        return [], 0
+    if not off_policy:
+        return list(on_policy_groups), 0
+    if off_policy_mix_ratio <= 0.0:
+        return list(on_policy_groups), 0
+    if global_step < off_policy_warmup_steps:
+        return list(on_policy_groups), 0
+    if len(replay_groups) < off_policy_min_buffer_groups:
+        return list(on_policy_groups), 0
+
+    desired_off_policy = int(round(len(on_policy_groups) * off_policy_mix_ratio))
+    if desired_off_policy <= 0:
+        desired_off_policy = 1
+    desired_off_policy = min(
+        desired_off_policy,
+        len(on_policy_groups),
+        len(replay_groups),
+    )
+    if desired_off_policy <= 0:
+        return list(on_policy_groups), 0
+
+    keep_on_policy = len(on_policy_groups) - desired_off_policy
+    if keep_on_policy <= 0:
+        selected_on_policy: list[Any] = []
+    elif keep_on_policy >= len(on_policy_groups):
+        selected_on_policy = list(on_policy_groups)
+    else:
+        selected_on_policy = rng.sample(list(on_policy_groups), k=keep_on_policy)
+
+    selected_off_policy = rng.sample(list(replay_groups), k=desired_off_policy)
+    mixed = selected_on_policy + selected_off_policy
+    rng.shuffle(mixed)
+    return mixed, desired_off_policy
+
+
+def _rank_checkpoint_eval_history(
+    history: list[dict[str, Any]],
+    *,
+    metric_key: str = "avg_checkpoint_metric",
+) -> list[dict[str, Any]]:
+    saved_entries = [item for item in history if bool(item.get("checkpoint_saved"))]
+    candidates = saved_entries if saved_entries else history
+    return sorted(
+        candidates,
+        key=lambda item: float(item.get(metric_key, item.get("avg_eval_reward_mean", 0.0))),
+        reverse=True,
+    )
+
+
+def _build_checkpoint_ranking_payload(
+    *,
+    finetune_id: str,
+    checkpoint_avg_metric: str,
+    checkpoint_avg_splits: list[str],
+    checkpoint_eval_history: list[dict[str, Any]],
+    training_status: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    ranking = _rank_checkpoint_eval_history(
+        checkpoint_eval_history,
+        metric_key="avg_checkpoint_metric",
+    )
+    best_avg_checkpoint_metric = (
+        float(ranking[0].get("avg_checkpoint_metric", ranking[0].get("avg_eval_reward_mean", 0.0)))
+        if ranking
+        else 0.0
+    )
+    best_avg_checkpoint_metric_eval_step = int(ranking[0]["step"]) if ranking else -1
+    best_avg_checkpoint_metric_step = (
+        _checkpoint_step_for_history_entry(ranking[0]) if ranking else -1
+    )
+    best_avg_eval_reward = (
+        float(ranking[0].get("avg_eval_reward_mean", best_avg_checkpoint_metric))
+        if ranking
+        else 0.0
+    )
+    status_payload = dict(training_status or {})
+    status_payload.setdefault("stopped_early", False)
+    status_payload.setdefault("stop_reason", "")
+    status_payload.setdefault("completed_steps", 0)
+    status_payload.setdefault("target_steps", 0)
+    status_payload.setdefault("early_stop_mode", "balanced")
+    status_payload.setdefault("collapse_detected", False)
+    return {
+        "finetune_id": finetune_id,
+        "checkpoint_avg_metric": checkpoint_avg_metric,
+        "checkpoint_avg_splits": checkpoint_avg_splits,
+        "best_avg_checkpoint_metric": best_avg_checkpoint_metric,
+        "best_avg_checkpoint_metric_step": best_avg_checkpoint_metric_step,
+        "best_avg_checkpoint_metric_eval_step": best_avg_checkpoint_metric_eval_step,
+        "best_avg_eval_reward": best_avg_eval_reward,
+        "best_avg_eval_reward_step": best_avg_checkpoint_metric_step,
+        "best_avg_eval_reward_eval_step": best_avg_checkpoint_metric_eval_step,
+        "training_status": status_payload,
+        "rankings": ranking,
+    }
+
+
+def _filter_wandb_metrics(metrics: dict[str, float], keys: tuple[str, ...]) -> dict[str, float]:
+    return {key: metrics[key] for key in keys if key in metrics}
+
+
+def _select_eval_wandb_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    selected = _filter_wandb_metrics(metrics, MAIN_EVAL_WANDB_METRIC_KEYS)
+    if float(metrics.get("eval_board_metric_samples", 0.0)) > 0.0:
+        selected.update(_filter_wandb_metrics(metrics, BOARD_EVAL_WANDB_METRIC_KEYS))
+    for task in sorted(SUPPORTED_TASKS):
+        key = f"eval_task_accuracy_{task}"
+        count_key = f"eval_task_count_{task}"
+        task_count = float(metrics.get(count_key, 0.0))
+        if key in metrics and task_count > 0.0:
+            selected[key] = metrics[key]
+    return selected
+
+
+def _should_log_prefixed_eval_streams(*, wandb_log_profile: str) -> bool:
+    return str(wandb_log_profile).strip().lower() == "legacy"
+
+
+def _checkpoint_wandb_payload(
+    *,
+    avg_checkpoint_metric: float,
+    avg_eval_reward_mean: float,
+    wandb_log_profile: str,
+) -> dict[str, float]:
+    if _should_log_prefixed_eval_streams(wandb_log_profile=wandb_log_profile):
+        return {
+            "checkpoint_avg_metric": float(avg_checkpoint_metric),
+            "checkpoint_avg_eval_reward_mean": float(avg_eval_reward_mean),
+        }
+    return {
+        "checkpoint_avg_metric_value": float(avg_checkpoint_metric),
+    }
+
+
+def _is_checkpoint_not_found_error(exc: Exception) -> bool:
+    if not isinstance(exc, TunaAPIError):
+        return False
+    if exc.status_code == 404 and "checkpoint" in str(exc).lower():
+        return True
+    return "checkpoint not found" in str(exc).lower()
+
+
+def _record_checkpoint_save(
+    history: list[dict[str, Any]],
+    *,
+    outcome: CheckpointSaveOutcome,
+) -> None:
+    if not history:
+        return
+    history[-1]["checkpoint_saved"] = bool(outcome.saved)
+    history[-1]["saved_checkpoint_id"] = str(outcome.checkpoint_id)
+    history[-1]["saved_checkpoint_step"] = int(outcome.checkpoint_step)
+
+
+def _checkpoint_step_for_history_entry(entry: dict[str, Any]) -> int:
+    saved_step = _parse_int(entry.get("saved_checkpoint_step"))
+    if saved_step is not None and int(saved_step) >= 0:
+        return int(saved_step)
+    return int(entry.get("step", -1))
+
+
+def _try_save_checkpoint(
+    *,
+    finetune: Any,
+    context: str,
+) -> CheckpointSaveOutcome:
+    try:
+        save_result = finetune.save_checkpoint()
+        saved = bool(getattr(save_result, "ok", True))
+        checkpoint = getattr(save_result, "checkpoint", None)
+        checkpoint_id = str(getattr(checkpoint, "checkpoint_id", "") or "")
+        checkpoint_step_raw = _parse_int(getattr(checkpoint, "step", -1))
+        checkpoint_step = -1 if checkpoint_step_raw is None else int(checkpoint_step_raw)
+        if saved:
+            details: list[str] = []
+            if checkpoint_id:
+                details.append(f"checkpoint_id={checkpoint_id}")
+            if checkpoint_step >= 0:
+                details.append(f"checkpoint_step={checkpoint_step}")
+            suffix = f" ({', '.join(details)})" if details else ""
+            print(f"{context}: checkpoint save succeeded{suffix}")
+        return CheckpointSaveOutcome(
+            saved=saved,
+            checkpoint_id=checkpoint_id,
+            checkpoint_step=checkpoint_step,
+        )
+    except (TunaAPIError, TunaNetworkError) as exc:
+        if _is_checkpoint_not_found_error(exc):
+            print(
+                f"{context}: checkpoint unavailable yet; continuing. "
+                f"details: {_error_details(exc)}"
+            )
+            return CheckpointSaveOutcome(saved=False)
+        print(
+            f"{context}: checkpoint save failed; continuing. "
+            f"details: {_error_details(exc)}"
+        )
+        return CheckpointSaveOutcome(saved=False)
+
+
+def _select_checkpoint_step_for_auto_benchmark(
+    *,
+    ranking_payload: dict[str, Any],
+    fallback_step: Optional[int],
+) -> Optional[int]:
+    ranked_checkpoint_metric_step = _parse_int(ranking_payload.get("best_avg_checkpoint_metric_step"))
+    if ranked_checkpoint_metric_step is not None and ranked_checkpoint_metric_step >= 0:
+        return int(ranked_checkpoint_metric_step)
+    ranked_step = _parse_int(ranking_payload.get("best_avg_eval_reward_step"))
+    if ranked_step is not None and ranked_step >= 0:
+        return int(ranked_step)
+    if fallback_step is not None and int(fallback_step) >= 0:
+        return int(fallback_step)
+    return None
+
+
+def _default_auto_benchmark_artifact_paths(
+    *,
+    finetune_id: str,
+    checkpoint_step: Optional[int],
+) -> tuple[Path, Path]:
+    step_tag = f"step{checkpoint_step}" if checkpoint_step is not None else "latest"
+    run_tag = time.strftime("%Y%m%d_%H%M%S")
+    metrics_path = _resolve_output_path(
+        "",
+        fallback_name=f"benchmark_auto_{finetune_id}_{step_tag}_{run_tag}.json",
+    )
+    predictions_path = _resolve_output_path(
+        "",
+        fallback_name=f"benchmark_auto_{finetune_id}_{step_tag}_{run_tag}_predictions.jsonl",
+    )
+    return metrics_path, predictions_path
+
+
+def _benchmark_config_task_types(config_path: str) -> Optional[list[str]]:
+    path = Path(str(config_path)).expanduser().resolve()
+    config = _load_json_config(path)
+    raw_values = config.get("task_types")
+    if not isinstance(raw_values, list):
+        return None
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in raw_values:
+        for piece in str(value).split(","):
+            task_type = piece.strip()
+            if not task_type:
+                continue
+            try:
+                task_type = normalize_task_type(task_type)
+            except ValueError as exc:
+                raise ValueError(
+                    f"auto benchmark config has unknown task_type '{task_type}' in {path}"
+                ) from exc
+            if task_type in seen:
+                continue
+            seen.add(task_type)
+            out.append(task_type)
+
+    return out or None
+
+
+def _infer_auto_benchmark_task_types(args: argparse.Namespace) -> Optional[list[str]]:
+    configured_task_types = _benchmark_config_task_types(str(args.auto_benchmark_config))
+    if configured_task_types:
+        return None
+
+    active_tasks = sorted(_active_tasks_from_sampling_weights(args.task_sampling_weights))
+    if len(active_tasks) == 1:
+        return active_tasks
+    return None
+
+
+def _build_auto_benchmark_command(
+    *,
+    args: argparse.Namespace,
+    finetune_id: str,
+    checkpoint_step: Optional[int],
+    dataset_dir: Optional[Path],
+    output_json: Path,
+    predictions_jsonl: Path,
+    task_types: Optional[list[str]],
+) -> list[str]:
+    cmd = [
+        sys.executable,
+        str(_repo_relative("benchmark_chess_query.py").resolve()),
+        "--config",
+        str(args.auto_benchmark_config),
+        "--env-file",
+        str(args.env_file),
+        "--base-url",
+        str(args.base_url),
+        "--finetune-id",
+        str(finetune_id),
+        "--dataset-source",
+        str(args.dataset_source),
+        "--dataset-variant-tag",
+        str(args.dataset_variant_tag),
+        "--output-json",
+        str(output_json),
+        "--predictions-jsonl",
+        str(predictions_jsonl),
+    ]
+    if checkpoint_step is not None:
+        cmd.extend(["--checkpoint-step", str(int(checkpoint_step))])
+    if args.dataset_source == "local_jsonl":
+        if dataset_dir is not None:
+            cmd.extend(["--dataset-dir", str(dataset_dir)])
+    else:
+        cmd.extend(["--hf-dataset-repo-id", str(args.hf_dataset_repo_id)])
+        cmd.extend(["--hf-dataset-revision", str(args.hf_dataset_revision)])
+        if str(args.hf_cache_dir).strip():
+            cmd.extend(["--hf-cache-dir", str(args.hf_cache_dir)])
+    if task_types:
+        cmd.extend(["--task-types", ",".join(task_types)])
+    if bool(args.no_progress):
+        cmd.append("--no-progress")
+    return cmd
+
+
+def _run_auto_benchmark(
+    *,
+    args: argparse.Namespace,
+    finetune_id: str,
+    checkpoint_step: Optional[int],
+    dataset_dir: Optional[Path],
+    output_json_override: str,
+    predictions_jsonl_override: str,
+) -> tuple[bool, Path, Path, Optional[dict[str, Any]]]:
+    default_output_json_path, default_predictions_jsonl_path = _default_auto_benchmark_artifact_paths(
+        finetune_id=finetune_id,
+        checkpoint_step=checkpoint_step,
+    )
+
+    if str(output_json_override or "").strip():
+        output_json_path = _resolve_output_path(
+            output_json_override,
+            fallback_name=f"benchmark_auto_{finetune_id}.json",
+        )
+    else:
+        output_json_path = default_output_json_path
+
+    if str(predictions_jsonl_override or "").strip():
+        predictions_jsonl_path = _resolve_output_path(
+            predictions_jsonl_override,
+            fallback_name=f"benchmark_auto_{finetune_id}_predictions.jsonl",
+        )
+    else:
+        predictions_jsonl_path = default_predictions_jsonl_path
+
+    output_json_path.parent.mkdir(parents=True, exist_ok=True)
+    predictions_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+
+    inferred_task_types = _infer_auto_benchmark_task_types(args)
+    if inferred_task_types:
+        print(
+            "auto benchmark: inferred task filter from training weights: "
+            + ",".join(inferred_task_types)
+        )
+
+    cmd = _build_auto_benchmark_command(
+        args=args,
+        finetune_id=finetune_id,
+        checkpoint_step=checkpoint_step,
+        dataset_dir=dataset_dir,
+        output_json=output_json_path,
+        predictions_jsonl=predictions_jsonl_path,
+        task_types=inferred_task_types,
+    )
+
+    env = dict(os.environ)
+    if str(args.api_key).strip():
+        env["MOONDREAM_API_KEY"] = str(args.api_key).strip()
+    if str(args.hf_token).strip():
+        env.setdefault("HF_TOKEN", str(args.hf_token).strip())
+
+    print("auto benchmark: running command")
+    print("  " + " ".join(shlex.quote(part) for part in cmd))
+
+    completed = subprocess.run(
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if completed.returncode != 0:
+        print(f"auto benchmark failed with exit_code={completed.returncode}")
+        if completed.stdout.strip():
+            print("auto benchmark stdout:")
+            print(_truncate(completed.stdout.strip(), limit=1200))
+        if completed.stderr.strip():
+            print("auto benchmark stderr:")
+            print(_truncate(completed.stderr.strip(), limit=1200))
+        return False, output_json_path, predictions_jsonl_path, None
+
+    metrics_payload: Optional[dict[str, Any]] = None
+    try:
+        if output_json_path.exists():
+            parsed = json.loads(output_json_path.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                metrics_payload = parsed
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"auto benchmark: unable to parse metrics JSON ({output_json_path}): {exc}")
+
+    if completed.stdout.strip():
+        print("auto benchmark stdout:")
+        print(_truncate(completed.stdout.strip(), limit=1200))
+    if completed.stderr.strip():
+        print("auto benchmark stderr:")
+        print(_truncate(completed.stderr.strip(), limit=1200))
+
+    print(
+        "auto benchmark completed: "
+        f"metrics={output_json_path} predictions={predictions_jsonl_path}"
+    )
+    return True, output_json_path, predictions_jsonl_path, metrics_payload
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    args = parse_args(argv)
+    args.env_file = _resolve_env_file(args.env_file)
+    show_progress = _progress_enabled(args.no_progress)
+    args.api_key_env_var = str(args.api_key_env_var or "").strip() or "MOONDREAM_API_KEY"
+
+    # An explicit env file should deterministically control auth/base URL, even if the shell
+    # already exported stale credentials from another environment.
+    _load_dotenv_compat(args.env_file, override=True)
+    if not args.api_key:
+        args.api_key = os.environ.get(args.api_key_env_var, "")
+    if not args.api_key and args.api_key_env_var != "MOONDREAM_API_KEY":
+        args.api_key = os.environ.get("MOONDREAM_API_KEY", "")
+    if not args.base_url:
+        args.base_url = os.environ.get("TUNA_BASE_URL", DEFAULT_BASE_URL)
+
+    _validate_args(args)
+    _warn_on_unsafe_mode_combo(off_policy=bool(args.off_policy), reasoning=bool(args.reasoning))
+    if not args.api_key:
+        raise ValueError("MOONDREAM_API_KEY is required")
+    args.hf_token = dataset_loader.resolve_hf_token(args.hf_token)
+
+    if args.eval_max_samples is not None and args.eval_max_samples <= 0:
+        args.eval_max_samples = None
+
+    eval_temperature = float(args.temperature) if args.eval_temperature is None else float(args.eval_temperature)
+    eval_top_p = float(args.top_p) if args.eval_top_p is None else float(args.eval_top_p)
+    eval_reasoning = bool(args.reasoning) if args.eval_reasoning is None else bool(args.eval_reasoning)
+    eval_fixed_subset_size = int(args.eval_fixed_subset_size)
+    eval_fixed_subset_seed = int(args.eval_fixed_subset_seed)
+
+    dataset_dir: Optional[Path] = None
+    if args.dataset_source == "local_jsonl":
+        dataset_dir = _resolve_dataset_dir(args.dataset_dir)
+        if not dataset_dir.exists():
+            raise FileNotFoundError(f"dataset_dir not found: {dataset_dir}")
+
+    final_eval_splits = _dedupe_splits(list(args.final_eval_splits))
+    if not final_eval_splits:
+        raise ValueError("--final-eval-splits must contain at least one split")
+    checkpoint_avg_splits = _dedupe_splits(list(args.checkpoint_avg_splits))
+    if not checkpoint_avg_splits:
+        raise ValueError("--checkpoint-avg-splits must contain at least one split")
+
+    rng = random.Random(args.seed)
+
+    train_examples = _load_split_examples(
+        split_name=args.train_split,
+        dataset_source=args.dataset_source,
+        dataset_variant_tag=args.dataset_variant_tag,
+        dataset_dir=dataset_dir,
+        hf_dataset_repo_id=args.hf_dataset_repo_id,
+        hf_dataset_revision=args.hf_dataset_revision,
+        hf_token=args.hf_token,
+        hf_cache_dir=args.hf_cache_dir,
+    )
+    val_examples = _load_split_examples(
+        split_name=args.val_split,
+        dataset_source=args.dataset_source,
+        dataset_variant_tag=args.dataset_variant_tag,
+        dataset_dir=dataset_dir,
+        hf_dataset_repo_id=args.hf_dataset_repo_id,
+        hf_dataset_revision=args.hf_dataset_revision,
+        hf_token=args.hf_token,
+        hf_cache_dir=args.hf_cache_dir,
+    )
+    train_examples_by_task: dict[str, list[QAExample]] = {}
+    for item in train_examples:
+        train_examples_by_task.setdefault(item.task_type, []).append(item)
+    if not train_examples_by_task:
+        raise ValueError("train split has no task-indexable examples")
+
+    sampling_tasks = sorted(train_examples_by_task.keys())
+    sampling_weights = _weights_for_sampling_tasks(
+        tasks=sampling_tasks,
+        task_sampling_weights=args.task_sampling_weights,
+    )
+    if not sampling_tasks:
+        raise ValueError("no tasks available for weighted sampling")
+
+    active_eval_tasks = _active_tasks_from_sampling_weights(args.task_sampling_weights)
+    print(
+        "eval task filter (weight>0): "
+        + ", ".join(sorted(active_eval_tasks))
+    )
+    val_before_filter = len(val_examples)
+    val_examples = _filter_examples_by_active_tasks(val_examples, active_tasks=active_eval_tasks)
+    if len(val_examples) != val_before_filter:
+        print(
+            f"filtered eval split={args.val_split}: kept={len(val_examples)} "
+            f"dropped={val_before_filter - len(val_examples)}"
+        )
+
+    split_examples_cache: dict[str, list[QAExample]] = {
+        args.val_split: val_examples,
+    }
+
+    def _examples_for_split(split_name: str) -> list[QAExample]:
+        if split_name not in split_examples_cache:
+            raw_examples = _load_split_examples(
+                split_name=split_name,
+                dataset_source=args.dataset_source,
+                dataset_variant_tag=args.dataset_variant_tag,
+                dataset_dir=dataset_dir,
+                hf_dataset_repo_id=args.hf_dataset_repo_id,
+                hf_dataset_revision=args.hf_dataset_revision,
+                hf_token=args.hf_token,
+                hf_cache_dir=args.hf_cache_dir,
+            )
+            filtered_examples = _filter_examples_by_active_tasks(
+                raw_examples,
+                active_tasks=active_eval_tasks,
+            )
+            if len(filtered_examples) != len(raw_examples):
+                print(
+                    f"filtered eval split={split_name}: kept={len(filtered_examples)} "
+                    f"dropped={len(raw_examples) - len(filtered_examples)}"
+                )
+            split_examples_cache[split_name] = filtered_examples
+        return split_examples_cache[split_name]
+
+    final_eval_examples: dict[str, list[QAExample]] = {}
+    for split in final_eval_splits:
+        final_eval_examples[split] = _examples_for_split(split)
+    checkpoint_avg_examples = {split: _examples_for_split(split) for split in checkpoint_avg_splits}
+    eval_splits_for_fixed_indices: dict[str, list[QAExample]] = {args.val_split: val_examples}
+    eval_splits_for_fixed_indices.update(checkpoint_avg_examples)
+    eval_splits_for_fixed_indices.update(final_eval_examples)
+    fixed_eval_indices_by_split = _build_fixed_eval_indices(
+        split_examples=eval_splits_for_fixed_indices,
+        fixed_subset_size=eval_fixed_subset_size,
+        fixed_subset_seed=eval_fixed_subset_seed,
+        max_samples=args.eval_max_samples,
+    )
+    if fixed_eval_indices_by_split:
+        print(
+            "using fixed eval subsets: "
+            + ", ".join(
+                f"{name}={len(indices)}" for name, indices in sorted(fixed_eval_indices_by_split.items())
+            )
+        )
+
+    if not args.finetune_id and not args.finetune_name:
+        args.finetune_name = f"chess-query-rl-{_random_suffix()}"
+
+    print(
+        "auth bootstrap: "
+        f"env_file={args.env_file} "
+        f"base_url={args.base_url} "
+        f"api_key_env_var={args.api_key_env_var} "
+        f"api_key={_fingerprint_secret(args.api_key)}"
+    )
+
+    client, finetune = _resolve_finetune_with_auth_context(args)
+
+    eval_predictions_output_dir = (
+        _resolve_output_dir(
+            str(args.eval_predictions_output_dir),
+            fallback_name=f"eval_predictions_{finetune.finetune_id}",
+        )
+        if bool(args.save_eval_predictions)
+        else None
+    )
+
+    run = wandb.init(
+        project=args.wandb_project,
+        name=args.wandb_run_name or None,
+        config={
+            "config": args.config,
+            "env_file": args.env_file,
+            "api_key_env_var": args.api_key_env_var,
+            "base_url": args.base_url,
+            "dataset_source": args.dataset_source,
+            "dataset_variant_tag": args.dataset_variant_tag,
+            "dataset_dir": str(dataset_dir) if dataset_dir is not None else "",
+            "hf_dataset_repo_id": args.hf_dataset_repo_id,
+            "hf_dataset_revision": args.hf_dataset_revision,
+            "hf_cache_dir": args.hf_cache_dir,
+            "train_split": args.train_split,
+            "val_split": args.val_split,
+            "final_eval_splits": final_eval_splits,
+            "checkpoint_avg_splits": checkpoint_avg_splits,
+            "checkpoint_avg_metric": args.checkpoint_avg_metric,
+            "train_rows": len(train_examples),
+            "val_rows": len(val_examples),
+            "finetune_id": finetune.finetune_id,
+            "finetune_name": finetune.name,
+            "rank": args.rank,
+            "seed": args.seed,
+            "num_steps": args.num_steps,
+            "resume_step": args.resume_step,
+            "batch_size": args.batch_size,
+            "group_size": args.group_size,
+            "lr": args.lr,
+            "max_workers": args.max_workers,
+            "rollout_retries": args.rollout_retries,
+            "rollout_retry_backoff_s": args.rollout_retry_backoff_s,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "eval_temperature": eval_temperature,
+            "eval_top_p": eval_top_p,
+            "eval_reasoning": eval_reasoning,
+            "eval_temperature_override": args.eval_temperature,
+            "eval_top_p_override": args.eval_top_p,
+            "eval_reasoning_override": args.eval_reasoning,
+            "max_tokens": args.max_tokens,
+            "image_jpeg_quality": args.image_jpeg_quality,
+            "off_policy": args.off_policy,
+            "off_policy_mix_ratio": args.off_policy_mix_ratio,
+            "off_policy_buffer_size": args.off_policy_buffer_size,
+            "off_policy_warmup_steps": args.off_policy_warmup_steps,
+            "off_policy_min_buffer_groups": args.off_policy_min_buffer_groups,
+            "list_piece_reward_mode": args.list_piece_reward_mode,
+            "list_piece_reward_weights": dict(args.list_piece_reward_weights),
+            "max_tokens_by_task": args.max_tokens_by_task,
+            "reasoning": args.reasoning,
+            "task_sampling_weights": {
+                task: float(args.task_sampling_weights.get(task, 1.0))
+                for task in sorted(args.task_sampling_weights.keys())
+            },
+            "eval_every": args.eval_every,
+            "save_every": args.save_every,
+            "save_on_eval": args.save_on_eval,
+            "save_eval_predictions": bool(args.save_eval_predictions),
+            "eval_predictions_output_dir": (
+                str(eval_predictions_output_dir) if eval_predictions_output_dir is not None else ""
+            ),
+            "eval_batch_size": args.eval_batch_size,
+            "eval_max_samples": args.eval_max_samples,
+            "eval_fixed_subset_size": eval_fixed_subset_size,
+            "eval_fixed_subset_seed": eval_fixed_subset_seed,
+            "early_stop": args.early_stop,
+            "early_stop_mode": args.early_stop_mode,
+            "skip_final_eval": args.skip_final_eval,
+            "best_metric": args.best_metric,
+            "checkpoint_ranking_output": args.checkpoint_ranking_output,
+            "auto_benchmark_best_checkpoint": bool(args.auto_benchmark_best_checkpoint),
+            "auto_benchmark_config": str(args.auto_benchmark_config),
+            "auto_benchmark_output_json": str(args.auto_benchmark_output_json or ""),
+            "auto_benchmark_predictions_jsonl": str(args.auto_benchmark_predictions_jsonl or ""),
+            "wandb_log_profile": str(args.wandb_log_profile),
+        },
+    )
+    run.summary["finetune_id"] = finetune.finetune_id
+
+    best_metric_value: Optional[float] = None
+    best_step: Optional[int] = None
+    best_eval_reward_seen: Optional[float] = None
+    low_parse_streak = 0
+    reward_drop_streak = 0
+    recent_eval_rewards: list[float] = []
+    completed_steps = 0
+    training_status = _default_training_status(
+        target_steps=int(args.num_steps),
+        early_stop_mode=str(args.early_stop_mode),
+    )
+    checkpoint_eval_history: list[dict[str, Any]] = []
+    replay_buffer: deque[Any] = deque(maxlen=int(args.off_policy_buffer_size))
+
+    def _run_checkpoint_eval(
+        *,
+        step_for_log: int,
+        seed_base: int,
+        stage_label: str,
+    ) -> dict[str, dict[str, float]]:
+        by_split: dict[str, dict[str, float]] = {}
+        for split_idx, split_name in enumerate(checkpoint_avg_splits):
+            split_metrics = _evaluate_split(
+                finetune=finetune,
+                examples=checkpoint_avg_examples[split_name],
+                split_name=split_name,
+                seed=seed_base + split_idx,
+                batch_size=args.eval_batch_size,
+                max_workers=args.max_workers,
+                max_samples=args.eval_max_samples,
+                rollout_retries=args.rollout_retries,
+                rollout_retry_backoff_s=args.rollout_retry_backoff_s,
+                temperature=eval_temperature,
+                top_p=eval_top_p,
+                max_tokens=args.max_tokens,
+                max_tokens_by_task=args.max_tokens_by_task,
+                reasoning=eval_reasoning,
+                image_jpeg_quality=args.image_jpeg_quality,
+                list_piece_reward_mode=args.list_piece_reward_mode,
+                list_piece_reward_weights=args.list_piece_reward_weights,
+                show_progress=show_progress,
+                fixed_indices=fixed_eval_indices_by_split.get(split_name),
+                save_predictions=bool(args.save_eval_predictions),
+                predictions_output_dir=eval_predictions_output_dir,
+                step_for_log=step_for_log,
+                stage_label=stage_label,
+            )
+            by_split[split_name] = split_metrics
+            if _should_log_prefixed_eval_streams(wandb_log_profile=args.wandb_log_profile):
+                prefix = f"checkpoint_{_sanitize_split_name(split_name)}_"
+                split_wandb_metrics = _select_eval_wandb_metrics(split_metrics)
+                wandb.log({f"{prefix}{k}": v for k, v in split_wandb_metrics.items()}, step=step_for_log)
+            print(
+                f"{stage_label} eval step={step_for_log} split={split_name} "
+                f"reward={split_metrics['eval_reward_mean']:.4f} "
+                f"obj_parse={split_metrics['eval_json_object_rate']:.4f} "
+                f"parse={split_metrics['eval_json_parse_rate']:.4f}"
+            )
+
+        avg_checkpoint_metric = float(
+            np.mean([float(m.get(args.checkpoint_avg_metric, 0.0)) for m in by_split.values()])
+        )
+        avg_eval_reward_mean = float(
+            np.mean([float(m.get("eval_reward_mean", 0.0)) for m in by_split.values()])
+        )
+        wandb.log(
+            _checkpoint_wandb_payload(
+                avg_checkpoint_metric=avg_checkpoint_metric,
+                avg_eval_reward_mean=avg_eval_reward_mean,
+                wandb_log_profile=args.wandb_log_profile,
+            ),
+            step=step_for_log,
+        )
+        print(
+            f"{stage_label} checkpoint average step={step_for_log} "
+            f"{args.checkpoint_avg_metric}={avg_checkpoint_metric:.4f}"
+        )
+
+        checkpoint_eval_history.append(
+            {
+                "step": int(step_for_log),
+                "avg_checkpoint_metric": avg_checkpoint_metric,
+                "avg_eval_reward_mean": avg_eval_reward_mean,
+                "checkpoint_avg_metric": args.checkpoint_avg_metric,
+                "checkpoint_saved": False,
+                "saved_checkpoint_id": "",
+                "saved_checkpoint_step": -1,
+                "split_metrics": {k: _numeric_metrics_only(v) for k, v in by_split.items()},
+            }
+        )
+        return by_split
+
+    if args.eval_every > 0:
+        print("running baseline checkpoint-average eval...")
+        baseline_by_split = _run_checkpoint_eval(
+            step_for_log=args.resume_step,
+            seed_base=args.seed + 101,
+            stage_label="baseline",
+        )
+        baseline_metrics = baseline_by_split.get(args.val_split)
+        if baseline_metrics is None:
+            baseline_metrics = _evaluate_split(
+                finetune=finetune,
+                examples=val_examples,
+                split_name=args.val_split,
+                seed=args.seed + 151,
+                batch_size=args.eval_batch_size,
+                max_workers=args.max_workers,
+                max_samples=args.eval_max_samples,
+                rollout_retries=args.rollout_retries,
+                rollout_retry_backoff_s=args.rollout_retry_backoff_s,
+                temperature=eval_temperature,
+                top_p=eval_top_p,
+                max_tokens=args.max_tokens,
+                max_tokens_by_task=args.max_tokens_by_task,
+                reasoning=eval_reasoning,
+                image_jpeg_quality=args.image_jpeg_quality,
+                list_piece_reward_mode=args.list_piece_reward_mode,
+                list_piece_reward_weights=args.list_piece_reward_weights,
+                show_progress=show_progress,
+                fixed_indices=fixed_eval_indices_by_split.get(args.val_split),
+                save_predictions=bool(args.save_eval_predictions),
+                predictions_output_dir=eval_predictions_output_dir,
+                step_for_log=args.resume_step,
+                stage_label="baseline_val",
+            )
+        baseline_wandb_metrics = _select_eval_wandb_metrics(baseline_metrics)
+        if _should_log_prefixed_eval_streams(wandb_log_profile=args.wandb_log_profile):
+            wandb.log({f"baseline_{k}": v for k, v in baseline_wandb_metrics.items()}, step=args.resume_step)
+
+        baseline_metric = float(baseline_metrics.get(args.best_metric, 0.0))
+        best_metric_value = baseline_metric
+        best_step = args.resume_step
+        best_eval_reward_seen = float(baseline_metrics.get("eval_reward_mean", 0.0))
+        print(
+            f"baseline eval step={args.resume_step} reward={baseline_metrics['eval_reward_mean']:.4f} "
+            f"obj_parse={baseline_metrics['eval_json_object_rate']:.4f} "
+            f"parse={baseline_metrics['eval_json_parse_rate']:.4f} "
+            f"exact={baseline_metrics['eval_exact_accuracy']:.4f}"
+        )
+        if args.save_on_eval:
+            baseline_saved = _try_save_checkpoint(
+                finetune=finetune,
+                context=f"baseline eval step={args.resume_step}",
+            )
+            _record_checkpoint_save(checkpoint_eval_history, outcome=baseline_saved)
+            if baseline_saved.saved:
+                print("baseline checkpoint saved (save_on_eval=true)")
+
+    step_iter = tqdm(
+        range(args.num_steps),
+        desc="train",
+        total=args.num_steps,
+        dynamic_ncols=True,
+        disable=not show_progress,
+    )
+    for step in step_iter:
+        global_step = args.resume_step + step
+        completed_steps = step + 1
+
+        sampled_tasks = rng.choices(sampling_tasks, weights=sampling_weights, k=args.batch_size)
+        batch = [
+            _sample_training_example(
+                task_name=task_name,
+                train_examples_by_task=train_examples_by_task,
+                rng=rng,
+            )
+            for task_name in sampled_tasks
+        ]
+        requests, active_examples = _prepare_requests(
+            batch,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_tokens=args.max_tokens,
+            max_tokens_by_task=args.max_tokens_by_task,
+            reasoning=args.reasoning,
+            image_jpeg_quality=args.image_jpeg_quality,
+        )
+        if not requests:
+            print(f"step {global_step}: no valid requests in batch; skipping")
+            continue
+
+        try:
+            results = _rollouts_batch_with_retry(
+                finetune=finetune,
+                requests=requests,
+                num_rollouts=args.group_size,
+                max_workers=min(args.max_workers, len(requests)),
+                retries=args.rollout_retries,
+                backoff_s=args.rollout_retry_backoff_s,
+                context=f"train step {global_step}",
+            )
+        except (TunaAPIError, TunaNetworkError) as exc:
+            print(
+                f"step {global_step}: rollouts_batch failed; skipping step. "
+                f"details: {_error_details(exc)}"
+            )
+            continue
+
+        if len(results) != len(active_examples):
+            print(
+                f"warning: step {global_step} got {len(results)} rollout results for "
+                f"{len(active_examples)} requests; training on aligned subset"
+            )
+
+        on_policy_groups: list[Any] = []
+        rewards_all: list[float] = []
+        object_parses = 0
+        parse_successes = 0
+
+        for item, result in zip(active_examples, results):
+            if not result.rollouts:
+                continue
+
+            rewards: list[float] = []
+            for rollout in result.rollouts:
+                outcome = _score_rollout_for_example(
+                    rollout,
+                    item,
+                    list_piece_reward_mode=args.list_piece_reward_mode,
+                    list_piece_reward_weights=args.list_piece_reward_weights,
+                )
+                rewards.append(outcome.reward)
+                rewards_all.append(outcome.reward)
+                if outcome.json_object_parsed:
+                    object_parses += 1
+                if outcome.parse_success:
+                    parse_successes += 1
+
+            if rewards:
+                on_policy_groups.append(result.to_group(rewards=rewards))
+
+        if not on_policy_groups:
+            print(f"step {global_step}: no train groups produced; skipping")
+            continue
+
+        train_groups, off_policy_groups_used = _compose_train_groups(
+            on_policy_groups=on_policy_groups,
+            replay_groups=list(replay_buffer),
+            off_policy=bool(args.off_policy),
+            off_policy_mix_ratio=float(args.off_policy_mix_ratio),
+            off_policy_warmup_steps=int(args.off_policy_warmup_steps),
+            off_policy_min_buffer_groups=int(args.off_policy_min_buffer_groups),
+            global_step=int(global_step),
+            rng=rng,
+        )
+        replay_buffer.extend(on_policy_groups)
+
+        if not train_groups:
+            print(f"step {global_step}: no train groups selected; skipping")
+            continue
+
+        try:
+            train_out = finetune.train_step(groups=train_groups, lr=args.lr)
+        except (TunaAPIError, TunaNetworkError) as exc:
+            print(
+                f"step {global_step}: train_step failed; skipping step. "
+                f"details: {_error_details(exc)}"
+            )
+            continue
+
+        reward_mean = float(np.mean(rewards_all)) if rewards_all else 0.0
+        reward_var = float(np.var(rewards_all)) if rewards_all else 0.0
+        object_parse_rate = object_parses / max(1, len(rewards_all))
+        parse_rate = parse_successes / max(1, len(rewards_all))
+
+        train_metrics: dict[str, float] = {
+            "reward_mean": reward_mean,
+            "reward_var": reward_var,
+            "train_json_object_rate": object_parse_rate,
+            "train_json_parse_rate": parse_rate,
+            "accepted_groups": float(len(train_groups)),
+            "on_policy_groups": float(len(train_groups) - off_policy_groups_used),
+            "off_policy_groups": float(off_policy_groups_used),
+            "off_policy_group_fraction": float(
+                off_policy_groups_used / max(1, len(train_groups))
+            ),
+            "replay_buffer_size": float(len(replay_buffer)),
+            "kl": float(train_out.kl or 0.0),
+            "router_kl": float(train_out.router_kl or 0.0),
+            "grad_norm": float(train_out.grad_norm or 0.0),
+        }
+        wandb.log(_filter_wandb_metrics(train_metrics, MAIN_TRAIN_WANDB_METRIC_KEYS), step=global_step)
+
+        print(
+            f"step {global_step} reward={reward_mean:.4f} "
+            f"obj_parse_rate={object_parse_rate:.4f} parse_rate={parse_rate:.4f} "
+            f"offp={off_policy_groups_used}/{len(train_groups)} "
+            f"replay={len(replay_buffer)} "
+            f"kl={float(train_out.kl or 0.0):.4f} "
+            f"router_kl={float(train_out.router_kl or 0.0):.4f} "
+            f"grad_norm={float(train_out.grad_norm or 0.0):.4f}"
+        )
+        if show_progress:
+            step_iter.set_postfix(
+                reward=f"{reward_mean:.3f}",
+                obj_parse=f"{object_parse_rate:.3f}",
+                parse=f"{parse_rate:.3f}",
+                kl=f"{float(train_out.kl or 0.0):.3f}",
+            )
+
+        if args.eval_every > 0 and (global_step + 1) % args.eval_every == 0:
+            eval_by_split = _run_checkpoint_eval(
+                step_for_log=global_step,
+                seed_base=args.seed + 1000 + (global_step * 13),
+                stage_label="checkpoint",
+            )
+            eval_metrics = eval_by_split.get(args.val_split)
+            if eval_metrics is None:
+                eval_metrics = _evaluate_split(
+                    finetune=finetune,
+                    examples=val_examples,
+                    split_name=args.val_split,
+                    seed=args.seed + 1000 + global_step,
+                    batch_size=args.eval_batch_size,
+                    max_workers=args.max_workers,
+                    max_samples=args.eval_max_samples,
+                    rollout_retries=args.rollout_retries,
+                    rollout_retry_backoff_s=args.rollout_retry_backoff_s,
+                    temperature=eval_temperature,
+                    top_p=eval_top_p,
+                    max_tokens=args.max_tokens,
+                    max_tokens_by_task=args.max_tokens_by_task,
+                    reasoning=eval_reasoning,
+                    image_jpeg_quality=args.image_jpeg_quality,
+                    list_piece_reward_mode=args.list_piece_reward_mode,
+                    list_piece_reward_weights=args.list_piece_reward_weights,
+                    show_progress=show_progress,
+                    fixed_indices=fixed_eval_indices_by_split.get(args.val_split),
+                    save_predictions=bool(args.save_eval_predictions),
+                    predictions_output_dir=eval_predictions_output_dir,
+                    step_for_log=global_step,
+                    stage_label="checkpoint_val",
+                )
+            wandb.log(_select_eval_wandb_metrics(eval_metrics), step=global_step)
+            metric_value = float(eval_metrics.get(args.best_metric, 0.0))
+            print(
+                f"eval step {global_step} reward={eval_metrics['eval_reward_mean']:.4f} "
+                f"obj_parse={eval_metrics['eval_json_object_rate']:.4f} "
+                f"parse={eval_metrics['eval_json_parse_rate']:.4f} "
+                f"exact={eval_metrics['eval_exact_accuracy']:.4f}"
+            )
+
+            if best_metric_value is None or metric_value > best_metric_value:
+                best_metric_value = metric_value
+                best_step = global_step
+                if not args.save_on_eval:
+                    best_saved = _try_save_checkpoint(
+                        finetune=finetune,
+                        context=f"best metric checkpoint step={global_step}",
+                    )
+                    _record_checkpoint_save(checkpoint_eval_history, outcome=best_saved)
+                    if best_saved.saved:
+                        print(
+                            f"new best {args.best_metric}={metric_value:.4f} at step {global_step}; checkpoint saved"
+                        )
+                    else:
+                        print(
+                            f"new best {args.best_metric}={metric_value:.4f} at step {global_step}; checkpoint save skipped"
+                        )
+                else:
+                    print(
+                        f"new best {args.best_metric}={metric_value:.4f} at step {global_step}"
+                    )
+
+            if args.save_on_eval:
+                eval_saved = _try_save_checkpoint(
+                    finetune=finetune,
+                    context=f"periodic eval step={global_step}",
+                )
+                _record_checkpoint_save(checkpoint_eval_history, outcome=eval_saved)
+                if eval_saved.saved:
+                    print(f"checkpoint saved at eval step={global_step} (save_on_eval=true)")
+
+            eval_reward_value = float(eval_metrics.get("eval_reward_mean", 0.0))
+            eval_parse_rate_value = float(eval_metrics.get("eval_json_parse_rate", 0.0))
+            thresholds = _early_stop_thresholds(args.early_stop_mode)
+            prior_best_eval_reward = (
+                eval_reward_value if best_eval_reward_seen is None else float(best_eval_reward_seen)
+            )
+
+            if eval_parse_rate_value < float(thresholds["parse_floor"]):
+                low_parse_streak += 1
+            else:
+                low_parse_streak = 0
+
+            if eval_reward_value <= (prior_best_eval_reward - float(thresholds["reward_drop"])):
+                reward_drop_streak += 1
+            else:
+                reward_drop_streak = 0
+
+            if best_eval_reward_seen is None or eval_reward_value > best_eval_reward_seen:
+                best_eval_reward_seen = eval_reward_value
+
+            recent_eval_rewards.append(eval_reward_value)
+            if args.early_stop:
+                should_stop, stop_reason, collapse_detected = _should_early_stop(
+                    mode=args.early_stop_mode,
+                    parse_streak=low_parse_streak,
+                    reward_drop_streak=reward_drop_streak,
+                    recent_eval_rewards=recent_eval_rewards,
+                )
+                if should_stop:
+                    training_status.update(
+                        {
+                            "stopped_early": True,
+                            "stop_reason": stop_reason,
+                            "completed_steps": int(completed_steps),
+                            "collapse_detected": bool(collapse_detected),
+                        }
+                    )
+                    print(
+                        f"early stop triggered at step={global_step}: reason={stop_reason} "
+                        f"parse_streak={low_parse_streak} reward_drop_streak={reward_drop_streak}"
+                    )
+                    break
+
+        if args.save_every > 0 and (global_step + 1) % args.save_every == 0:
+            _try_save_checkpoint(
+                finetune=finetune,
+                context=f"save_every checkpoint step={global_step}",
+            )
+
+    if not bool(training_status.get("stopped_early")):
+        training_status["completed_steps"] = int(completed_steps)
+
+    _try_save_checkpoint(
+        finetune=finetune,
+        context="final checkpoint save",
+    )
+
+    final_eval_step = args.resume_step + int(completed_steps)
+    if args.skip_final_eval:
+        print("skip_final_eval=true; skipping final split eval pass.")
+    else:
+        for idx, (split_name, split_examples) in enumerate(final_eval_examples.items()):
+            eval_metrics = _evaluate_split(
+                finetune=finetune,
+                examples=split_examples,
+                split_name=split_name,
+                seed=args.seed + 5000 + idx,
+                batch_size=args.eval_batch_size,
+                max_workers=args.max_workers,
+                max_samples=args.eval_max_samples,
+                rollout_retries=args.rollout_retries,
+                rollout_retry_backoff_s=args.rollout_retry_backoff_s,
+                temperature=eval_temperature,
+                top_p=eval_top_p,
+                max_tokens=args.max_tokens,
+                max_tokens_by_task=args.max_tokens_by_task,
+                reasoning=eval_reasoning,
+                image_jpeg_quality=args.image_jpeg_quality,
+                list_piece_reward_mode=args.list_piece_reward_mode,
+                list_piece_reward_weights=args.list_piece_reward_weights,
+                show_progress=show_progress,
+                fixed_indices=fixed_eval_indices_by_split.get(split_name),
+                save_predictions=bool(args.save_eval_predictions),
+                predictions_output_dir=eval_predictions_output_dir,
+                step_for_log=final_eval_step,
+                stage_label="final",
+            )
+            prefix = _metric_prefix_for_split(split_name)
+            final_eval_wandb_metrics = _select_eval_wandb_metrics(eval_metrics)
+            if _should_log_prefixed_eval_streams(wandb_log_profile=args.wandb_log_profile):
+                wandb.log({f"{prefix}{k}": v for k, v in final_eval_wandb_metrics.items()}, step=final_eval_step)
+
+            print(
+                f"final eval split={split_name} reward={eval_metrics['eval_reward_mean']:.4f} "
+                f"obj_parse={eval_metrics['eval_json_object_rate']:.4f} "
+                f"parse={eval_metrics['eval_json_parse_rate']:.4f} "
+                f"exact={eval_metrics['eval_exact_accuracy']:.4f}"
+            )
+
+    ranking_payload = _build_checkpoint_ranking_payload(
+        finetune_id=finetune.finetune_id,
+        checkpoint_avg_metric=args.checkpoint_avg_metric,
+        checkpoint_avg_splits=checkpoint_avg_splits,
+        checkpoint_eval_history=checkpoint_eval_history,
+        training_status=training_status,
+    )
+    checkpoint_ranking = ranking_payload["rankings"]
+    best_avg_checkpoint_metric = float(ranking_payload.get("best_avg_checkpoint_metric", 0.0))
+    best_avg_checkpoint_metric_step = int(ranking_payload.get("best_avg_checkpoint_metric_step", -1))
+    best_avg_checkpoint_metric_eval_step = int(
+        ranking_payload.get("best_avg_checkpoint_metric_eval_step", -1)
+    )
+    best_avg_eval_reward = float(ranking_payload["best_avg_eval_reward"])
+    best_avg_eval_reward_step = int(ranking_payload["best_avg_eval_reward_step"])
+    best_avg_eval_reward_eval_step = int(ranking_payload.get("best_avg_eval_reward_eval_step", -1))
+    if checkpoint_ranking:
+        step_label = f"step={best_avg_checkpoint_metric_step}"
+        if best_avg_checkpoint_metric_eval_step >= 0 and (
+            best_avg_checkpoint_metric_eval_step != best_avg_checkpoint_metric_step
+        ):
+            step_label += f" eval_step={best_avg_checkpoint_metric_eval_step}"
+        print(
+            "best checkpoint by configured average metric: "
+            f"{step_label} "
+            f"{args.checkpoint_avg_metric}={best_avg_checkpoint_metric:.4f} "
+            f"avg_eval_reward_mean={best_avg_eval_reward:.4f} "
+            f"splits={checkpoint_avg_splits}"
+        )
+    else:
+        print("no checkpoint eval history to rank (eval_every may be 0).")
+
+    ranking_output_path = _resolve_output_path(
+        args.checkpoint_ranking_output,
+        fallback_name=f"checkpoint_ranking_{finetune.finetune_id}.json",
+    )
+    ranking_output_path.parent.mkdir(parents=True, exist_ok=True)
+    ranking_output_path.write_text(
+        json.dumps(ranking_payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    print(f"wrote checkpoint ranking JSON: {ranking_output_path}")
+
+    auto_benchmark_ran = False
+    auto_benchmark_success = False
+    auto_benchmark_checkpoint_step: Optional[int] = None
+    auto_benchmark_metrics_path: Optional[Path] = None
+    auto_benchmark_predictions_path: Optional[Path] = None
+    auto_benchmark_metrics: Optional[dict[str, Any]] = None
+    if bool(args.auto_benchmark_best_checkpoint):
+        auto_benchmark_checkpoint_step = _select_checkpoint_step_for_auto_benchmark(
+            ranking_payload=ranking_payload,
+            fallback_step=best_step,
+        )
+        auto_benchmark_ran = True
+        try:
+            (
+                auto_benchmark_success,
+                auto_benchmark_metrics_path,
+                auto_benchmark_predictions_path,
+                auto_benchmark_metrics,
+            ) = _run_auto_benchmark(
+                args=args,
+                finetune_id=finetune.finetune_id,
+                checkpoint_step=auto_benchmark_checkpoint_step,
+                dataset_dir=dataset_dir,
+                output_json_override=str(args.auto_benchmark_output_json),
+                predictions_jsonl_override=str(args.auto_benchmark_predictions_jsonl),
+            )
+        except Exception as exc:
+            auto_benchmark_success = False
+            print(f"auto benchmark failed with unexpected exception: {exc}")
+    else:
+        print("auto benchmark disabled (auto_benchmark_best_checkpoint=false).")
+
+    run.summary["best_metric_name"] = args.best_metric
+    run.summary["best_metric_value"] = float(best_metric_value or 0.0)
+    run.summary["best_metric_step"] = int(best_step if best_step is not None else -1)
+    run.summary["wandb_log_profile"] = str(args.wandb_log_profile)
+    run.summary["dataset_variant_tag"] = str(args.dataset_variant_tag)
+    run.summary["list_piece_reward_mode"] = str(args.list_piece_reward_mode)
+    run.summary["list_piece_reward_weights"] = json.dumps(
+        args.list_piece_reward_weights,
+        sort_keys=True,
+    )
+    run.summary["finetune_id"] = finetune.finetune_id
+    run.summary["train_rows"] = len(train_examples)
+    run.summary["val_rows"] = len(val_examples)
+    run.summary["checkpoint_avg_metric_name"] = args.checkpoint_avg_metric
+    run.summary["best_avg_checkpoint_metric"] = float(best_avg_checkpoint_metric)
+    run.summary["best_avg_checkpoint_metric_step"] = int(best_avg_checkpoint_metric_step)
+    run.summary["best_avg_checkpoint_metric_eval_step"] = int(best_avg_checkpoint_metric_eval_step)
+    run.summary["best_avg_eval_reward"] = float(best_avg_eval_reward)
+    run.summary["best_avg_eval_reward_step"] = int(best_avg_eval_reward_step)
+    run.summary["best_avg_eval_reward_eval_step"] = int(best_avg_eval_reward_eval_step)
+    run.summary["best_avg_eval_reward_splits"] = ",".join(checkpoint_avg_splits)
+    run.summary["checkpoint_ranking_output"] = str(ranking_output_path)
+    run.summary["stopped_early"] = bool(training_status.get("stopped_early"))
+    run.summary["early_stop_reason"] = str(training_status.get("stop_reason", ""))
+    run.summary["completed_steps"] = int(training_status.get("completed_steps", completed_steps))
+    run.summary["target_steps"] = int(training_status.get("target_steps", args.num_steps))
+    run.summary["collapse_detected"] = bool(training_status.get("collapse_detected"))
+    run.summary["save_eval_predictions"] = bool(args.save_eval_predictions)
+    run.summary["eval_predictions_output_dir"] = (
+        str(eval_predictions_output_dir) if eval_predictions_output_dir is not None else ""
+    )
+    run.summary["auto_benchmark_enabled"] = bool(args.auto_benchmark_best_checkpoint)
+    run.summary["auto_benchmark_ran"] = bool(auto_benchmark_ran)
+    run.summary["auto_benchmark_success"] = bool(auto_benchmark_success)
+    run.summary["auto_benchmark_checkpoint_step"] = int(
+        auto_benchmark_checkpoint_step if auto_benchmark_checkpoint_step is not None else -1
+    )
+    run.summary["auto_benchmark_output_json"] = (
+        str(auto_benchmark_metrics_path) if auto_benchmark_metrics_path is not None else ""
+    )
+    run.summary["auto_benchmark_predictions_jsonl"] = (
+        str(auto_benchmark_predictions_path) if auto_benchmark_predictions_path is not None else ""
+    )
+    if auto_benchmark_metrics is not None:
+        for key in (
+            "eval_reward_mean",
+            "eval_json_parse_rate",
+            "eval_exact_accuracy",
+        ):
+            if isinstance(auto_benchmark_metrics.get(key), (int, float)):
+                run.summary[f"auto_benchmark_{key}"] = float(auto_benchmark_metrics[key])
+
+    run.finish()
+    client.close()
+
+    print(
+        f"done. finetune_id={finetune.finetune_id} best_{args.best_metric}={best_metric_value} "
+        f"best_step={best_step} best_avg_checkpoint_metric={best_avg_checkpoint_metric} "
+        f"best_avg_checkpoint_metric_step={best_avg_checkpoint_metric_step} "
+        f"best_avg_eval_reward={best_avg_eval_reward} "
+        f"auto_benchmark_success={auto_benchmark_success} "
+        f"auto_benchmark_step={auto_benchmark_checkpoint_step} "
+        f"stopped_early={training_status.get('stopped_early')} "
+        f"stop_reason={training_status.get('stop_reason', '')}"
+    )
+
+
+if __name__ == "__main__":
+    main()

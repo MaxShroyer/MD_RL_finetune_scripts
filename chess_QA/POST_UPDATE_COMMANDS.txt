@@ -1,0 +1,280 @@
+Chess QA command runbook
+========================
+
+Run everything from the repo root:
+
+  cd /Users/maxs/Documents/Repos/MD/MD_RL_Pipe/RL_amazon_logo
+
+
+0. Install dataset builder dependencies
+---------------------------------------
+
+Install or refresh the dataset-builder dependencies before rebuilding:
+
+  pip install -r chess_QA/synth-chess-dataset/requirements.txt
+
+If you specifically hit `ModuleNotFoundError: No module named 'PIL'`, the package name is:
+
+  pip install Pillow
+
+
+1. Run tests
+------------
+
+Full Chess QA test pass:
+
+  pytest chess_QA/tests/test_train_chess_query_rl.py chess_QA/synth-chess-dataset/tests
+
+Dataset-only tests:
+
+  pytest chess_QA/synth-chess-dataset/tests
+
+
+2. Rebuild datasets
+-------------------
+
+Use builder defaults for all available sources:
+
+  python chess_QA/synth-chess-dataset/build_chess_qa_dataset.py
+
+Note:
+  `piece_position_v2_dataset2` and `mixed_tasks_v2_dataset2` now merge the
+  v2-capable input sources you provide to the builder.
+  If you pass both `--dataset2-dir` and `--osf-dir`, those two outputs contain both sources.
+  By default, the builder now writes only those two main datasets.
+
+Explicit build with all three raw sources:
+
+  python chess_QA/synth-chess-dataset/build_chess_qa_dataset.py \
+    --dataset2-dir "chess_QA/synth-chess-dataset/rawdatasets/Chess Pieces.v23-raw.coco" \
+    --osf-dir "chess_QA/synth-chess-dataset/rawdatasets/osfstorage-archive" \
+    --output-dir "chess_QA/synth-chess-dataset/outputs" \
+    --copy-images true
+
+Build only dataset2-style v2 outputs if dataset1 is missing:
+
+  python chess_QA/synth-chess-dataset/build_chess_qa_dataset.py \
+    --dataset2-dir "chess_QA/synth-chess-dataset/rawdatasets/Chess Pieces.v23-raw.coco" \
+    --output-dir "chess_QA/synth-chess-dataset/outputs" \
+    --copy-images true
+
+Build only OSF-backed merged v2 outputs if you only care about the archive:
+
+  python chess_QA/synth-chess-dataset/build_chess_qa_dataset.py \
+    --osf-dir "chess_QA/synth-chess-dataset/rawdatasets/osfstorage-archive" \
+    --output-dir "chess_QA/synth-chess-dataset/outputs" \
+    --copy-images true
+
+If you explicitly want legacy v1 outputs too:
+
+  python chess_QA/synth-chess-dataset/build_chess_qa_dataset.py \
+    --dataset1-dir "chess_QA/synth-chess-dataset/rawdatasets/chess-dataset/labeled_originals" \
+    --dataset2-dir "chess_QA/synth-chess-dataset/rawdatasets/Chess Pieces.v23-raw.coco" \
+    --osf-dir "chess_QA/synth-chess-dataset/rawdatasets/osfstorage-archive" \
+    --output-dir "chess_QA/synth-chess-dataset/outputs" \
+    --copy-images true \
+    --build-legacy-v1 true
+
+If you explicitly want source-specific OSF-only outputs too:
+
+  python chess_QA/synth-chess-dataset/build_chess_qa_dataset.py \
+    --dataset2-dir "chess_QA/synth-chess-dataset/rawdatasets/Chess Pieces.v23-raw.coco" \
+    --osf-dir "chess_QA/synth-chess-dataset/rawdatasets/osfstorage-archive" \
+    --output-dir "chess_QA/synth-chess-dataset/outputs" \
+    --copy-images true \
+    --build-source-specific-v2 true
+
+
+3. Inspect dataset metadata and stats
+-------------------------------------
+
+Merged main v2 outputs:
+
+  cat chess_QA/synth-chess-dataset/outputs/piece_position_v2_dataset2/metadata.json
+  cat chess_QA/synth-chess-dataset/outputs/mixed_tasks_v2_dataset2/metadata.json
+  cat chess_QA/synth-chess-dataset/outputs/piece_position_v2_dataset2/stats.json
+  cat chess_QA/synth-chess-dataset/outputs/mixed_tasks_v2_dataset2/stats.json
+
+Quick metadata summary for all v2 datasets:
+
+  python - <<'PY'
+import json
+from pathlib import Path
+root = Path("chess_QA/synth-chess-dataset/outputs")
+for name in [
+    "piece_position_v2_dataset2",
+    "mixed_tasks_v2_dataset2",
+]:
+    path = root / name / "metadata.json"
+    if not path.exists():
+        print(name, "missing")
+        continue
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    print(name)
+    print("  split_counts:", payload.get("split_counts"))
+    print("  source_counts:", payload.get("source_counts"))
+    if "cleaning" in payload:
+        print("  cleaning:", payload["cleaning"])
+    if "validation" in payload:
+        print("  validation:", payload["validation"])
+PY
+
+
+4. Preview JSONL rows
+---------------------
+
+Merged main v2:
+
+  sed -n '1,5p' chess_QA/synth-chess-dataset/outputs/piece_position_v2_dataset2/jsonl/train.jsonl
+  sed -n '1,8p' chess_QA/synth-chess-dataset/outputs/mixed_tasks_v2_dataset2/jsonl/train.jsonl
+
+5. Sanity-check config parsing
+------------------------------
+
+  python - <<'PY'
+from chess_QA import train_chess_query_rl as mod
+configs = [
+    "chess_QA/configs/query_rl_chess_piece_position_v2_baseline_reasoning.json",
+    "chess_QA/configs/query_rl_chess_piece_position_v2_offpolicy_reasoning.json",
+    "chess_QA/configs/query_rl_chess_piece_position_v2_offpolicy_reasoning_rank24_lowlr.json",
+    "chess_QA/configs/query_rl_chess_piece_position_v2_offpolicy_no_reasoning.json",
+]
+for cfg in configs:
+    args = mod.parse_args(["--config", cfg])
+    print(cfg)
+    print("  dataset_variant_tag:", args.dataset_variant_tag)
+    print("  list_piece_reward_mode:", args.list_piece_reward_mode)
+    print("  save_eval_predictions:", args.save_eval_predictions)
+PY
+
+
+6. Run training manually
+------------------------
+
+Main v2 baseline reasoning:
+
+python chess_QA/train_chess_query_rl.py \
+    --config chess_QA/configs/query_rl_chess_piece_position_v2_baseline_reasoning.json
+
+# Train one mixed-v2 task at a time with the new individual-task configs
+python chess_QA/train_chess_query_rl.py \
+    --config chess_QA/configs/individual_tasks/query_rl_chess_individual_list_all_pieces_v2.json
+
+python chess_QA/train_chess_query_rl.py \
+    --config chess_QA/configs/individual_tasks/query_rl_chess_individual_count_by_color_v2.json
+
+python chess_QA/train_chess_query_rl.py \
+    --config chess_QA/configs/individual_tasks/query_rl_chess_individual_list_color_pieces_v2.json
+
+python chess_QA/train_chess_query_rl.py \
+    --config chess_QA/configs/individual_tasks/query_rl_chess_individual_color_presence_check_v2.json
+
+Main v2 off-policy reasoning:
+
+  python chess_QA/train_chess_query_rl.py \
+    --config chess_QA/configs/query_rl_chess_piece_position_v2_offpolicy_reasoning.json
+
+Main v2 off-policy reasoning rank24 lowlr:
+
+  python chess_QA/train_chess_query_rl.py \
+    --config chess_QA/configs/query_rl_chess_piece_position_v2_offpolicy_reasoning_rank24_lowlr.json
+
+Main v2 off-policy no reasoning:
+
+  python chess_QA/train_chess_query_rl.py \
+    --config chess_QA/configs/query_rl_chess_piece_position_v2_offpolicy_no_reasoning.json
+
+7. Run the existing 4-config main v2 sweep
+------------------------------------------
+
+Default behavior launches all four runs immediately:
+
+  ./chess_QA/run_piece_position_v2_sweep.sh
+
+Optional startup stagger:
+
+  STARTUP_STAGGER_S=10 ./chess_QA/run_piece_position_v2_sweep.sh
+
+Pass extra trainer flags through:
+
+  ./chess_QA/run_piece_position_v2_sweep.sh --no-progress
+
+Interpreter selection:
+  The sweep script prefers the active `VIRTUAL_ENV`, then `../.venv/bin/python`,
+  then falls back to `python3` / `python`.
+
+Force a specific interpreter if needed:
+
+  PYTHON_BIN="../.venv/bin/python" ./chess_QA/run_piece_position_v2_sweep.sh
+
+8. Run the 4-config individual-task v2 sweep
+--------------------------------------------
+
+Default behavior launches all four task-specific runs immediately:
+
+  ./chess_QA/run_individual_tasks_v2_sweep.sh
+
+Optional startup stagger:
+
+  STARTUP_STAGGER_S=10 ./chess_QA/run_individual_tasks_v2_sweep.sh
+
+Pass extra trainer flags through:
+
+  ./chess_QA/run_individual_tasks_v2_sweep.sh --no-progress
+
+Force a specific interpreter if needed:
+
+  PYTHON_BIN="../.venv/bin/python" ./chess_QA/run_individual_tasks_v2_sweep.sh
+
+9. Monitor logs
+---------------
+
+Newest sweep directory:
+
+  ls -td chess_QA/outputs/sweeps/piece_position_v2_* | head -n 1
+
+Read PID table for newest sweep:
+
+  latest="$(ls -td chess_QA/outputs/sweeps/piece_position_v2_* | head -n 1)" && cat "$latest/pids.tsv"
+
+Tail one dataset2 run:
+
+  latest="$(ls -td chess_QA/outputs/sweeps/piece_position_v2_* | head -n 1)" && tail -f "$latest/query_rl_chess_piece_position_v2_offpolicy_reasoning.log"
+
+Newest individual-task sweep directory:
+
+  ls -td chess_QA/outputs/sweeps/individual_tasks_v2_* | head -n 1
+
+Read PID table for newest individual-task sweep:
+
+  latest="$(ls -td chess_QA/outputs/sweeps/individual_tasks_v2_* | head -n 1)" && cat "$latest/pids.tsv"
+
+Tail one individual-task run:
+
+  latest="$(ls -td chess_QA/outputs/sweeps/individual_tasks_v2_* | head -n 1)" && tail -f "$latest/query_rl_chess_individual_list_all_pieces_v2.log"
+
+
+10. Inspect eval prediction samples
+-----------------------------------
+
+Dataset2 baseline:
+
+  ls chess_QA/outputs/eval_predictions/piece_position_v2_baseline_reasoning
+  sed -n '1,5p' chess_QA/outputs/eval_predictions/piece_position_v2_baseline_reasoning/baseline_step000000_val.jsonl
+
+Dataset2 off-policy reasoning:
+
+  ls chess_QA/outputs/eval_predictions/piece_position_v2_offpolicy_reasoning
+
+List all eval artifact directories:
+
+  find chess_QA/outputs/eval_predictions -maxdepth 1 -type d
+
+
+10. Inspect checkpoint ranking outputs
+--------------------------------------
+
+  cat chess_QA/outputs/checkpoint_ranking_piece_position_v2_baseline_reasoning.json
+  cat chess_QA/outputs/checkpoint_ranking_piece_position_v2_offpolicy_reasoning.json
+  cat chess_QA/outputs/checkpoint_ranking_piece_position_v2_offpolicy_reasoning_rank24_lowlr.json
+  cat chess_QA/outputs/checkpoint_ranking_piece_position_v2_offpolicy_no_reasoning.json

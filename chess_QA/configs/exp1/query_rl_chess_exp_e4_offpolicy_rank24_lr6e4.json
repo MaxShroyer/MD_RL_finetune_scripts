@@ -1,0 +1,68 @@
+{
+  "env_file": ".env",
+  "dataset_source": "local_jsonl",
+  "dataset_dir": "chess_QA/synth-chess-dataset/outputs",
+  "dataset_variant_tag": "piece_position_v1",
+  "train_split": "train",
+  "val_split": "val",
+  "final_eval_splits": [
+    "val",
+    "test"
+  ],
+  "finetune_id": "",
+  "finetune_name": "",
+  "rank": 24,
+  "num_steps": 250,
+  "resume_step": 0,
+  "batch_size": 16,
+  "group_size": 4,
+  "lr": 0.0006,
+  "temperature": 1.0,
+  "top_p": 0.9,
+  "max_tokens": 1050,
+  "max_tokens_by_task": {
+    "list_all_pieces": 900,
+    "list_color_pieces": 900,
+    "count_by_color": 200,
+    "color_presence_check": 200
+  },
+  "reasoning": false,
+  "off_policy": true,
+  "off_policy_mix_ratio": 0.6,
+  "off_policy_buffer_size": 8192,
+  "off_policy_warmup_steps": 20,
+  "off_policy_min_buffer_groups": 128,
+  "list_piece_reward_mode": "dense_partial_v1",
+  "list_piece_reward_weights": {
+    "typed_f1": 0.6,
+    "square_f1": 0.2,
+    "piece_recall": 0.2
+  },
+  "task_sampling_weights": {
+    "list_all_pieces": 1.0,
+    "count_by_color": 1.0,
+    "list_color_pieces": 1.0,
+    "color_presence_check": 1.0
+  },
+  "max_workers": 4,
+  "rollout_retries": 2,
+  "rollout_retry_backoff_s": 1.0,
+  "eval_every": 10,
+  "save_every": 10,
+  "save_on_eval": true,
+  "eval_batch_size": 32,
+  "eval_max_samples": 1000,
+  "checkpoint_avg_splits": [
+    "val",
+    "test"
+  ],
+  "checkpoint_avg_metric": "eval_reward_mean",
+  "checkpoint_ranking_output": "chess_QA/outputs/checkpoint_ranking_chess_exp_e4_offpolicy_rank24_lr6e4.json",
+  "auto_benchmark_best_checkpoint": false,
+  "auto_benchmark_config": "chess_QA/configs/benchmark_chess_default.json",
+  "seed": 42,
+  "best_metric": "eval_reward_mean",
+  "no_progress": false,
+  "wandb_project": "moondream-chess-query-rl",
+  "wandb_run_name": "chess-exp-e4-offpolicy-rank24-lr6e4"
+}

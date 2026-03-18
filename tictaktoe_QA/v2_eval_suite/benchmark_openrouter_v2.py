@@ -50,6 +50,8 @@ DEFAULT_MODELS: list[dict[str, Any]] = [
     {"label": "chatgpt_frontier", "model_id": "openai/gpt-5.1"},
     {"label": "qwen_vl_frontier", "model_id": "qwen/qwen-2.5-vl-7b-instruct"},
 ]
+SAMPLE_STRATEGIES = ("random", "stratified")
+STRATIFY_SUPPORTED_TASKS = {"turn_player", "available_moves_count"}
 
 OPENROUTER_CONFIG_ALLOWED_KEYS = {
     "api_base",
@@ -68,8 +70,10 @@ OPENROUTER_CONFIG_ALLOWED_KEYS = {
     "retry_429_backoff_s",
     "retry_429_max_backoff_s",
     "retry_429_max_retries",
+    "sample_strategy",
     "seed",
     "split",
+    "stratify_tasks",
     "task_types",
     "temperature",
     "timeout",
@@ -186,6 +190,20 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
         help="0 means full rows per selected task.",
     )
     parser.add_argument("--seed", type=int, default=common.cfg_int(config, "seed", 42))
+    parser.add_argument(
+        "--sample-strategy",
+        choices=list(SAMPLE_STRATEGIES),
+        default=common.cfg_str(config, "sample_strategy", "random"),
+    )
+    parser.add_argument(
+        "--stratify-tasks",
+        nargs="*",
+        default=None,
+        help=(
+            "Task types to stratify when sample_strategy=stratified. "
+            "Supported tasks: turn_player, available_moves_count."
+        ),
+    )
 
     parser.add_argument("--temperature", type=float, default=common.cfg_float(config, "temperature", 0.0))
     parser.add_argument("--top-p", type=float, default=common.cfg_float(config, "top_p", 1.0))
@@ -241,6 +259,11 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         args.task_types = common.normalize_task_types(default_task_types)
     else:
         args.task_types = common.normalize_task_types(args.task_types)
+    if args.stratify_tasks is None:
+        default_stratify_tasks = common.cfg_list_str(config, "stratify_tasks", [])
+        args.stratify_tasks = common.normalize_task_types(default_stratify_tasks)
+    else:
+        args.stratify_tasks = common.normalize_task_types(args.stratify_tasks)
 
     models_from_config = config.get("models")
     args.models = _parse_models(models_from_config)
@@ -682,12 +705,145 @@ def _error_details(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def _stratify_bucket_key_for_example(
+    item: train_utils.QAExample,
+    *,
+    task_name: str,
+) -> Optional[str]:
+    if task_name == "turn_player":
+        normalized = train_utils._normalize_non_best_answer("turn_player", item.expected_answer)
+        if not isinstance(normalized, dict):
+            return None
+        player = normalized.get("player")
+        if isinstance(player, str) and player in {"X", "O"}:
+            return player
+        return None
+    if task_name == "available_moves_count":
+        normalized = train_utils._normalize_non_best_answer("available_moves_count", item.expected_answer)
+        if not isinstance(normalized, dict):
+            return None
+        count = train_utils._parse_int(normalized.get("available_move_count"))
+        if count is None:
+            return None
+        return str(int(count))
+    return None
+
+
+def _allocate_stratified_counts(
+    *,
+    bucket_sizes: dict[str, int],
+    limit: int,
+) -> dict[str, int]:
+    keys = sorted(key for key, size in bucket_sizes.items() if size > 0)
+    if limit <= 0 or not keys:
+        return {key: 0 for key in keys}
+
+    total_rows = sum(bucket_sizes[key] for key in keys)
+    if limit >= total_rows:
+        return {key: int(bucket_sizes[key]) for key in keys}
+
+    allocations: dict[str, int] = {key: 0 for key in keys}
+    if limit >= len(keys):
+        for key in keys:
+            allocations[key] = 1
+        remaining = limit - len(keys)
+    else:
+        ranked_keys = sorted(keys, key=lambda key: (-bucket_sizes[key], key))
+        for key in ranked_keys[:limit]:
+            allocations[key] = 1
+        remaining = 0
+
+    if remaining <= 0:
+        return allocations
+
+    capacity = {key: max(0, bucket_sizes[key] - allocations[key]) for key in keys}
+    capacity_total = sum(capacity.values())
+    if capacity_total <= 0:
+        return allocations
+
+    base_add: dict[str, int] = {}
+    fractional: list[tuple[float, str]] = []
+    assigned = 0
+    for key in keys:
+        cap = capacity[key]
+        if cap <= 0:
+            base_add[key] = 0
+            continue
+        raw = (remaining * cap) / capacity_total
+        add = min(cap, int(raw))
+        base_add[key] = add
+        assigned += add
+        fractional.append((raw - add, key))
+
+    for key in keys:
+        allocations[key] += base_add.get(key, 0)
+
+    leftovers = remaining - assigned
+    if leftovers <= 0:
+        return allocations
+
+    fractional.sort(key=lambda item: (-item[0], item[1]))
+    idx = 0
+    while leftovers > 0 and fractional:
+        _, key = fractional[idx % len(fractional)]
+        if allocations[key] < bucket_sizes[key]:
+            allocations[key] += 1
+            leftovers -= 1
+        idx += 1
+        if idx > (len(fractional) * (remaining + 1)):
+            break
+    return allocations
+
+
+def _sample_stratified_rows_for_task(
+    rows: list[train_utils.QAExample],
+    *,
+    task_name: str,
+    limit: int,
+    rng: random.Random,
+) -> list[train_utils.QAExample]:
+    if limit <= 0 or not rows:
+        return []
+
+    buckets: dict[str, list[train_utils.QAExample]] = {}
+    for item in rows:
+        bucket_key = _stratify_bucket_key_for_example(item, task_name=task_name)
+        if bucket_key is None:
+            bucket_key = "__unknown__"
+        buckets.setdefault(bucket_key, []).append(item)
+
+    for bucket_rows in buckets.values():
+        rng.shuffle(bucket_rows)
+
+    allocations = _allocate_stratified_counts(
+        bucket_sizes={key: len(bucket_rows) for key, bucket_rows in buckets.items()},
+        limit=min(limit, len(rows)),
+    )
+    selected: list[train_utils.QAExample] = []
+    for key in sorted(buckets.keys()):
+        take = min(len(buckets[key]), int(allocations.get(key, 0)))
+        if take > 0:
+            selected.extend(buckets[key][:take])
+
+    if len(selected) < min(limit, len(rows)):
+        selected_ids = {id(item) for item in selected}
+        spillover = [item for item in rows if id(item) not in selected_ids]
+        rng.shuffle(spillover)
+        remaining = min(limit, len(rows)) - len(selected)
+        selected.extend(spillover[:remaining])
+
+    rng.shuffle(selected)
+    return selected[: min(limit, len(rows))]
+
+
 def _sample_examples_by_task(
     examples: list[train_utils.QAExample],
     *,
     task_types: list[str],
     max_samples_per_task: int,
     seed: int,
+    sample_strategy: str = "random",
+    stratify_tasks: Optional[list[str]] = None,
 ) -> list[train_utils.QAExample]:
     rng = random.Random(seed)
     grouped: dict[str, list[train_utils.QAExample]] = {task: [] for task in task_types}
@@ -695,13 +851,29 @@ def _sample_examples_by_task(
         if item.task_type in grouped:
             grouped[item.task_type].append(item)
 
+    stratify_set = {
+        task
+        for task in (stratify_tasks or [])
+        if task in STRATIFY_SUPPORTED_TASKS
+    }
     selected: list[train_utils.QAExample] = []
     for task in task_types:
         rows = list(grouped.get(task, []))
         rng.shuffle(rows)
-        if max_samples_per_task > 0:
-            rows = rows[:max_samples_per_task]
-        selected.extend(rows)
+        if max_samples_per_task <= 0:
+            selected.extend(rows)
+            continue
+        if sample_strategy == "stratified" and task in stratify_set:
+            selected.extend(
+                _sample_stratified_rows_for_task(
+                    rows,
+                    task_name=task,
+                    limit=max_samples_per_task,
+                    rng=rng,
+                )
+            )
+            continue
+        selected.extend(rows[:max_samples_per_task])
 
     rng.shuffle(selected)
     return selected
@@ -712,6 +884,20 @@ def _count_examples_by_task(examples: list[train_utils.QAExample]) -> dict[str, 
     for item in examples:
         out[item.task_type] += 1
     return {task: int(out[task]) for task in sorted(out.keys())}
+
+
+def _count_jsonl_lines(path: Path) -> int:
+    if not path.exists():
+        return 0
+    count = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for _line in handle:
+            count += 1
+    return count
+
+
+def _model_status_from_counts(*, requested_rows: int, prediction_lines: int) -> str:
+    return "completed" if int(prediction_lines) == int(requested_rows) else "partial"
 
 
 def _benchmark_model(
@@ -739,13 +925,25 @@ def _benchmark_model(
     object_parse_count = 0
     parse_success_count = 0
     request_failure_count = 0
+    prediction_lines_written = 0
 
     best_move_total = 0
     best_move_set_correct = 0
     best_move_canonical_correct = 0
+    best_move_wrong_reward_sum = 0.0
+    best_move_wrong_count = 0
 
     non_best_total = 0
     non_best_exact_correct = 0
+    turn_player_confusion: Counter[str] = Counter(
+        {
+            "X->X": 0,
+            "X->O": 0,
+            "O->X": 0,
+            "O->O": 0,
+        }
+    )
+    available_moves_count_delta_hist: Counter[int] = Counter()
 
     per_task_total: Counter[str] = Counter()
     per_task_correct: Counter[str] = Counter()
@@ -787,6 +985,7 @@ def _benchmark_model(
                     )
                     + "\n"
                 )
+                prediction_lines_written += 1
                 continue
 
             try:
@@ -823,6 +1022,7 @@ def _benchmark_model(
                     )
                     + "\n"
                 )
+                prediction_lines_written += 1
                 continue
 
             latency_values_ms.append(latency_ms)
@@ -849,10 +1049,43 @@ def _benchmark_model(
                     best_move_set_correct += 1
                 if outcome.best_move_canonical_correct:
                     best_move_canonical_correct += 1
+                if not outcome.best_move_set_correct:
+                    best_move_wrong_reward_sum += float(outcome.reward)
+                    best_move_wrong_count += 1
             else:
                 non_best_total += 1
                 if outcome.exact_non_best_correct:
                     non_best_exact_correct += 1
+
+            if item.task_type == "turn_player":
+                gt_norm = train_utils._normalize_non_best_answer("turn_player", item.expected_answer)
+                pred_norm = train_utils._normalize_non_best_answer("turn_player", pred_payload)
+                gt_player = gt_norm.get("player") if isinstance(gt_norm, dict) else None
+                pred_player = pred_norm.get("player") if isinstance(pred_norm, dict) else None
+                if gt_player in {"X", "O"} and pred_player in {"X", "O"}:
+                    turn_player_confusion[f"{gt_player}->{pred_player}"] += 1
+
+            if item.task_type == "available_moves_count":
+                gt_norm = train_utils._normalize_non_best_answer(
+                    "available_moves_count",
+                    item.expected_answer,
+                )
+                pred_norm = train_utils._normalize_non_best_answer(
+                    "available_moves_count",
+                    pred_payload,
+                )
+                gt_count = (
+                    train_utils._parse_int(gt_norm.get("available_move_count"))
+                    if isinstance(gt_norm, dict)
+                    else None
+                )
+                pred_count = (
+                    train_utils._parse_int(pred_norm.get("available_move_count"))
+                    if isinstance(pred_norm, dict)
+                    else None
+                )
+                if gt_count is not None and pred_count is not None:
+                    available_moves_count_delta_hist[int(pred_count) - int(gt_count)] += 1
 
             predictions_handle.write(
                 json.dumps(
@@ -879,6 +1112,7 @@ def _benchmark_model(
                 )
                 + "\n"
             )
+            prediction_lines_written += 1
 
             if show_progress and total_scored % 10 == 0:
                 parse_rate = parse_success_count / max(1, total_scored)
@@ -912,8 +1146,20 @@ def _benchmark_model(
         "eval_best_move_set_accuracy": (best_move_set_correct / max(1, best_move_total)),
         "eval_best_move_canonical_accuracy": (best_move_canonical_correct / max(1, best_move_total)),
         "eval_exact_accuracy_non_best_move": (non_best_exact_correct / max(1, non_best_total)),
+        "prediction_lines_written": int(prediction_lines_written),
         "latency_avg_ms": avg_latency_ms,
         "latency_p95_ms": p95_latency_ms,
+        "diagnostics": {
+            "best_move_wrong_reward_mean": (best_move_wrong_reward_sum / max(1, best_move_wrong_count)),
+            "turn_player_confusion": {
+                key: int(turn_player_confusion[key])
+                for key in ("X->X", "X->O", "O->X", "O->O")
+            },
+            "available_moves_count_delta_hist": {
+                str(delta): int(available_moves_count_delta_hist[delta])
+                for delta in sorted(available_moves_count_delta_hist.keys())
+            },
+        },
         "by_task": {
             task: {
                 "count": int(per_task_total[task]),
@@ -986,11 +1232,22 @@ def main(argv: Optional[list[str]] = None) -> None:
         hf_token=args.hf_token,
         hf_cache_dir=args.hf_cache_dir,
     )
+    if args.sample_strategy == "stratified":
+        unsupported_stratify = sorted(
+            task for task in args.stratify_tasks if task not in STRATIFY_SUPPORTED_TASKS
+        )
+        if unsupported_stratify:
+            print(
+                "WARNING: stratify_tasks contains tasks without stratification support; "
+                f"falling back to random for: {unsupported_stratify}"
+            )
     selected_examples = _sample_examples_by_task(
         examples,
         task_types=args.task_types,
         max_samples_per_task=args.max_samples_per_task,
         seed=args.seed,
+        sample_strategy=args.sample_strategy,
+        stratify_tasks=args.stratify_tasks,
     )
     if not selected_examples:
         raise ValueError("No examples selected for benchmark. Check split/task filters.")
@@ -1039,12 +1296,27 @@ def main(argv: Optional[list[str]] = None) -> None:
                 "hf_dataset_repo_id": args.hf_dataset_repo_id,
                 "hf_dataset_revision": args.hf_dataset_revision,
                 "task_types": list(args.task_types),
+                "sample_strategy": str(args.sample_strategy),
+                "stratify_tasks": list(args.stratify_tasks),
                 "max_samples_per_task": int(args.max_samples_per_task),
                 "seed": int(args.seed),
-                    "api_base": args.api_base,
-                    "request_overrides": request_overrides or {},
-                }
+                "api_base": args.api_base,
+                "request_overrides": request_overrides or {},
+            }
         )
+        prediction_lines = _count_jsonl_lines(predictions_path)
+        requested_rows = int(metrics_payload.get("requested_rows", len(selected_examples)))
+        status = _model_status_from_counts(
+            requested_rows=requested_rows,
+            prediction_lines=prediction_lines,
+        )
+        metrics_payload["prediction_lines"] = int(prediction_lines)
+        metrics_payload["status"] = status
+        if status == "partial":
+            print(
+                f"WARNING: model={model_label} wrote predictions lines={prediction_lines} "
+                f"but requested_rows={requested_rows}; marking status=partial"
+            )
         metrics_path.write_text(json.dumps(metrics_payload, indent=2, sort_keys=True), encoding="utf-8")
 
         model_artifacts.append(
@@ -1053,6 +1325,8 @@ def main(argv: Optional[list[str]] = None) -> None:
                 "model_id": model_id,
                 "metrics_file": metrics_path.name,
                 "predictions_file": predictions_path.name,
+                "status": status,
+                "prediction_lines": int(prediction_lines),
                 "eval_reward_mean": float(metrics_payload.get("eval_reward_mean", 0.0)),
                 "eval_json_parse_rate": float(metrics_payload.get("eval_json_parse_rate", 0.0)),
             }
@@ -1068,6 +1342,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         "hf_dataset_revision": args.hf_dataset_revision,
         "split": args.split,
         "task_types": list(args.task_types),
+        "sample_strategy": str(args.sample_strategy),
+        "stratify_tasks": list(args.stratify_tasks),
         "max_samples_per_task": int(args.max_samples_per_task),
         "seed": int(args.seed),
         "selected_rows": len(selected_examples),

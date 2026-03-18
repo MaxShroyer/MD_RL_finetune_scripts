@@ -1,0 +1,31 @@
+{
+  "env_file": ".env",
+  "dataset_source": "hf_hub",
+  "hf_dataset_repo_id": "maxs-m87/tictactoe-qa-v2",
+  "hf_dataset_revision": "main",
+  "hf_cache_dir": "",
+  "dataset_dir": "synth_dataset/outputs/v2",
+  "split": "test",
+  "seed": 42,
+  "max_samples": 0,
+  "task_types": [
+    "best_move"
+  ],
+  "model": "",
+  "finetune_id": "",
+  "checkpoint_step": -1,
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "max_tokens": 96,
+  "reasoning": false,
+  "timeout": 60.0,
+  "retry_429_max_retries": 2,
+  "retry_429_backoff_s": 1.0,
+  "retry_429_max_backoff_s": 8.0,
+  "best_move_optimal_reward": 0.7,
+  "best_move_reward_mode": "hybrid_strict",
+  "best_move_wrong_rank_scale": 0.0,
+  "output_json": "",
+  "predictions_jsonl": "",
+  "no_progress": false
+}

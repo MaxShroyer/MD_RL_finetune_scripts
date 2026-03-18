@@ -51,6 +51,8 @@ BENCHMARK_CONFIG_ALLOWED_KEYS = {
     "api_key",
     "base_url",
     "best_move_optimal_reward",
+    "best_move_reward_mode",
+    "best_move_wrong_rank_scale",
     "checkpoint_step",
     "config",
     "dataset_dir",
@@ -107,6 +109,10 @@ def _resolve_config_path(raw_path: str) -> Path:
     from_cwd = (Path.cwd() / path).resolve()
     if from_cwd.exists():
         return from_cwd
+
+    from_repo = (REPO_ROOT / path).resolve()
+    if from_repo.exists():
+        return from_repo
 
     from_script = (_repo_relative(path.as_posix())).resolve()
     if from_script.exists():
@@ -508,6 +514,16 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
         type=float,
         default=_cfg_float(config, "best_move_optimal_reward", 0.7),
     )
+    parser.add_argument(
+        "--best-move-reward-mode",
+        choices=list(train_utils.BEST_MOVE_REWARD_MODES),
+        default=_cfg_str(config, "best_move_reward_mode", "ranked"),
+    )
+    parser.add_argument(
+        "--best-move-wrong-rank-scale",
+        type=float,
+        default=_cfg_float(config, "best_move_wrong_rank_scale", 1.0),
+    )
 
     parser.add_argument(
         "--output-json",
@@ -571,6 +587,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--retry-429-max-backoff-s must be >= 0")
     if not (0.0 <= args.best_move_optimal_reward <= 1.0):
         raise ValueError("--best-move-optimal-reward must be in [0,1]")
+    if not (0.0 <= args.best_move_wrong_rank_scale <= 1.0):
+        raise ValueError("--best-move-wrong-rank-scale must be in [0,1]")
     if args.checkpoint_step is not None and args.checkpoint_step < 0:
         raise ValueError("--checkpoint-step must be >= 0")
     if args.dataset_source == "local_jsonl" and not str(args.dataset_dir).strip():
@@ -639,6 +657,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     best_move_total = 0
     best_move_set_correct = 0
     best_move_canonical_correct = 0
+    best_move_wrong_reward_sum = 0.0
+    best_move_wrong_count = 0
+    best_move_predicted_move_hist: Counter[str] = Counter()
 
     non_best_total = 0
     non_best_exact_correct = 0
@@ -715,6 +736,8 @@ def main(argv: Optional[list[str]] = None) -> None:
                 item,
                 pred_payload,
                 best_move_optimal_reward=args.best_move_optimal_reward,
+                best_move_reward_mode=args.best_move_reward_mode,
+                best_move_wrong_rank_scale=args.best_move_wrong_rank_scale,
             )
 
             total_scored += 1
@@ -728,10 +751,20 @@ def main(argv: Optional[list[str]] = None) -> None:
 
             if item.task_type == "best_move":
                 best_move_total += 1
+                move = train_utils._move_from_payload_obj(pred_payload)
+                if move is not None and 1 <= int(move) <= 9:
+                    row = ((int(move) - 1) // 3) + 1
+                    col = ((int(move) - 1) % 3) + 1
+                    best_move_predicted_move_hist[f"{row},{col}"] += 1
+                else:
+                    best_move_predicted_move_hist["invalid_or_missing"] += 1
                 if outcome.best_move_set_correct:
                     best_move_set_correct += 1
                 if outcome.best_move_canonical_correct:
                     best_move_canonical_correct += 1
+                if not outcome.best_move_set_correct:
+                    best_move_wrong_reward_sum += float(outcome.reward)
+                    best_move_wrong_count += 1
             else:
                 non_best_total += 1
                 if outcome.exact_non_best_correct:
@@ -794,6 +827,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         "hf_dataset_revision": args.hf_dataset_revision,
         "reasoning": bool(args.reasoning),
         "task_types": list(args.task_types or []),
+        "best_move_reward_mode": str(args.best_move_reward_mode),
+        "best_move_wrong_rank_scale": float(args.best_move_wrong_rank_scale),
         "requested_rows": len(indices),
         "evaluated_rows": total_scored,
         "request_failures": request_failure_count,
@@ -811,6 +846,16 @@ def main(argv: Optional[list[str]] = None) -> None:
         ),
         "latency_avg_ms": avg_latency_ms,
         "latency_p95_ms": p95_latency_ms,
+        "diagnostics": {
+            "best_move_wrong_reward_mean": (best_move_wrong_reward_sum / max(1, best_move_wrong_count)),
+            "best_move_center_prediction_rate": (
+                float(best_move_predicted_move_hist.get("2,2", 0)) / max(1, best_move_total)
+            ),
+            "best_move_predicted_move_hist": {
+                key: int(best_move_predicted_move_hist[key])
+                for key in sorted(best_move_predicted_move_hist.keys())
+            },
+        },
         "by_task": {
             task: {
                 "count": int(per_task_total[task]),

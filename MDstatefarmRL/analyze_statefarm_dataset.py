@@ -20,10 +20,10 @@ DATASETS = [
     # "maxs-m87/NBA_StateFarm_splits_p1",
     # "maxs-m87/NBA_StateFarm_splits_1-8th",
     # "maxs-m87/NBA_StateFarm_splits_1-4th",
-    # "maxs-m87/NBA_StateFarm_Splits_01",
-    "maxs-m87/NBA-statefarm-hard-100",
-    "maxs-m87/NBA-statefarm-hard-50",
-    "maxs-m87/NBA-statefarm-hard-25",
+    "maxs-m87/NBA_StateFarm_Splits_01",
+    # "maxs-m87/NBA-statefarm-hard-100",
+    # "maxs-m87/NBA-statefarm-hard-50",
+    # "maxs-m87/NBA-statefarm-hard-25",
 ]
 
 

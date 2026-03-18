@@ -1,0 +1,13 @@
+{
+  "env_file": ".env",
+  "dataset": "maxs-m87/football_detect_no_split",
+  "split": "train",
+  "seed": 42,
+  "val_fraction": 0.2,
+  "holdout_count": 13,
+  "output_dir": "football_detect/outputs/maxs-m87_football_detect_v2_splits",
+  "push_to_hub": "maxs-m87/football_detect_v2",
+  "hub_val_split": "validation",
+  "hub_post_val_split": "test",
+  "flatten_by_box_element": true
+}

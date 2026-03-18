@@ -13,6 +13,12 @@ This prevents related variants (especially patched data) from crossing train/val
 ## Runtime config
 - Most scripts load `.env` from `--env-file` and then resolve `MOONDREAM_API_KEY` / `HF_TOKEN`.
 - `--base-url` / `--api-base` can be set explicitly, otherwise they fall back to `TUNA_BASE_URL`, `MOONDREAM_BASE_URL`, then the production default.
+- `train_pid_icons.py` and `benchmark_pid_icons.py` now support `--config <json>` in the same style as `tictaktoe_QA`.
+- Default config files live in `configs/`:
+  - `configs/train_pid_icons_default.json`
+  - `configs/train_pid_icons_quick.json`
+  - `configs/benchmark_pid_icons_default.json`
+  - `configs/benchmark_pid_icons_quick.json`
 
 ## Quick start
 ```bash
@@ -34,6 +40,10 @@ python benchmark_pid_icons.py \
   --split post_val \
   --finetune-id <FINETUNE_ID> \
   --checkpoint-step <CHECKPOINT_STEP>
+
+# Config-driven runs (CLI args still override config values):
+python train_pid_icons.py --config configs/train_pid_icons_default.json
+python benchmark_pid_icons.py --config configs/benchmark_pid_icons_default.json
 ```
 
 ## Point recall stabilization runs

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import tempfile
 import unittest
@@ -117,6 +118,36 @@ class RewardPolicyTests(unittest.TestCase):
         self.assertEqual(out.reward, 0.7)
         self.assertTrue(out.best_move_set_correct)
         self.assertFalse(out.best_move_canonical_correct)
+
+    def test_best_move_hybrid_strict_scales_wrong_ranked_reward(self) -> None:
+        example = self._best_move_example()
+        out = mod._score_payload_for_example(
+            example,
+            {"row": 2, "col": 2},
+            best_move_optimal_reward=0.7,
+            best_move_reward_mode="hybrid_strict",
+            best_move_wrong_rank_scale=0.2,
+        )
+        self.assertAlmostEqual(out.reward, 0.1, places=6)
+        self.assertFalse(out.best_move_set_correct)
+        self.assertFalse(out.best_move_canonical_correct)
+
+    def test_best_move_binary_reward(self) -> None:
+        example = self._best_move_example()
+        wrong = mod._score_payload_for_example(
+            example,
+            {"row": 2, "col": 2},
+            best_move_optimal_reward=0.7,
+            best_move_reward_mode="binary",
+        )
+        right = mod._score_payload_for_example(
+            example,
+            {"row": 1, "col": 1},
+            best_move_optimal_reward=0.7,
+            best_move_reward_mode="binary",
+        )
+        self.assertEqual(wrong.reward, 0.0)
+        self.assertEqual(right.reward, 1.0)
 
     def test_turn_player_normalization(self) -> None:
         example = mod.QAExample(
@@ -318,6 +349,21 @@ class PathResolutionTests(unittest.TestCase):
             self.assertIsNotNone(example)
             assert example is not None
             self.assertEqual(example.task_type, "available_moves_count")
+
+    def test_resolve_config_path_supports_repo_prefixed_path_from_nested_cwd(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        nested_cwd = repo_root / "tictaktoe_QA"
+        config_rel = "tictaktoe_QA/configs/benchmark_best_move_strict.json"
+        expected = (repo_root / config_rel).resolve()
+
+        prior_cwd = Path.cwd()
+        os.chdir(nested_cwd)
+        try:
+            resolved = mod._resolve_config_path(config_rel)
+        finally:
+            os.chdir(prior_cwd)
+
+        self.assertEqual(resolved, expected)
 
 
 class ConfigPrecedenceTests(unittest.TestCase):
@@ -591,6 +637,36 @@ class CheckpointRankingTests(unittest.TestCase):
         ranked = mod._rank_checkpoint_eval_history(history)
         self.assertEqual([item["step"] for item in ranked], [30, 20])
 
+    def test_rank_checkpoint_eval_history_uses_checkpoint_metric_by_default(self) -> None:
+        history = [
+            {"step": 10, "avg_checkpoint_metric": 0.40, "avg_eval_reward_mean": 0.90},
+            {"step": 20, "avg_checkpoint_metric": 0.80, "avg_eval_reward_mean": 0.20},
+        ]
+        ranked = mod._rank_checkpoint_eval_history(history)
+        self.assertEqual([item["step"] for item in ranked], [20, 10])
+
+    def test_build_checkpoint_ranking_payload_uses_configured_metric_step(self) -> None:
+        payload = mod._build_checkpoint_ranking_payload(
+            finetune_id="ft_123",
+            checkpoint_avg_metric="eval_best_move_set_accuracy",
+            checkpoint_avg_splits=["val", "test"],
+            checkpoint_eval_history=[
+                {
+                    "step": 5,
+                    "avg_checkpoint_metric": 0.51,
+                    "avg_eval_reward_mean": 0.75,
+                },
+                {
+                    "step": 9,
+                    "avg_checkpoint_metric": 0.85,
+                    "avg_eval_reward_mean": 0.55,
+                },
+            ],
+        )
+        self.assertEqual(payload["best_avg_checkpoint_metric_step"], 9)
+        self.assertAlmostEqual(payload["best_avg_checkpoint_metric"], 0.85, places=6)
+        self.assertEqual(payload["best_avg_eval_reward_step"], 9)
+
 
 class AutoBenchmarkTests(unittest.TestCase):
     def test_parse_args_auto_benchmark_defaults_and_overrides(self) -> None:
@@ -606,6 +682,15 @@ class AutoBenchmarkTests(unittest.TestCase):
             fallback_step=129,
         )
         self.assertEqual(selected, 148)
+
+        selected_checkpoint_metric = mod._select_checkpoint_step_for_auto_benchmark(
+            ranking_payload={
+                "best_avg_checkpoint_metric_step": 151,
+                "best_avg_eval_reward_step": 148,
+            },
+            fallback_step=129,
+        )
+        self.assertEqual(selected_checkpoint_metric, 151)
 
         fallback = mod._select_checkpoint_step_for_auto_benchmark(
             ranking_payload={"best_avg_eval_reward_step": -1},
@@ -626,6 +711,8 @@ class AutoBenchmarkTests(unittest.TestCase):
             base_url="https://api.moondream.ai/v1",
             dataset_source="local_jsonl",
             best_move_optimal_reward=0.7,
+            best_move_reward_mode="hybrid_strict",
+            best_move_wrong_rank_scale=0.2,
             hf_dataset_repo_id="repo",
             hf_dataset_revision="main",
             hf_cache_dir="",
@@ -653,6 +740,8 @@ class AutoBenchmarkTests(unittest.TestCase):
             base_url="https://api.moondream.ai/v1",
             dataset_source="hf_hub",
             best_move_optimal_reward=0.7,
+            best_move_reward_mode="hybrid_strict",
+            best_move_wrong_rank_scale=0.2,
             hf_dataset_repo_id="repo",
             hf_dataset_revision="main",
             hf_cache_dir="",
@@ -823,6 +912,247 @@ class SamplingConfigTests(unittest.TestCase):
         ]
         filtered = mod._filter_examples_by_active_tasks(examples, active_tasks={"best_move"})
         self.assertEqual([item.row_id for item in filtered], ["r_best"])
+
+    def test_intra_task_sampling_validation(self) -> None:
+        intra = mod._resolve_intra_task_sampling(
+            config_map={"turn_player": "balanced_player"},
+            cli_override_json="",
+        )
+        self.assertEqual(intra, {"turn_player": "balanced_player"})
+
+        intra_best = mod._resolve_intra_task_sampling(
+            config_map={"best_move": "uniform_canonical_move"},
+            cli_override_json="",
+        )
+        self.assertEqual(intra_best, {"best_move": "uniform_canonical_move"})
+
+        with self.assertRaisesRegex(ValueError, "not valid for task_type 'turn_player'"):
+            mod._resolve_intra_task_sampling(
+                config_map={"turn_player": "uniform_count"},
+                cli_override_json="",
+            )
+
+    def test_intra_task_sampling_deterministic(self) -> None:
+        examples = [
+            mod.QAExample(
+                row_id=f"row_{idx}_x",
+                split="train",
+                task_type="turn_player",
+                question="q",
+                image_path=Path("/tmp/unused.png"),
+                expected_answer={"player": "X"},
+                best_move_canonical=None,
+                best_move_optimal_set=frozenset(),
+            )
+            for idx in range(4)
+        ] + [
+            mod.QAExample(
+                row_id=f"row_{idx}_o",
+                split="train",
+                task_type="turn_player",
+                question="q",
+                image_path=Path("/tmp/unused.png"),
+                expected_answer={"player": "O"},
+                best_move_canonical=None,
+                best_move_optimal_set=frozenset(),
+            )
+            for idx in range(4)
+        ]
+        groups = mod._prepare_intra_task_sampling_groups(
+            train_examples_by_task={"turn_player": examples},
+            intra_task_sampling={"turn_player": "balanced_player"},
+            best_move_center_not_optimal_ratio=0.7,
+        )
+        self.assertIn("turn_player", groups)
+
+        rng_a = random.Random(123)
+        rng_b = random.Random(123)
+        sampled_a = [
+            mod._sample_training_example(
+                task_name="turn_player",
+                train_examples_by_task={"turn_player": examples},
+                intra_task_sampling_groups=groups,
+                rng=rng_a,
+            ).row_id
+            for _ in range(20)
+        ]
+        sampled_b = [
+            mod._sample_training_example(
+                task_name="turn_player",
+                train_examples_by_task={"turn_player": examples},
+                intra_task_sampling_groups=groups,
+                rng=rng_b,
+            ).row_id
+            for _ in range(20)
+        ]
+        self.assertEqual(sampled_a, sampled_b)
+        sampled_players = {
+            "X" if row_id.endswith("_x") else "O"
+            for row_id in sampled_a
+        }
+        self.assertEqual(sampled_players, {"X", "O"})
+
+    def test_intra_task_sampling_center_hard_negative_ratio_and_determinism(self) -> None:
+        center_not_optimal = [
+            mod.QAExample(
+                row_id=f"neg_{idx}",
+                split="train",
+                task_type="best_move",
+                question="q",
+                image_path=Path("/tmp/unused.png"),
+                expected_answer={"row": 1, "col": 1},
+                best_move_canonical=1,
+                best_move_optimal_set=frozenset({1}),
+            )
+            for idx in range(10)
+        ]
+        other = [
+            mod.QAExample(
+                row_id=f"other_{idx}",
+                split="train",
+                task_type="best_move",
+                question="q",
+                image_path=Path("/tmp/unused.png"),
+                expected_answer={"row": 2, "col": 2},
+                best_move_canonical=5,
+                best_move_optimal_set=frozenset({5}),
+            )
+            for idx in range(10)
+        ]
+        examples = center_not_optimal + other
+        groups = mod._prepare_intra_task_sampling_groups(
+            train_examples_by_task={"best_move": examples},
+            intra_task_sampling={"best_move": "center_hard_negative"},
+            best_move_center_not_optimal_ratio=0.7,
+        )
+        self.assertIn("best_move", groups)
+        weights = groups["best_move"].get("bucket_pick_weights", {})
+        self.assertAlmostEqual(weights.get("center_not_optimal", 0.0), 0.7, places=6)
+        self.assertAlmostEqual(weights.get("other", 0.0), 0.3, places=6)
+
+        rng_a = random.Random(11)
+        rng_b = random.Random(11)
+        sampled_a = [
+            mod._sample_training_example(
+                task_name="best_move",
+                train_examples_by_task={"best_move": examples},
+                intra_task_sampling_groups=groups,
+                rng=rng_a,
+            ).row_id
+            for _ in range(600)
+        ]
+        sampled_b = [
+            mod._sample_training_example(
+                task_name="best_move",
+                train_examples_by_task={"best_move": examples},
+                intra_task_sampling_groups=groups,
+                rng=rng_b,
+            ).row_id
+            for _ in range(600)
+        ]
+        self.assertEqual(sampled_a, sampled_b)
+        neg_count = sum(1 for row_id in sampled_a if row_id.startswith("neg_"))
+        neg_ratio = neg_count / max(1, len(sampled_a))
+        self.assertGreater(neg_ratio, 0.62)
+        self.assertLess(neg_ratio, 0.78)
+
+    def test_parse_args_accepts_wandb_profile_and_center_gate(self) -> None:
+        args = mod.parse_args(
+            [
+                "--wandb-log-profile",
+                "lean",
+                "--center-bias-gate",
+                "--center-bias-gate-threshold",
+                "0.6",
+                "--center-bias-gate-after-evals",
+                "1",
+                "--center-bias-gate-min-best-move-samples",
+                "100",
+            ]
+        )
+        self.assertEqual(args.wandb_log_profile, "lean")
+        self.assertTrue(args.center_bias_gate_enabled)
+        self.assertAlmostEqual(args.center_bias_gate_threshold, 0.6, places=6)
+        self.assertEqual(args.center_bias_gate_after_evals, 1)
+        self.assertEqual(args.center_bias_gate_min_best_move_samples, 100)
+
+
+class GateAndWandbHelperTests(unittest.TestCase):
+    def test_should_trigger_center_bias_gate(self) -> None:
+        self.assertTrue(
+            mod._should_trigger_center_bias_gate(
+                enabled=True,
+                eval_index=1,
+                gate_after_evals=1,
+                center_prediction_rate=0.8,
+                gate_threshold=0.6,
+                best_move_samples=120,
+                min_best_move_samples=100,
+            )
+        )
+        self.assertFalse(
+            mod._should_trigger_center_bias_gate(
+                enabled=False,
+                eval_index=5,
+                gate_after_evals=1,
+                center_prediction_rate=0.99,
+                gate_threshold=0.6,
+                best_move_samples=1000,
+                min_best_move_samples=100,
+            )
+        )
+        self.assertFalse(
+            mod._should_trigger_center_bias_gate(
+                enabled=True,
+                eval_index=0,
+                gate_after_evals=1,
+                center_prediction_rate=0.99,
+                gate_threshold=0.6,
+                best_move_samples=1000,
+                min_best_move_samples=100,
+            )
+        )
+        self.assertFalse(
+            mod._should_trigger_center_bias_gate(
+                enabled=True,
+                eval_index=1,
+                gate_after_evals=1,
+                center_prediction_rate=0.99,
+                gate_threshold=0.6,
+                best_move_samples=20,
+                min_best_move_samples=100,
+            )
+        )
+
+    def test_checkpoint_wandb_payload_respects_profile(self) -> None:
+        legacy = mod._checkpoint_wandb_payload(
+            avg_checkpoint_metric=0.61,
+            avg_eval_reward_mean=0.44,
+            wandb_log_profile="legacy",
+        )
+        self.assertIn("checkpoint_avg_metric", legacy)
+        self.assertIn("checkpoint_avg_eval_reward_mean", legacy)
+
+        lean = mod._checkpoint_wandb_payload(
+            avg_checkpoint_metric=0.61,
+            avg_eval_reward_mean=0.44,
+            wandb_log_profile="lean",
+        )
+        self.assertEqual(set(lean.keys()), {"checkpoint_avg_metric_value"})
+
+    def test_select_eval_wandb_metrics_skips_zero_count_task_accuracy(self) -> None:
+        metrics = {
+            "eval_reward_mean": 0.5,
+            "eval_json_parse_rate": 0.9,
+            "eval_best_move_center_prediction_rate": 0.4,
+            "eval_task_accuracy_best_move": 0.45,
+            "eval_task_count_best_move": 100.0,
+            "eval_task_accuracy_turn_player": 0.95,
+            "eval_task_count_turn_player": 0.0,
+        }
+        selected = mod._select_eval_wandb_metrics(metrics)
+        self.assertIn("eval_task_accuracy_best_move", selected)
+        self.assertNotIn("eval_task_accuracy_turn_player", selected)
 
 
 class EvalSubsetAndEarlyStopTests(unittest.TestCase):

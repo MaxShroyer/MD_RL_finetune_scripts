@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
-"""Class-conditional RL finetuning for PI&D symbol detection.
-
-Training behavior:
-- For each sample, build class-conditional prompt candidates.
-- Train on one sampled task per base sample (BallHolder-style batching).
-- For empty samples, create random negative prompts.
-- Optional random negative prompts for non-empty samples.
-
-This matches single-prompt detect APIs while covering many classes.
-"""
+"""Class-conditional RL finetuning for football detection."""
 
 from __future__ import annotations
 
 import argparse
 import base64
-import itertools
 import io
 import json
 import os
@@ -25,7 +15,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 import numpy as np
 from datasets import Dataset, DatasetDict, get_dataset_split_names, load_dataset, load_from_disk
@@ -55,12 +45,24 @@ except ModuleNotFoundError:  # pragma: no cover
 
     wandb = _WandbShim()
 
-# Ensure repo-root imports (tuna_sdk) work when this file is run directly.
-REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parents[0]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tuna_sdk import (
+from football_detect.common import (  # noqa: E402
+    NormalizedBox,
+    clamp,
+    config_to_cli_args,
+    discover_class_names,
+    default_prompt_for_class,
+    load_json_config,
+    normalize_class_name,
+    parse_box_element_annotations,
+    repo_relative,
+    resolve_config_path,
+)
+from tuna_sdk import (  # noqa: E402
     DetectAnnotation,
     DetectOutput,
     DetectRequest,
@@ -70,102 +72,11 @@ from tuna_sdk import (
     TrainStepGroup,
     TunaClient,
 )
-from tuna_sdk import PointAnnotation, PointOutput, PointRequest, PointSettings
-from tuna_sdk.errors import TunaAPIError, TunaNetworkError
+from tuna_sdk.errors import TunaAPIError, TunaNetworkError  # noqa: E402
 
-
-def _repo_relative(*parts: str) -> Path:
-    return Path(__file__).resolve().parent.joinpath(*parts)
-
-
-DEFAULT_CONFIG_PATH = _repo_relative("configs", "train_pid_icons_default.json")
-
-
-def _resolve_config_path(raw_path: str) -> Path:
-    path = Path(raw_path).expanduser()
-    if path.is_absolute():
-        return path
-    from_cwd = (Path.cwd() / path).resolve()
-    if from_cwd.exists():
-        return from_cwd
-    from_repo = (REPO_ROOT / path).resolve()
-    if from_repo.exists():
-        return from_repo
-    from_script = (_repo_relative(path.as_posix())).resolve()
-    if from_script.exists():
-        return from_script
-    return from_cwd
-
-
-def _load_json_config(config_path: Path) -> dict[str, Any]:
-    if not config_path.exists():
-        if config_path == DEFAULT_CONFIG_PATH:
-            return {}
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    payload = json.loads(config_path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError(f"Config must be a JSON object: {config_path}")
-    return payload
-
-
-def _option_for_action(action: argparse.Action) -> str:
-    for opt in action.option_strings:
-        if opt.startswith("--"):
-            return opt
-    return action.option_strings[0]
-
-
-def _config_to_cli_args(
-    parser: argparse.ArgumentParser,
-    config: dict[str, Any],
-    *,
-    config_path: Path,
-    overridden_dests: Optional[set[str]] = None,
-) -> list[str]:
-    overridden = set(overridden_dests or set())
-    by_dest: dict[str, list[argparse.Action]] = {}
-    for action in parser._actions:
-        if not action.option_strings or action.dest == "help":
-            continue
-        by_dest.setdefault(action.dest, []).append(action)
-
-    unknown = sorted(key for key in config if key not in by_dest)
-    if unknown:
-        raise ValueError(
-            f"Unknown config key(s) in {config_path}: {unknown}. "
-            "Remove typos or update script support."
-        )
-
-    cli_args: list[str] = []
-    for key, raw_value in config.items():
-        if key in overridden:
-            continue
-        actions = by_dest[key]
-        const_actions = [a for a in actions if isinstance(a, argparse._StoreConstAction)]
-        store_actions = [a for a in actions if not isinstance(a, argparse._StoreConstAction)]
-
-        if raw_value is None:
-            matched = next((a for a in const_actions if getattr(a, "const", object()) is None), None)
-            if matched is not None:
-                cli_args.append(_option_for_action(matched))
-            continue
-
-        if isinstance(raw_value, bool):
-            matched = next((a for a in const_actions if getattr(a, "const", object()) is raw_value), None)
-            if matched is not None:
-                cli_args.append(_option_for_action(matched))
-            continue
-
-        if not store_actions:
-            continue
-
-        action = store_actions[0]
-        cli_args.append(_option_for_action(action))
-        if isinstance(raw_value, list):
-            cli_args.extend(str(item) for item in raw_value)
-        else:
-            cli_args.append(str(raw_value))
-    return cli_args
+DEFAULT_CONFIG_PATH = repo_relative("configs", "train_football_detect_default.json")
+DEFAULT_BASE_URL = "https://api.moondream.ai/v1"
+VAL_SPLIT_CANDIDATES = ("validation", "val", "dev", "test", "post_val")
 
 
 def _random_suffix(length: int = 6) -> str:
@@ -173,26 +84,11 @@ def _random_suffix(length: int = 6) -> str:
     return "".join(random.choices(chars, k=length))
 
 
-def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
-    return max(lo, min(hi, value))
-
-
 def _to_data_url(image: Image.Image, *, quality: int = 90) -> str:
     buf = io.BytesIO()
     image.save(buf, format="JPEG", quality=max(1, min(100, int(quality))))
     encoded = base64.b64encode(buf.getvalue()).decode("ascii")
     return f"data:image/jpeg;base64,{encoded}"
-
-
-@dataclass(frozen=True)
-class _ReasoningPointRequest(PointRequest):
-    reasoning: bool = False
-
-    def to_payload(self) -> dict[str, Any]:
-        payload = super().to_payload()
-        if bool(self.reasoning):
-            payload["reasoning"] = True
-        return payload
 
 
 @dataclass(frozen=True)
@@ -208,9 +104,9 @@ class _ReasoningDetectRequest(DetectRequest):
 
 @dataclass(frozen=True)
 class ClassBox:
-    class_uid: str
     class_name: str
     box: DetectAnnotation
+    prompt: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -274,480 +170,23 @@ class UsageStats:
     class_tasks_consumed: Counter[str] = field(default_factory=Counter)
 
 
-VAL_SPLIT_CANDIDATES = ("validation", "val", "dev", "test", "post_val")
-
-
-def _extract_class_catalog(payload: Any) -> list[tuple[str, str]]:
-    raw_catalog: Any = None
-    if isinstance(payload, dict) and isinstance(payload.get("class_catalog"), list):
-        raw_catalog = payload.get("class_catalog")
-    elif isinstance(payload, list) and payload and all(isinstance(item, dict) for item in payload):
-        raw_catalog = payload
-
-    if not isinstance(raw_catalog, list):
-        return []
-
-    out: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for item in raw_catalog:
-        if not isinstance(item, dict):
-            continue
-        class_name = str(item.get("class_name", "")).strip()
-        if not class_name:
-            continue
-        class_uid = str(item.get("class_uid") or class_name).strip()
-        pair = (class_uid, class_name)
-        if pair in seen:
-            continue
-        seen.add(pair)
-        out.append(pair)
-        print(f"found class in catalog: uid='{class_uid}', name='{class_name}'")
-    return out
-
-
-def _load_class_catalog(class_names_file: str, dataset_path: Optional[str]) -> list[tuple[str, str]]:
-    if class_names_file:
-        path = Path(class_names_file).expanduser().resolve()
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        catalog = _extract_class_catalog(payload)
-        if catalog:
-            return catalog
-        if isinstance(payload, list):
-            names = [str(item).strip() for item in payload if str(item).strip()]
-            if names:
-                return [(name, name) for name in sorted(set(names))]
-
-    if dataset_path:
-        meta_path = Path(dataset_path).expanduser().resolve() / "metadata.json"
-        if meta_path.exists():
-            payload = json.loads(meta_path.read_text(encoding="utf-8"))
-            catalog = _extract_class_catalog(payload)
-            if catalog:
-                return catalog
-
-    return []
-
-
-def _load_class_names(class_names_file: str, dataset_path: Optional[str]) -> list[str]:
-    catalog = _load_class_catalog(class_names_file, dataset_path)
-    if catalog:
-        names = [name for _, name in catalog if name]
-        if names:
-            return sorted(set(names))
-
-    if class_names_file:
-        path = Path(class_names_file).expanduser().resolve()
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(payload, dict) and "class_catalog" in payload:
-            names = [str(item.get("class_name", "")).strip() for item in payload["class_catalog"]]
-            names = [name for name in names if name]
-            if names:
-                return sorted(set(names))
-        if isinstance(payload, list):
-            names = [str(item).strip() for item in payload if str(item).strip()]
-            if names:
-                return sorted(set(names))
-
-    if dataset_path:
-        meta_path = Path(dataset_path).expanduser().resolve() / "metadata.json"
-        if meta_path.exists():
-            payload = json.loads(meta_path.read_text(encoding="utf-8"))
-            catalog = payload.get("class_catalog") or []
-            names = [str(item.get("class_name", "")).strip() for item in catalog if isinstance(item, dict)]
-            names = [name for name in names if name]
-            if names:
-                return sorted(set(names))
-
-    return []
-
-
-def _class_name_has_digit(name: str) -> bool:
-    return any(char.isdigit() for char in name)
-
-
-def _analyze_class_catalog(catalog: list[tuple[str, str]]) -> tuple[dict[str, list[str]], list[str]]:
-    by_name: dict[str, set[str]] = {}
-    for class_uid, class_name in catalog:
-        if not class_name:
-            continue
-        by_name.setdefault(class_name, set()).add(class_uid or class_name)
-
-    duplicate_names = {
-        class_name: sorted(uids)
-        for class_name, uids in by_name.items()
-        if len(uids) > 1
-    }
-    numeric_names = sorted(name for name in by_name if _class_name_has_digit(name))
-    return duplicate_names, numeric_names
-
-
-def _parse_answer_boxes(value: Any, width: int, height: int) -> list[ClassBox]:
-    if value is None:
-        return []
-    raw = value
-    if isinstance(raw, str):
-        text = raw.strip()
-        if not text:
-            return []
-        try:
-            raw = json.loads(text)
-        except json.JSONDecodeError:
-            return []
-
-    if isinstance(raw, dict):
-        raw = [raw]
-    if not isinstance(raw, list):
-        return []
-
-    parsed: list[ClassBox] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-
-        class_name = str(item.get("class_name") or item.get("source_class_name") or "").strip()
-        class_uid = str(item.get("class_uid") or class_name or "").strip()
-        if not class_name:
-            continue
-
-        x_min = item.get("x_min")
-        y_min = item.get("y_min")
-        x_max = item.get("x_max")
-        y_max = item.get("y_max")
-        try:
-            x_min_f = float(x_min)
-            y_min_f = float(y_min)
-            x_max_f = float(x_max)
-            y_max_f = float(y_max)
-        except (TypeError, ValueError):
-            continue
-
-        # Support both normalized and pixel coords.
-        if max(abs(x_min_f), abs(y_min_f), abs(x_max_f), abs(y_max_f)) > 1.5:
-            if width <= 0 or height <= 0:
-                continue
-            x_min_f = x_min_f / width
-            y_min_f = y_min_f / height
-            x_max_f = x_max_f / width
-            y_max_f = y_max_f / height
-
-        x_min_f = _clamp(x_min_f)
-        y_min_f = _clamp(y_min_f)
-        x_max_f = _clamp(x_max_f)
-        y_max_f = _clamp(y_max_f)
-        if x_max_f <= x_min_f or y_max_f <= y_min_f:
-            continue
-
-        parsed.append(
-            ClassBox(
-                class_uid=class_uid,
-                class_name=class_name,
-                box=DetectAnnotation(x_min=x_min_f, y_min=y_min_f, x_max=x_max_f, y_max=y_max_f),
-            )
-        )
-
-    return parsed
-
-
-def _to_base_sample(row: dict) -> Optional[BaseSample]:
-    image = row.get("image")
-    if image is None:
-        return None
-    image = image.convert("RGB")
-    width, height = image.size
-    boxes = _parse_answer_boxes(row.get("answer_boxes"), width=width, height=height)
-    source = str(row.get("source_collection") or row.get("source_dataset") or "unknown")
-    return BaseSample(image=image, boxes=boxes, source=source)
-
-
-def _group_boxes_by_class(boxes: list[ClassBox]) -> dict[str, tuple[str, list[DetectAnnotation]]]:
-    grouped: dict[str, tuple[str, list[DetectAnnotation]]] = {}
-    for item in boxes:
-        if item.class_uid not in grouped:
-            grouped[item.class_uid] = (item.class_name, [item.box])
-        else:
-            grouped[item.class_uid][1].append(item.box)
-    return grouped
-
-
-def _prompt_for_class(class_name: str, *, style: str = "detect_phrase") -> str:
-    normalized_style = (style or "detect_phrase").strip().lower()
-    if normalized_style == "class_name":
-        return class_name
-    # This string is sent as the `detect`/`point` "object" to Moondream.
-    return f"{class_name} icon or icons"
-
-
-def _tasks_from_base_sample(
-    sample: BaseSample,
-    *,
-    all_class_names: list[str],
-    rng: random.Random,
-    neg_prompts_per_empty: int,
-    neg_prompts_per_nonempty: int,
-    prompt_style: str = "detect_phrase",
-) -> list[TaskSample]:
-    tasks: list[TaskSample] = []
-    grouped = _group_boxes_by_class(sample.boxes)
-    present_names = {item[0] for item in grouped.values()}
-
-    if grouped:
-        for _, (class_name, boxes) in grouped.items():
-            tasks.append(
-                TaskSample(
-                    image=sample.image,
-                    prompt=_prompt_for_class(class_name, style=prompt_style),
-                    gt_boxes=list(boxes),
-                    class_name=class_name,
-                    is_positive=True,
-                    source=sample.source,
-                )
-            )
-
-        absent = [name for name in all_class_names if name not in present_names]
-        if absent and neg_prompts_per_nonempty > 0:
-            picks = rng.sample(absent, k=min(neg_prompts_per_nonempty, len(absent)))
-            for class_name in picks:
-                tasks.append(
-                    TaskSample(
-                        image=sample.image,
-                        prompt=_prompt_for_class(class_name, style=prompt_style),
-                        gt_boxes=[],
-                        class_name=class_name,
-                        is_positive=False,
-                        source=sample.source,
-                    )
-                )
-        return tasks
-
-    if not all_class_names:
-        return []
-
-    if neg_prompts_per_empty <= 0:
-        return []
-
-    k = min(neg_prompts_per_empty, len(all_class_names))
-    if k <= 0:
-        return []
-    picks = rng.sample(all_class_names, k=min(k, len(all_class_names)))
-    for class_name in picks:
-        tasks.append(
-            TaskSample(
-                image=sample.image,
-                prompt=_prompt_for_class(class_name, style=prompt_style),
-                gt_boxes=[],
-                class_name=class_name,
-                is_positive=False,
-                source=sample.source,
-            )
-        )
-    return tasks
+def _to_detect_annotation(box: NormalizedBox) -> DetectAnnotation:
+    return DetectAnnotation(
+        x_min=float(box.x_min),
+        y_min=float(box.y_min),
+        x_max=float(box.x_max),
+        y_max=float(box.y_max),
+    )
 
 
 def _box_from_normalized(x_min: float, y_min: float, x_max: float, y_max: float) -> DetectAnnotation:
-    x_min = _clamp(float(x_min))
-    y_min = _clamp(float(y_min))
-    x_max = _clamp(float(x_max))
-    y_max = _clamp(float(y_max))
-    if x_max <= x_min or y_max <= y_min:
+    x0 = clamp(float(x_min))
+    y0 = clamp(float(y_min))
+    x1 = clamp(float(x_max))
+    y1 = clamp(float(y_max))
+    if x1 <= x0 or y1 <= y0:
         raise ValueError("invalid normalized bbox")
-    return DetectAnnotation(x_min=x_min, y_min=y_min, x_max=x_max, y_max=y_max)
-
-
-def _horizontal_flip(image: Image.Image, boxes: list[ClassBox]) -> tuple[Image.Image, list[ClassBox]]:
-    flipped: list[ClassBox] = []
-    for item in boxes:
-        box = item.box
-        flipped_box = DetectAnnotation(
-            x_min=1.0 - box.x_max,
-            y_min=box.y_min,
-            x_max=1.0 - box.x_min,
-            y_max=box.y_max,
-        )
-        flipped.append(
-            ClassBox(
-                class_uid=item.class_uid,
-                class_name=item.class_name,
-                box=flipped_box,
-            )
-        )
-    return image.transpose(Image.FLIP_LEFT_RIGHT), flipped
-
-
-def _random_crop(
-    image: Image.Image,
-    boxes: list[ClassBox],
-    rng: random.Random,
-    *,
-    scale_min: float,
-    scale_max: float,
-) -> tuple[Image.Image, list[ClassBox]]:
-    width, height = image.size
-    if width < 2 or height < 2:
-        return image, boxes
-    scale_w = rng.uniform(scale_min, scale_max)
-    scale_h = rng.uniform(scale_min, scale_max)
-    crop_w = max(1, int(width * scale_w))
-    crop_h = max(1, int(height * scale_h))
-    if crop_w >= width and crop_h >= height:
-        return image, boxes
-    left = rng.randint(0, max(0, width - crop_w)) if width > crop_w else 0
-    top = rng.randint(0, max(0, height - crop_h)) if height > crop_h else 0
-    right = left + crop_w
-    bottom = top + crop_h
-
-    kept: list[ClassBox] = []
-    for item in boxes:
-        box = item.box
-        x_min = box.x_min * width
-        y_min = box.y_min * height
-        x_max = box.x_max * width
-        y_max = box.y_max * height
-        if x_min >= left and y_min >= top and x_max <= right and y_max <= bottom:
-            kept.append(
-                ClassBox(
-                    class_uid=item.class_uid,
-                    class_name=item.class_name,
-                    box=DetectAnnotation(
-                        x_min=(x_min - left) / crop_w,
-                        y_min=(y_min - top) / crop_h,
-                        x_max=(x_max - left) / crop_w,
-                        y_max=(y_max - top) / crop_h,
-                    ),
-                )
-            )
-    return image.crop((left, top, right, bottom)), kept
-
-
-def _random_stretch(
-    image: Image.Image,
-    rng: random.Random,
-    *,
-    scale_min: float,
-    scale_max: float,
-) -> Image.Image:
-    width, height = image.size
-    scale_x = rng.uniform(scale_min, scale_max)
-    scale_y = rng.uniform(scale_min, scale_max)
-    new_width = max(1, int(width * scale_x))
-    new_height = max(1, int(height * scale_y))
-    if new_width == width and new_height == height:
-        return image
-    return image.resize((new_width, new_height), resample=Image.BICUBIC)
-
-
-def _random_resize(
-    image: Image.Image,
-    boxes: list[ClassBox],
-    rng: random.Random,
-    *,
-    scale_min: float,
-    scale_max: float,
-) -> tuple[Image.Image, list[ClassBox]]:
-    width, height = image.size
-    scale = rng.uniform(scale_min, scale_max)
-    new_width = max(1, int(round(width * scale)))
-    new_height = max(1, int(round(height * scale)))
-    if new_width == width and new_height == height:
-        return image, boxes
-    resized = image.resize((new_width, new_height), resample=Image.BICUBIC)
-    adjusted: list[ClassBox] = []
-    for item in boxes:
-        box = item.box
-        try:
-            adjusted_box = _box_from_normalized(box.x_min, box.y_min, box.x_max, box.y_max)
-        except ValueError:
-            continue
-        adjusted.append(
-            ClassBox(
-                class_uid=item.class_uid,
-                class_name=item.class_name,
-                box=adjusted_box,
-            )
-        )
-    return resized, adjusted
-
-
-def _color_jitter(image: Image.Image, rng: random.Random, config: AugmentConfig) -> Image.Image:
-    image = ImageEnhance.Brightness(image).enhance(rng.uniform(config.brightness_min, config.brightness_max))
-    image = ImageEnhance.Contrast(image).enhance(rng.uniform(config.contrast_min, config.contrast_max))
-    image = ImageEnhance.Color(image).enhance(rng.uniform(config.saturation_min, config.saturation_max))
-    return image
-
-
-def _hue_shift(image: Image.Image, rng: random.Random, config: AugmentConfig) -> Image.Image:
-    delta = rng.uniform(config.hue_delta_min, config.hue_delta_max)
-    shift = int(round(delta * 255.0))
-    if shift == 0:
-        return image
-    hsv = np.asarray(image.convert("HSV"), dtype=np.uint8).copy()
-    hsv[..., 0] = ((hsv[..., 0].astype(np.int16) + shift) % 256).astype(np.uint8)
-    return Image.fromarray(hsv, mode="HSV").convert("RGB")
-
-
-def _add_noise(image: Image.Image, rng_np: np.random.Generator, config: AugmentConfig) -> Image.Image:
-    arr = np.asarray(image).astype(np.float32)
-    std = rng_np.uniform(config.noise_std_min, config.noise_std_max)
-    noise = rng_np.normal(0.0, std, size=arr.shape)
-    arr = np.clip(arr + noise, 0.0, 255.0).astype(np.uint8)
-    return Image.fromarray(arr, mode="RGB")
-
-
-def _augment_base_sample(
-    sample: BaseSample,
-    rng: random.Random,
-    rng_np: np.random.Generator,
-    config: AugmentConfig,
-    *,
-    augment_prob: float,
-) -> BaseSample:
-    image = sample.image
-    boxes = list(sample.boxes)
-
-    # Keep augment_prob as a top-level gate so disabling/reducing augmentation
-    # also disables random resizing.
-    if rng.random() >= augment_prob:
-        return BaseSample(image=image, boxes=boxes, source=sample.source)
-
-    image, boxes = _random_resize(
-        image,
-        boxes,
-        rng,
-        scale_min=config.resize_min,
-        scale_max=config.resize_max,
-    )
-
-    if rng.random() < config.crop_p:
-        pre_crop_image = image
-        pre_crop_boxes = list(boxes)
-        cropped_image, cropped_boxes = _random_crop(
-            image,
-            boxes,
-            rng,
-            scale_min=config.crop_scale_min,
-            scale_max=config.crop_scale_max,
-        )
-        # Match StateFarm behavior: avoid converting positives into empty labels via crop.
-        if pre_crop_boxes and not cropped_boxes:
-            image, boxes = pre_crop_image, pre_crop_boxes
-        else:
-            image, boxes = cropped_image, cropped_boxes
-    if rng.random() < config.flip_p:
-        image, boxes = _horizontal_flip(image, boxes)
-    if rng.random() < config.stretch_p:
-        image = _random_stretch(
-            image,
-            rng,
-            scale_min=config.stretch_min,
-            scale_max=config.stretch_max,
-        )
-    if rng.random() < config.color_p:
-        image = _color_jitter(image, rng, config)
-    if rng.random() < config.hue_p:
-        image = _hue_shift(image, rng, config)
-    if rng.random() < config.noise_p:
-        image = _add_noise(image, rng_np, config)
-
-    return BaseSample(image=image, boxes=boxes, source=sample.source)
+    return DetectAnnotation(x_min=x0, y_min=y0, x_max=x1, y_max=y1)
 
 
 def _default_augment_config() -> AugmentConfig:
@@ -777,6 +216,318 @@ def _default_augment_config() -> AugmentConfig:
     )
 
 
+def _extract_class_names_from_file(path_str: str) -> list[str]:
+    if not path_str:
+        return []
+    path = Path(path_str).expanduser().resolve()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict) and isinstance(payload.get("class_catalog"), list):
+        names = [
+            str(item.get("class_name") or "").strip()
+            for item in payload["class_catalog"]
+            if isinstance(item, dict)
+        ]
+        return sorted({name for name in names if name})
+    if isinstance(payload, list):
+        if payload and all(isinstance(item, dict) for item in payload):
+            names = [str(item.get("class_name") or "").strip() for item in payload]
+            return sorted({name for name in names if name})
+        return sorted({str(item).strip() for item in payload if str(item).strip()})
+    raise ValueError(f"Unsupported class names payload in {path}")
+
+
+def _parse_prompt_overrides_json(raw_value: str) -> dict[str, str]:
+    text = str(raw_value or "").strip()
+    if not text:
+        return {}
+    payload = json.loads(text)
+    if not isinstance(payload, dict):
+        raise ValueError("--prompt-overrides-json must decode to an object")
+    out: dict[str, str] = {}
+    for key, value in payload.items():
+        name = normalize_class_name(key)
+        prompt = str(value or "").strip()
+        if not name or not prompt:
+            continue
+        out[name] = prompt
+    return out
+
+
+def _prompt_for_class(class_name: str, *, prompt_overrides: Mapping[str, str]) -> str:
+    normalized = normalize_class_name(class_name)
+    override = str(prompt_overrides.get(normalized, "") or "").strip()
+    if override:
+        return override
+    return default_prompt_for_class(normalized)
+
+
+def _to_base_sample(row: Mapping[str, Any]) -> Optional[BaseSample]:
+    image = row.get("image")
+    if image is None:
+        return None
+    image = image.convert("RGB")
+    width, height = image.size
+    parsed_boxes = parse_box_element_annotations(row.get("answer_boxes"), width=width, height=height)
+    boxes: list[ClassBox] = []
+    row_class_name = normalize_class_name(row.get("class_name"))
+    row_prompt = str(row.get("prompt") or "").strip()
+    task_schema = str(row.get("task_schema") or "").strip()
+    use_row_prompt = bool(row_prompt) and bool(row_class_name) and (
+        task_schema == "per_box_element" or len(parsed_boxes) == 1
+    )
+    for item in parsed_boxes:
+        annotation = _to_detect_annotation(item.box)
+        prompt = row_prompt if use_row_prompt and row_class_name == item.class_name else None
+        boxes.append(ClassBox(class_name=item.class_name, box=annotation, prompt=prompt))
+    source = str(row.get("source_collection") or row.get("source_dataset") or row.get("source") or "unknown")
+    return BaseSample(image=image, boxes=boxes, source=source)
+
+
+def tasks_from_base_sample(
+    sample: BaseSample,
+    *,
+    all_class_names: list[str],
+    rng: random.Random,
+    neg_prompts_per_empty: int,
+    neg_prompts_per_nonempty: int,
+    prompt_overrides: Mapping[str, str],
+) -> list[TaskSample]:
+    tasks: list[TaskSample] = []
+    present_names = {item.class_name for item in sample.boxes}
+
+    if sample.boxes:
+        for item in sample.boxes:
+            tasks.append(
+                TaskSample(
+                    image=sample.image,
+                    prompt=item.prompt or _prompt_for_class(item.class_name, prompt_overrides=prompt_overrides),
+                    gt_boxes=[item.box],
+                    class_name=item.class_name,
+                    is_positive=True,
+                    source=sample.source,
+                )
+            )
+
+        absent = [name for name in all_class_names if name not in present_names]
+        if absent and neg_prompts_per_nonempty > 0:
+            picks = rng.sample(absent, k=min(neg_prompts_per_nonempty, len(absent)))
+            for class_name in picks:
+                tasks.append(
+                    TaskSample(
+                        image=sample.image,
+                        prompt=_prompt_for_class(class_name, prompt_overrides=prompt_overrides),
+                        gt_boxes=[],
+                        class_name=class_name,
+                        is_positive=False,
+                        source=sample.source,
+                    )
+                )
+        return tasks
+
+    if not all_class_names or neg_prompts_per_empty <= 0:
+        return []
+    picks = rng.sample(all_class_names, k=min(neg_prompts_per_empty, len(all_class_names)))
+    for class_name in picks:
+        tasks.append(
+            TaskSample(
+                image=sample.image,
+                prompt=_prompt_for_class(class_name, prompt_overrides=prompt_overrides),
+                gt_boxes=[],
+                class_name=class_name,
+                is_positive=False,
+                source=sample.source,
+            )
+        )
+    return tasks
+
+
+def _horizontal_flip(image: Image.Image, boxes: list[DetectAnnotation]) -> tuple[Image.Image, list[DetectAnnotation]]:
+    flipped = [
+        DetectAnnotation(
+            x_min=1.0 - box.x_max,
+            y_min=box.y_min,
+            x_max=1.0 - box.x_min,
+            y_max=box.y_max,
+        )
+        for box in boxes
+    ]
+    return image.transpose(Image.FLIP_LEFT_RIGHT), flipped
+
+
+def _random_crop(
+    image: Image.Image,
+    boxes: list[DetectAnnotation],
+    rng: random.Random,
+    *,
+    scale_min: float,
+    scale_max: float,
+) -> tuple[Image.Image, list[DetectAnnotation]]:
+    width, height = image.size
+    if width < 2 or height < 2:
+        return image, boxes
+    scale_w = rng.uniform(scale_min, scale_max)
+    scale_h = rng.uniform(scale_min, scale_max)
+    crop_w = max(1, int(width * scale_w))
+    crop_h = max(1, int(height * scale_h))
+    if crop_w >= width and crop_h >= height:
+        return image, boxes
+    left = rng.randint(0, max(0, width - crop_w)) if width > crop_w else 0
+    top = rng.randint(0, max(0, height - crop_h)) if height > crop_h else 0
+    right = left + crop_w
+    bottom = top + crop_h
+
+    kept: list[DetectAnnotation] = []
+    for box in boxes:
+        x_min = box.x_min * width
+        y_min = box.y_min * height
+        x_max = box.x_max * width
+        y_max = box.y_max * height
+        if x_min >= left and y_min >= top and x_max <= right and y_max <= bottom:
+            kept.append(
+                DetectAnnotation(
+                    x_min=(x_min - left) / crop_w,
+                    y_min=(y_min - top) / crop_h,
+                    x_max=(x_max - left) / crop_w,
+                    y_max=(y_max - top) / crop_h,
+                )
+            )
+    return image.crop((left, top, right, bottom)), kept
+
+
+def _random_stretch(
+    image: Image.Image,
+    rng: random.Random,
+    *,
+    scale_min: float,
+    scale_max: float,
+) -> Image.Image:
+    width, height = image.size
+    scale_x = rng.uniform(scale_min, scale_max)
+    scale_y = rng.uniform(scale_min, scale_max)
+    new_width = max(1, int(width * scale_x))
+    new_height = max(1, int(height * scale_y))
+    if new_width == width and new_height == height:
+        return image
+    return image.resize((new_width, new_height), resample=Image.BICUBIC)
+
+
+def _random_resize(
+    image: Image.Image,
+    boxes: list[DetectAnnotation],
+    rng: random.Random,
+    *,
+    scale_min: float,
+    scale_max: float,
+) -> tuple[Image.Image, list[DetectAnnotation]]:
+    width, height = image.size
+    scale = rng.uniform(scale_min, scale_max)
+    new_width = max(1, int(round(width * scale)))
+    new_height = max(1, int(round(height * scale)))
+    if new_width == width and new_height == height:
+        return image, boxes
+    resized = image.resize((new_width, new_height), resample=Image.BICUBIC)
+    adjusted: list[DetectAnnotation] = []
+    for box in boxes:
+        try:
+            adjusted.append(_box_from_normalized(box.x_min, box.y_min, box.x_max, box.y_max))
+        except ValueError:
+            continue
+    return resized, adjusted
+
+
+def _color_jitter(image: Image.Image, rng: random.Random, config: AugmentConfig) -> Image.Image:
+    image = ImageEnhance.Brightness(image).enhance(rng.uniform(config.brightness_min, config.brightness_max))
+    image = ImageEnhance.Contrast(image).enhance(rng.uniform(config.contrast_min, config.contrast_max))
+    image = ImageEnhance.Color(image).enhance(rng.uniform(config.saturation_min, config.saturation_max))
+    return image
+
+
+def _hue_shift(image: Image.Image, rng: random.Random, config: AugmentConfig) -> Image.Image:
+    delta = rng.uniform(config.hue_delta_min, config.hue_delta_max)
+    shift = int(round(delta * 255.0))
+    if shift == 0:
+        return image
+    hsv = np.asarray(image.convert("HSV"), dtype=np.uint8).copy()
+    hsv[..., 0] = ((hsv[..., 0].astype(np.int16) + shift) % 256).astype(np.uint8)
+    return Image.fromarray(hsv, mode="HSV").convert("RGB")
+
+
+def _add_noise(image: Image.Image, rng_np: np.random.Generator, config: AugmentConfig) -> Image.Image:
+    arr = np.asarray(image).astype(np.float32)
+    std = rng_np.uniform(config.noise_std_min, config.noise_std_max)
+    noise = rng_np.normal(0.0, std, size=arr.shape)
+    arr = np.clip(arr + noise, 0.0, 255.0).astype(np.uint8)
+    return Image.fromarray(arr, mode="RGB")
+
+
+def augment_task_sample(
+    sample: TaskSample,
+    rng: random.Random,
+    rng_np: np.random.Generator,
+    config: AugmentConfig,
+    *,
+    augment_prob: float,
+) -> TaskSample:
+    image = sample.image
+    boxes = list(sample.gt_boxes)
+
+    image, boxes = _random_resize(
+        image,
+        boxes,
+        rng,
+        scale_min=config.resize_min,
+        scale_max=config.resize_max,
+    )
+    if rng.random() >= augment_prob:
+        return TaskSample(
+            image=image,
+            prompt=sample.prompt,
+            gt_boxes=boxes,
+            class_name=sample.class_name,
+            is_positive=sample.is_positive,
+            source=sample.source,
+        )
+
+    if rng.random() < config.crop_p:
+        pre_crop_image = image
+        pre_crop_boxes = list(boxes)
+        cropped_image, cropped_boxes = _random_crop(
+            image,
+            boxes,
+            rng,
+            scale_min=config.crop_scale_min,
+            scale_max=config.crop_scale_max,
+        )
+        if sample.is_positive and pre_crop_boxes and not cropped_boxes:
+            image, boxes = pre_crop_image, pre_crop_boxes
+        else:
+            image, boxes = cropped_image, cropped_boxes
+    if rng.random() < config.flip_p:
+        image, boxes = _horizontal_flip(image, boxes)
+    if rng.random() < config.stretch_p:
+        image = _random_stretch(
+            image,
+            rng,
+            scale_min=config.stretch_min,
+            scale_max=config.stretch_max,
+        )
+    if rng.random() < config.color_p:
+        image = _color_jitter(image, rng, config)
+    if rng.random() < config.hue_p:
+        image = _hue_shift(image, rng, config)
+    if rng.random() < config.noise_p:
+        image = _add_noise(image, rng_np, config)
+
+    return TaskSample(
+        image=image,
+        prompt=sample.prompt,
+        gt_boxes=boxes,
+        class_name=sample.class_name,
+        is_positive=sample.is_positive,
+        source=sample.source,
+    )
+
+
 def _iter_dataset_rows(ds: Dataset, seed: int) -> Iterable[dict]:
     epoch = 0
     while True:
@@ -786,19 +537,18 @@ def _iter_dataset_rows(ds: Dataset, seed: int) -> Iterable[dict]:
         epoch += 1
 
 
-def _load_local_split(dataset_path: str, split: str) -> Dataset:
+def _load_local_dataset_dict(dataset_path: str) -> DatasetDict:
     dataset_obj = load_from_disk(dataset_path)
-    if isinstance(dataset_obj, DatasetDict):
-        if split not in dataset_obj:
-            available = ", ".join(dataset_obj.keys())
-            raise ValueError(f"Split '{split}' not found in local dataset. Available: {available}")
-        return dataset_obj[split]
+    if not isinstance(dataset_obj, DatasetDict):
+        raise ValueError("Local dataset path must contain a DatasetDict with train/val splits.")
     return dataset_obj
 
 
-def _iter_local_rows(dataset_path: str, split: str, seed: int) -> Iterable[dict]:
-    ds = _load_local_split(dataset_path, split)
-    return _iter_dataset_rows(ds, seed)
+def _iter_local_rows_once(dataset_obj: DatasetDict, split: str) -> Iterable[dict]:
+    if split not in dataset_obj:
+        available = ", ".join(dataset_obj.keys())
+        raise ValueError(f"Split '{split}' not found. Available: {available}")
+    return iter(dataset_obj[split])
 
 
 def _iter_hf_rows(dataset_name: str, split: str, token: Optional[str], seed: int, buffer_size: int) -> Iterable[dict]:
@@ -812,50 +562,29 @@ def _iter_hf_rows(dataset_name: str, split: str, token: Optional[str], seed: int
         epoch += 1
 
 
-def _iter_local_rows_once(dataset_obj: Dataset | DatasetDict, split: Optional[str]) -> Iterable[dict]:
-    if isinstance(dataset_obj, DatasetDict):
-        if not split:
-            return iter(())
-        if split not in dataset_obj:
-            available = ", ".join(dataset_obj.keys())
-            raise ValueError(f"Split '{split}' not found. Available: {available}")
-        ds: Dataset = dataset_obj[split]
-    else:
-        ds = dataset_obj
-    return iter(ds)
-
-
-def _iter_hf_rows_once(dataset_name: str, split: Optional[str], token: Optional[str]) -> Iterable[dict]:
-    if not split:
-        return iter(())
+def _iter_hf_rows_once(dataset_name: str, split: str, token: Optional[str]) -> Iterable[dict]:
     return load_dataset(dataset_name, split=split, token=token, streaming=True)
 
 
-def _resolve_hf_splits(
-    *,
-    dataset_name: str,
-    token: Optional[str],
-    requested_train_split: str,
-    requested_val_split: str,
-) -> tuple[str, Optional[str]]:
-    try:
-        names = list(get_dataset_split_names(dataset_name, token=token))
-    except Exception:
-        names = []
+def _resolve_val_split(available_splits: list[str], train_split: str, val_split: str) -> str:
+    if not available_splits:
+        raise ValueError("Dataset exposes no splits.")
 
-    train_split = requested_train_split or "train"
-    if names and train_split not in names:
-        train_split = "train" if "train" in names else names[0]
-
-    if requested_val_split:
-        if names and requested_val_split not in names:
-            raise ValueError(f"--val-split '{requested_val_split}' not found in dataset splits: {names}")
-        return train_split, requested_val_split
-
-    for candidate in VAL_SPLIT_CANDIDATES:
-        if candidate in names:
-            return train_split, candidate
-    return train_split, None
+    train_base_split = train_split.split("[", 1)[0]
+    if not val_split:
+        for candidate in VAL_SPLIT_CANDIDATES:
+            if candidate in available_splits and candidate != train_base_split:
+                return candidate
+        raise ValueError(
+            f"Dataset must already contain a validation split. Available splits: {available_splits}"
+        )
+    if val_split in available_splits:
+        return val_split
+    if "[" in val_split and "]" in val_split:
+        base_split = val_split.split("[", 1)[0]
+        if base_split in available_splits:
+            return val_split
+    raise ValueError(f"val split '{val_split}' not found. Available splits: {available_splits}")
 
 
 def _box_iou(a: DetectAnnotation, b: DetectAnnotation) -> float:
@@ -891,26 +620,25 @@ def _match_ious(predicted: list[DetectAnnotation], ground_truth: list[DetectAnno
     return iou_matrix[row_idx, col_idx]
 
 
-def _reward_miou(
+def _count_tp_fp_fn(
     predicted: list[DetectAnnotation],
     ground_truth: list[DetectAnnotation],
     *,
-    fn_penalty_exponent: float = 1.0,
-    fp_penalty_exponent: float = 1.0,
-    fn_iou_threshold: float = 0.5,
-) -> float:
-    if not predicted and not ground_truth:
-        return 1.0
-    if not predicted or not ground_truth:
-        return 0.0
+    iou_threshold: float = 0.5,
+) -> tuple[int, int, int]:
+    n_pred = len(predicted)
+    n_gt = len(ground_truth)
+    if n_pred == 0 and n_gt == 0:
+        return 0, 0, 0
+    if n_pred == 0:
+        return 0, 0, n_gt
+    if n_gt == 0:
+        return 0, n_pred, 0
     matches = _match_ious(predicted, ground_truth)
-    true_pos = int((matches >= fn_iou_threshold).sum())
-    false_pos = len(predicted) - true_pos
-    false_neg = len(ground_truth) - true_pos
-    weighted_pred = float(true_pos) + (float(false_pos) ** float(fp_penalty_exponent))
-    weighted_gt = float(true_pos) + (float(false_neg) ** float(fn_penalty_exponent))
-    denom = max(weighted_pred, weighted_gt)
-    return float(matches.sum()) / float(denom) if denom else 0.0
+    true_pos = int((matches >= iou_threshold).sum())
+    false_pos = n_pred - true_pos
+    false_neg = n_gt - true_pos
+    return true_pos, false_pos, false_neg
 
 
 def _reward_f1(predicted: list[DetectAnnotation], ground_truth: list[DetectAnnotation]) -> float:
@@ -946,125 +674,56 @@ def _reward_f1_weighted(
     return (2.0 * float(tp)) / denom
 
 
-def _count_tp_fp_fn(
+def _reward_miou(
     predicted: list[DetectAnnotation],
-    ground_truth: list[DetectAnnotation],
-    *,
-    iou_threshold: float = 0.5,
-) -> tuple[int, int, int]:
-    n_pred = len(predicted)
-    n_gt = len(ground_truth)
-    if n_pred == 0 and n_gt == 0:
-        return 0, 0, 0
-    if n_pred == 0:
-        return 0, 0, n_gt
-    if n_gt == 0:
-        return 0, n_pred, 0
-    matches = _match_ious(predicted, ground_truth)
-    true_pos = int((matches >= iou_threshold).sum())
-    false_pos = n_pred - true_pos
-    false_neg = n_gt - true_pos
-    return true_pos, false_pos, false_neg
-
-
-def _point_in_box(point: PointAnnotation, box: DetectAnnotation) -> bool:
-    return (box.x_min <= point.x <= box.x_max) and (box.y_min <= point.y <= box.y_max)
-
-
-def _match_points_in_boxes(points: list[PointAnnotation], ground_truth: list[DetectAnnotation]) -> int:
-    n_points = len(points)
-    n_gt = len(ground_truth)
-    if n_points == 0 or n_gt == 0:
-        return 0
-    size = max(n_points, n_gt)
-    score = np.zeros((size, size), dtype=np.float32)
-    for i, gt in enumerate(ground_truth):
-        for j, pt in enumerate(points):
-            score[i, j] = 1.0 if _point_in_box(pt, gt) else 0.0
-    cost = -score
-    row_idx, col_idx = linear_sum_assignment(cost)
-    return int(score[row_idx, col_idx].sum())
-
-
-def _count_tp_fp_fn_points(
-    points: list[PointAnnotation],
-    ground_truth: list[DetectAnnotation],
-) -> tuple[int, int, int]:
-    n_points = len(points)
-    n_gt = len(ground_truth)
-    if n_points == 0 and n_gt == 0:
-        return 0, 0, 0
-    if n_points == 0:
-        return 0, 0, n_gt
-    if n_gt == 0:
-        return 0, n_points, 0
-    tp = _match_points_in_boxes(points, ground_truth)
-    fp = n_points - tp
-    fn = n_gt - tp
-    return tp, fp, fn
-
-
-def _reward_f1_points(
-    points: list[PointAnnotation],
     ground_truth: list[DetectAnnotation],
     *,
     fn_penalty_exponent: float = 1.0,
     fp_penalty_exponent: float = 1.0,
+    fn_iou_threshold: float = 0.5,
 ) -> float:
-    tp, fp, fn = _count_tp_fp_fn_points(points, ground_truth)
-    if tp == 0 and fp == 0 and fn == 0:
+    if not predicted and not ground_truth:
         return 1.0
-    weighted_fp = float(fp) ** float(fp_penalty_exponent)
-    weighted_fn = float(fn) ** float(fn_penalty_exponent)
-    denom = (2.0 * float(tp)) + weighted_fp + weighted_fn
-    if denom <= 0.0:
+    if not predicted or not ground_truth:
         return 0.0
-    return (2.0 * float(tp)) / denom
+    matches = _match_ious(predicted, ground_truth)
+    true_pos = int((matches >= fn_iou_threshold).sum())
+    false_pos = len(predicted) - true_pos
+    false_neg = len(ground_truth) - true_pos
+    weighted_pred = float(true_pos) + (float(false_pos) ** float(fp_penalty_exponent))
+    weighted_gt = float(true_pos) + (float(false_neg) ** float(fn_penalty_exponent))
+    denom = max(weighted_pred, weighted_gt)
+    return float(matches.sum()) / float(denom) if denom else 0.0
 
 
 def _rewards_for_rollouts(
     rollouts: list[Rollout],
     gt_boxes: list[DetectAnnotation],
     *,
-    skill: str = "detect",
-    reward_metric: str = "f1",
-    fn_penalty_exponent: float = 1.0,
-    fp_penalty_exponent: float = 1.0,
-    neg_reward_weight: float = 1.0,
+    reward_metric: str,
+    fn_penalty_exponent: float,
+    fp_penalty_exponent: float,
+    neg_reward_weight: float,
 ) -> list[float]:
     rewards: list[float] = []
     is_negative_task = len(gt_boxes) == 0
-    effective_skill = (skill or "detect").strip().lower()
-    if effective_skill == "point" and reward_metric == "miou":
-        print("warning: reward_metric='miou' is not defined for point outputs; using point F1 instead.")
-        reward_metric = "f1"
     for rollout in rollouts:
-        if effective_skill == "point":
-            output = rollout.output
-            pred_points = output.points if isinstance(output, PointOutput) else []
-            reward = _reward_f1_points(
-                pred_points,
+        output = rollout.output
+        pred_boxes = output.objects if isinstance(output, DetectOutput) else []
+        if reward_metric == "miou":
+            reward = _reward_miou(
+                pred_boxes,
                 gt_boxes,
                 fn_penalty_exponent=fn_penalty_exponent,
                 fp_penalty_exponent=fp_penalty_exponent,
             )
         else:
-            output = rollout.output
-            pred_boxes = output.objects if isinstance(output, DetectOutput) else []
-            if reward_metric == "miou":
-                reward = _reward_miou(
-                    pred_boxes,
-                    gt_boxes,
-                    fn_penalty_exponent=fn_penalty_exponent,
-                    fp_penalty_exponent=fp_penalty_exponent,
-                )
-            else:
-                reward = _reward_f1_weighted(
-                    pred_boxes,
-                    gt_boxes,
-                    fn_penalty_exponent=fn_penalty_exponent,
-                    fp_penalty_exponent=fp_penalty_exponent,
-                )
+            reward = _reward_f1_weighted(
+                pred_boxes,
+                gt_boxes,
+                fn_penalty_exponent=fn_penalty_exponent,
+                fp_penalty_exponent=fp_penalty_exponent,
+            )
         if is_negative_task:
             reward *= float(neg_reward_weight)
         rewards.append(float(reward))
@@ -1110,10 +769,7 @@ def _is_reasoning_unsupported_error(exc: Exception) -> bool:
     if body is None:
         text = str(exc)
         return "reasoning" in text and "extra_forbidden" in text
-    if isinstance(body, dict):
-        body_text = json.dumps(body, ensure_ascii=True)
-    else:
-        body_text = str(body)
+    body_text = json.dumps(body, ensure_ascii=True) if isinstance(body, dict) else str(body)
     lowered = body_text.lower()
     return "reasoning" in lowered and "extra_forbidden" in lowered
 
@@ -1121,7 +777,7 @@ def _is_reasoning_unsupported_error(exc: Exception) -> bool:
 def _rollouts_batch_with_retry(
     *,
     finetune,
-    requests: list[DetectRequest | PointRequest],
+    requests: list[DetectRequest],
     num_rollouts: int,
     max_workers: int,
     retries: int,
@@ -1156,6 +812,7 @@ def _evaluate(
     finetune,
     eval_rows: Iterable[dict],
     all_class_names: list[str],
+    prompt_overrides: Mapping[str, str],
     rng: random.Random,
     neg_prompts_per_empty: int,
     neg_prompts_per_nonempty: int,
@@ -1168,8 +825,6 @@ def _evaluate(
     top_p: float,
     max_tokens: int,
     max_objects: int,
-    skill: str,
-    point_prompt_style: str,
     reasoning: bool,
 ) -> dict[str, float]:
     tasks: list[TaskSample] = []
@@ -1179,7 +834,6 @@ def _evaluate(
     total_tp = 0
     total_fp = 0
     total_fn = 0
-    effective_skill = (skill or "detect").strip().lower()
     reasoning_failure_hint_emitted = False
 
     def _drain_batch(batch: list[TaskSample]) -> None:
@@ -1189,35 +843,20 @@ def _evaluate(
         chunk_size = max(1, min(max_workers, len(batch)))
         for offset in range(0, len(batch), chunk_size):
             chunk = batch[offset : offset + chunk_size]
-            if effective_skill == "point":
-                requests = [
-                    _ReasoningPointRequest(
-                        object_name=item.prompt,
-                        image_url=_to_data_url(item.image, quality=92),
-                        settings=PointSettings(
-                            temperature=temperature,
-                            top_p=top_p,
-                            max_tokens=max_tokens,
-                        ),
-                        reasoning=bool(reasoning),
-                    )
-                    for item in chunk
-                ]
-            else:
-                requests = [
-                    _ReasoningDetectRequest(
-                        object_name=item.prompt,
-                        image_url=_to_data_url(item.image, quality=92),
-                        settings=DetectSettings(
-                            temperature=temperature,
-                            top_p=top_p,
-                            max_tokens=max_tokens,
-                            max_objects=max_objects,
-                        ),
-                        reasoning=bool(reasoning),
-                    )
-                    for item in chunk
-                ]
+            requests = [
+                _ReasoningDetectRequest(
+                    object_name=item.prompt,
+                    image_url=_to_data_url(item.image, quality=92),
+                    settings=DetectSettings(
+                        temperature=temperature,
+                        top_p=top_p,
+                        max_tokens=max_tokens,
+                        max_objects=max_objects,
+                    ),
+                    reasoning=bool(reasoning),
+                )
+                for item in chunk
+            ]
             try:
                 results = _rollouts_batch_with_retry(
                     finetune=finetune,
@@ -1237,47 +876,21 @@ def _evaluate(
                 print(f"eval rollouts_batch failed: {_format_tuna_error(exc)}. skipping chunk")
                 if bool(reasoning) and not reasoning_failure_hint_emitted:
                     print(
-                        "hint: this may indicate reasoning is not supported for detect/point tuning rollouts in "
+                        "hint: this may indicate reasoning is not supported for detect tuning rollouts in "
                         "your current API path. Try --no-reasoning --no-eval-reasoning."
                     )
                     reasoning_failure_hint_emitted = True
                 continue
 
-            if len(results) != len(chunk):
-                print(
-                    f"warning: eval returned {len(results)} results for {len(chunk)} requests; "
-                    "only aligned results are scored."
-                )
-
             for item, result in zip(chunk, results):
-                if not result.rollouts:
-                    if effective_skill == "point":
-                        pred_points: list[PointAnnotation] = []
-                        total_f1 += _reward_f1_points(pred_points, item.gt_boxes)
-                        tp, fp, fn = _count_tp_fp_fn_points(pred_points, item.gt_boxes)
-                    else:
-                        pred_boxes: list[DetectAnnotation] = []
-                        total_f1 += _reward_f1(pred_boxes, item.gt_boxes)
-                        total_miou += _reward_miou(pred_boxes, item.gt_boxes)
-                        tp, fp, fn = _count_tp_fp_fn(pred_boxes, item.gt_boxes)
-                    total_tp += tp
-                    total_fp += fp
-                    total_fn += fn
-                    total += 1
-                    continue
-
-                rollout0 = result.rollouts[0]
-                if effective_skill == "point":
-                    output = rollout0.output
-                    pred_points = output.points if isinstance(output, PointOutput) else []
-                    total_f1 += _reward_f1_points(pred_points, item.gt_boxes)
-                    tp, fp, fn = _count_tp_fp_fn_points(pred_points, item.gt_boxes)
-                else:
+                pred_boxes: list[DetectAnnotation] = []
+                if result.rollouts:
+                    rollout0 = result.rollouts[0]
                     output = rollout0.output
                     pred_boxes = output.objects if isinstance(output, DetectOutput) else []
-                    total_f1 += _reward_f1(pred_boxes, item.gt_boxes)
-                    total_miou += _reward_miou(pred_boxes, item.gt_boxes)
-                    tp, fp, fn = _count_tp_fp_fn(pred_boxes, item.gt_boxes)
+                total_f1 += _reward_f1(pred_boxes, item.gt_boxes)
+                total_miou += _reward_miou(pred_boxes, item.gt_boxes)
+                tp, fp, fn = _count_tp_fp_fn(pred_boxes, item.gt_boxes)
                 total_tp += tp
                 total_fp += fp
                 total_fn += fn
@@ -1287,13 +900,13 @@ def _evaluate(
         base = _to_base_sample(row)
         if base is None:
             continue
-        task_list = _tasks_from_base_sample(
+        task_list = tasks_from_base_sample(
             base,
             all_class_names=all_class_names,
             rng=rng,
             neg_prompts_per_empty=neg_prompts_per_empty,
             neg_prompts_per_nonempty=neg_prompts_per_nonempty,
-            prompt_style=point_prompt_style,
+            prompt_overrides=prompt_overrides,
         )
         for task in task_list:
             tasks.append(task)
@@ -1332,14 +945,6 @@ def _evaluate(
     }
 
 
-def _local_split_size(dataset_obj: Dataset | DatasetDict, split: Optional[str]) -> Optional[int]:
-    if isinstance(dataset_obj, DatasetDict):
-        if not split or split not in dataset_obj:
-            return None
-        return len(dataset_obj[split])
-    return len(dataset_obj)
-
-
 def _counter_top(counter: Counter[str], top_k: int) -> list[tuple[str, int]]:
     if top_k <= 0:
         return []
@@ -1355,7 +960,6 @@ def _usage_snapshot(
     row_coverage = 0.0
     if total_train_rows and total_train_rows > 0:
         row_coverage = usage.rows_seen / float(total_train_rows)
-
     return {
         "rows_seen": usage.rows_seen,
         "rows_with_boxes": usage.rows_with_boxes,
@@ -1375,7 +979,7 @@ def _usage_snapshot(
     }
 
 
-def _print_usage_snapshot(snapshot: dict[str, Any], *, prefix: str) -> None:
+def _print_usage_snapshot(snapshot: Mapping[str, Any], *, prefix: str) -> None:
     rows_seen = int(snapshot.get("rows_seen", 0))
     rows_seen_fraction = float(snapshot.get("rows_seen_fraction", 0.0)) * 100.0
     tasks_generated = int(snapshot.get("tasks_generated", 0))
@@ -1389,41 +993,72 @@ def _print_usage_snapshot(snapshot: dict[str, Any], *, prefix: str) -> None:
     print(f"{prefix} class_tasks_consumed_top={snapshot.get('class_tasks_consumed_top', [])}")
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def _resolve_env_file(env_file: str) -> str:
+    path = Path(env_file).expanduser()
+    if path.is_absolute():
+        return str(path)
+
+    from_cwd = (Path.cwd() / path).resolve()
+    if from_cwd.exists():
+        return str(from_cwd)
+
+    from_repo = (REPO_ROOT / path).resolve()
+    if from_repo.exists():
+        return str(from_repo)
+
+    from_script = (repo_relative(path.as_posix())).resolve()
+    if from_script.exists():
+        return str(from_script)
+
+    return str(from_cwd)
+
+
+def _resolve_runtime_env(args: argparse.Namespace) -> argparse.Namespace:
+    args.env_file = _resolve_env_file(str(args.env_file))
+    args.api_key_env_var = str(getattr(args, "api_key_env_var", "") or "").strip() or "MOONDREAM_API_KEY"
+    load_dotenv(args.env_file, override=True)
+    if not args.api_key:
+        args.api_key = os.environ.get(args.api_key_env_var, "")
+    if not args.api_key and args.api_key_env_var != "MOONDREAM_API_KEY":
+        args.api_key = os.environ.get("MOONDREAM_API_KEY", "")
+    if not args.hf_token:
+        args.hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    if not args.base_url:
+        args.base_url = os.environ.get("TUNA_BASE_URL", DEFAULT_BASE_URL)
+    return args
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
     pre_args, _ = pre_parser.parse_known_args(raw_argv)
-    config_path = _resolve_config_path(pre_args.config)
-    config = _load_json_config(config_path)
+    config_path = resolve_config_path(pre_args.config, script_dir=SCRIPT_DIR)
+    config = load_json_config(config_path, default_path=DEFAULT_CONFIG_PATH)
 
-    parser = argparse.ArgumentParser(description="RL finetune Moondream for PI&D icon detection (class-conditional).")
+    parser = argparse.ArgumentParser(description="RL finetune Moondream for football detection.")
     parser.add_argument("--config", default=str(config_path))
-    parser.add_argument("--env-file", default=str(_repo_relative(".env")))
-    parser.add_argument("--api-key", default=os.environ.get("MOONDREAM_API_KEY"))
+    parser.add_argument("--env-file", default=str(repo_relative(".env")))
+    parser.add_argument("--api-key", default="")
+    parser.add_argument("--api-key-env-var", default="MOONDREAM_API_KEY")
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN"))
-    parser.add_argument("--base-url", default=os.environ.get("TUNA_BASE_URL", "https://api.moondream.ai/v1"))
+    parser.add_argument("--base-url", default="")
 
-    parser.add_argument("--dataset-path", default="")
-    parser.add_argument("--dataset-name", default="maxs-m87/pid-icons-merged" )
+    parser.add_argument(
+        "--dataset-path",
+        default=str(repo_relative("outputs", "maxs-m87_football_detect_no_split_splits")),
+    )
+    parser.add_argument("--dataset-name", default="")
     parser.add_argument("--split", default="train")
     parser.add_argument(
         "--val-split",
         default="",
-        help="Validation split name. If omitted, uses dataset validation/val/dev/test/post_val when present; otherwise auto-splits.",
+        help="Validation split name. If omitted, uses validation/val/dev/test/post_val when present.",
     )
-    parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--class-names-file", default="")
-    parser.add_argument(
-        "--allow-duplicate-class-names",
-        action="store_true",
-        help="Deprecated no-op: duplicate class_name values now warn and do not fail.",
-    )
-    parser.add_argument(
-        "--fail-on-numeric-class-names",
-        action="store_true",
-        help="Fail if any class name contains digits (0-9).",
-    )
+    parser.add_argument("--include-classes", nargs="*", default=None)
+    parser.add_argument("--exclude-classes", nargs="*", default=None)
+    parser.add_argument("--prompt-overrides-json", default="{}")
 
     parser.add_argument("--finetune-id", default="")
     parser.add_argument("--finetune-name", default="")
@@ -1445,22 +1080,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--max-objects", type=int, default=50)
     parser.add_argument(
-        "--skill",
-        choices=["detect", "point"],
-        default="detect",
-        help="Which Moondream vision skill to train/eval against. In 'point' mode, a prediction counts as correct if the returned point lies inside any GT bbox.",
-    )
-    parser.add_argument(
         "--reward-metric",
         choices=["f1", "miou"],
         default="f1",
-        help="Training reward metric for rollouts. Use 'f1' to focus optimization on detection F1.",
-    )
-    parser.add_argument(
-        "--point-prompt-style",
-        choices=["detect_phrase", "class_name"],
-        default="detect_phrase",
-        help="Prompt style for class-conditional point training/eval tasks.",
+        help="Training reward metric for detect rollouts.",
     )
 
     reasoning_group = parser.add_mutually_exclusive_group()
@@ -1514,58 +1137,28 @@ def main(argv: Optional[list[str]] = None) -> None:
         "--fn-penalty-exponent",
         type=float,
         default=1.0,
-        help="Exponent for false negatives in reward denominator via FN^exp; >1.0 penalizes missed GT boxes more.",
+        help="Exponent for false negatives in reward denominator via FN^exp.",
     )
     parser.add_argument(
         "--fp-penalty-exponent",
         type=float,
         default=1.0,
-        help="Exponent for false positives in reward denominator via FP^exp; >1.0 penalizes extra detections more.",
+        help="Exponent for false positives in reward denominator via FP^exp.",
     )
 
-    parser.add_argument("--neg-prompts-per-empty", type=int, default=1)
-    parser.add_argument("--neg-prompts-per-nonempty", type=int, default=0)
+    parser.add_argument("--neg-prompts-per-empty", type=int, default=0)
+    parser.add_argument("--neg-prompts-per-nonempty", type=int, default=1)
     parser.add_argument(
         "--pos-task-prob",
         type=float,
         default=0.95,
-        help=(
-            "When a sampled base image has positive tasks, choose a positive task with this probability "
-            "(otherwise sample a negative task from that same image when available)."
-        ),
+        help="When an image has positive tasks, choose a positive task with this probability.",
     )
     parser.add_argument(
         "--neg-reward-weight",
         type=float,
         default=0.5,
-        help="Scale factor applied to rewards for negative tasks (no GT boxes). Range: (0, 1].",
-    )
-    parser.add_argument(
-        "--use-recall-first-preset",
-        action="store_true",
-        help=(
-            "Apply recall-first point defaults: lr=5e-4, pos_task_prob=0.995, "
-            "neg_prompts_per_nonempty=0, neg_prompts_per_empty=1, neg_reward_weight=0.15, "
-            "fn_penalty_exponent=2.0, fp_penalty_exponent=1.0." 
-        ),
-    )
-    parser.add_argument(
-        "--recall-gate-step",
-        type=int,
-        default=40,
-        help="First eval step at/after which recall TP gate is checked.",
-    )
-    parser.add_argument(
-        "--recall-drop-threshold",
-        type=float,
-        default=0.25,
-        help="Maximum allowed TP drop vs baseline for recall gate. 0.25 means <=25%% drop.",
-    )
-    parser.add_argument(
-        "--f1-improvement-target",
-        type=float,
-        default=0.01,
-        help="Required best eval_f1 improvement over baseline eval_f1.",
+        help="Scale factor applied to rewards for negative tasks (no GT boxes).",
     )
     parser.add_argument("--augment-prob", type=float, default=0.5)
     parser.add_argument("--eval-temperature", type=float, default=0.0)
@@ -1585,10 +1178,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         "--usage-top-k",
         type=int,
         default=30,
-        help="How many sources/classes to include in usage distribution summaries.",
+        help="How many sources/classes to include in usage summaries.",
     )
-    parser.add_argument("--wandb-project", default="moondream-pid-icons-rl")
+    parser.add_argument("--wandb-project", default="moondream-football-detect-rl")
     parser.add_argument("--wandb-run-name", default="")
+
     option_to_dest: dict[str, str] = {}
     for action in parser._actions:
         if not action.option_strings:
@@ -1596,36 +1190,23 @@ def main(argv: Optional[list[str]] = None) -> None:
         for opt in action.option_strings:
             option_to_dest[opt] = action.dest
     overridden_dests = {option_to_dest[arg] for arg in raw_argv if arg in option_to_dest}
-    config_cli_args = _config_to_cli_args(
+    config_cli_args = config_to_cli_args(
         parser,
         config,
         config_path=config_path,
         overridden_dests=overridden_dests,
     )
     args = parser.parse_args(config_cli_args + raw_argv)
-    args.config = str(_resolve_config_path(args.config))
+    args.config = str(resolve_config_path(args.config, script_dir=SCRIPT_DIR))
+    args.include_classes = list(args.include_classes or [])
+    args.exclude_classes = list(args.exclude_classes or [])
+    args.prompt_overrides = _parse_prompt_overrides_json(args.prompt_overrides_json)
+    return args
 
-    if args.use_recall_first_preset:
-        args.lr = 5e-4
-        args.pos_task_prob = 0.995
-        args.neg_prompts_per_nonempty = 0
-        args.neg_prompts_per_empty = 1
-        args.neg_reward_weight = 0.15
-        args.fn_penalty_exponent = 2.0
-        args.fp_penalty_exponent = 2.0
-        print(
-            "applied recall-first preset: "
-            "lr=5e-4 pos_task_prob=0.995 neg_prompts_per_nonempty=0 "
-            "neg_prompts_per_empty=1 neg_reward_weight=0.15 fn_exp=2.0 fp_exp=1.0"
-        )
 
-    load_dotenv(args.env_file, override=False)
-    if not args.api_key:
-        args.api_key = os.environ.get("MOONDREAM_API_KEY")
-    if not args.hf_token:
-        args.hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-    if not args.base_url:
-        args.base_url = os.environ.get("TUNA_BASE_URL", "https://api.moondream.ai/v1")
+def main(argv: Optional[list[str]] = None) -> None:
+    args = parse_args(argv)
+    args = _resolve_runtime_env(args)
 
     if not args.api_key:
         raise ValueError("MOONDREAM_API_KEY is required")
@@ -1640,8 +1221,6 @@ def main(argv: Optional[list[str]] = None) -> None:
         args.neg_reward_weight = 1.0
     if not (0.0 <= args.augment_prob <= 1.0):
         raise ValueError("--augment-prob must be in [0, 1]")
-    if not (0.0 < args.val_fraction < 1.0):
-        raise ValueError("--val-fraction must be in (0, 1)")
     if args.usage_top_k < 0:
         raise ValueError("--usage-top-k must be >= 0")
     if args.off_policy_min_reward <= 0.0:
@@ -1656,12 +1235,6 @@ def main(argv: Optional[list[str]] = None) -> None:
         raise ValueError("--rollout-retries must be >= 0")
     if args.rollout_retry_backoff_s <= 0.0:
         raise ValueError("--rollout-retry-backoff-s must be > 0")
-    if args.recall_gate_step < 0:
-        raise ValueError("--recall-gate-step must be >= 0")
-    if not (0.0 <= args.recall_drop_threshold < 1.0):
-        raise ValueError("--recall-drop-threshold must be in [0, 1)")
-    if args.f1_improvement_target < 0.0:
-        raise ValueError("--f1-improvement-target must be >= 0")
 
     eval_reasoning = bool(args.reasoning) if args.eval_reasoning is None else bool(args.eval_reasoning)
     off_policy_injection_allowed = bool(
@@ -1673,12 +1246,13 @@ def main(argv: Optional[list[str]] = None) -> None:
             "Set --allow-off-policy-with-reasoning to override."
         )
 
-    dataset_path = args.dataset_path.strip()
-    dataset_name = args.dataset_name.strip()
+    dataset_path = str(args.dataset_path or "").strip()
+    dataset_name = str(args.dataset_name or "").strip()
     use_local = bool(dataset_path)
-
-    all_class_names = _load_class_names(args.class_names_file, dataset_path if use_local else None)
-    class_catalog = _load_class_catalog(args.class_names_file, dataset_path if use_local else None)
+    if use_local and dataset_name:
+        print("warning: both --dataset-path and --dataset-name provided; using --dataset-path.")
+    if not use_local and not dataset_name:
+        raise ValueError("Provide --dataset-path or --dataset-name.")
 
     rng = random.Random(args.seed)
     rng_np = np.random.default_rng(args.seed)
@@ -1686,149 +1260,68 @@ def main(argv: Optional[list[str]] = None) -> None:
     usage = UsageStats()
     total_train_rows: Optional[int] = None
     total_val_rows: Optional[int] = None
-    discovery_train_rows_consumed = 0
 
-    eval_rows_factory: Callable[[], Iterable[dict]] = lambda: iter(())
-    has_eval_rows = False
-    train_split = args.split
+    eval_rows_factory: Callable[[], Iterable[dict]]
+    train_row_iter: Iterable[dict]
+    train_split = args.split.strip() or "train"
     requested_val_split = args.val_split.strip()
-    val_split: Optional[str] = requested_val_split or None
-    auto_val_split = False
-    eval_dataset: Optional[Dataset] = None
+    val_split: str
 
     if use_local:
-        dataset_obj = load_from_disk(dataset_path)
-        if isinstance(dataset_obj, DatasetDict):
-            train_split = args.split if args.split in dataset_obj else ("train" if "train" in dataset_obj else args.split)
-            if requested_val_split:
-                if requested_val_split not in dataset_obj:
-                    raise ValueError(
-                        f"--val-split '{requested_val_split}' not found in local dataset splits: {list(dataset_obj)}"
-                    )
-                val_split = requested_val_split
-            else:
-                val_split = "val" if "val" in dataset_obj else ("validation" if "validation" in dataset_obj else None)
-        else:
-            train_split = args.split
-            val_split = requested_val_split or None
+        dataset_obj = _load_local_dataset_dict(dataset_path)
+        if train_split not in dataset_obj:
+            raise ValueError(f"train split '{train_split}' not found in local dataset splits: {list(dataset_obj)}")
+        val_split = _resolve_val_split(list(dataset_obj.keys()), train_split, requested_val_split)
+        train_ds = dataset_obj[train_split]
+        train_row_iter = _iter_dataset_rows(train_ds, args.seed)
+        total_train_rows = len(train_ds)
+        total_val_rows = len(dataset_obj[val_split])
 
-        if not val_split:
-            full_ds = _load_local_split(dataset_path, train_split)
-            split_ds = full_ds.train_test_split(test_size=args.val_fraction, seed=args.seed, shuffle=True)
-            train_ds = split_ds["train"]
-            eval_dataset = split_ds["test"]
-            train_row_iter = _iter_dataset_rows(train_ds, args.seed)
-            total_train_rows = len(train_ds)
-            total_val_rows = len(eval_dataset)
-            val_split = f"auto({train_split})"
-            auto_val_split = True
-            has_eval_rows = True
+        def _local_eval_rows() -> Iterable[dict]:
+            return _iter_local_rows_once(dataset_obj, val_split)
 
-            def _local_auto_eval_rows() -> Iterable[dict]:
-                return iter(eval_dataset) if eval_dataset is not None else iter(())
-
-            eval_rows_factory = _local_auto_eval_rows
-        else:
-            train_ds = _load_local_split(dataset_path, train_split)
-            train_row_iter = _iter_dataset_rows(train_ds, args.seed)
-            total_train_rows = len(train_ds)
-            total_val_rows = _local_split_size(dataset_obj, val_split)
-            has_eval_rows = True
-
-            def _local_eval_rows() -> Iterable[dict]:
-                return _iter_local_rows_once(dataset_obj, val_split)
-
-            eval_rows_factory = _local_eval_rows
+        eval_rows_factory = _local_eval_rows
+        class_source_rows: Iterable[Mapping[str, Any]] = iter(train_ds)
     else:
-        if not dataset_name:
-            raise ValueError("Provide --dataset-path or --dataset-name")
+        split_names = list(get_dataset_split_names(dataset_name, token=args.hf_token))
+        if train_split not in split_names:
+            raise ValueError(f"train split '{train_split}' not found in dataset splits: {split_names}")
+        val_split = _resolve_val_split(split_names, train_split, requested_val_split)
+        train_row_iter = _iter_hf_rows(dataset_name, train_split, args.hf_token, args.seed, args.buffer_size)
 
-        train_split, resolved_val = _resolve_hf_splits(
-            dataset_name=dataset_name,
-            token=args.hf_token,
-            requested_train_split=args.split,
-            requested_val_split=requested_val_split,
-        )
-        if resolved_val is None:
-            full_ds = load_dataset(dataset_name, split=train_split, token=args.hf_token, streaming=False)
-            split_ds = full_ds.train_test_split(test_size=args.val_fraction, seed=args.seed, shuffle=True)
-            train_ds = split_ds["train"]
-            eval_dataset = split_ds["test"]
-            train_row_iter = _iter_dataset_rows(train_ds, args.seed)
-            total_train_rows = len(train_ds)
-            total_val_rows = len(eval_dataset)
-            val_split = f"auto({train_split})"
-            auto_val_split = True
-            has_eval_rows = True
+        def _hf_eval_rows() -> Iterable[dict]:
+            return _iter_hf_rows_once(dataset_name, val_split, args.hf_token)
 
-            def _hf_auto_eval_rows() -> Iterable[dict]:
-                return iter(eval_dataset) if eval_dataset is not None else iter(())
+        eval_rows_factory = _hf_eval_rows
+        class_source_rows = _iter_hf_rows_once(dataset_name, train_split, args.hf_token)
 
-            eval_rows_factory = _hf_auto_eval_rows
-        else:
-            val_split = resolved_val
-            train_row_iter = _iter_hf_rows(dataset_name, train_split, args.hf_token, args.seed, args.buffer_size)
-            has_eval_rows = True
-
-            def _hf_eval_rows() -> Iterable[dict]:
-                return _iter_hf_rows_once(dataset_name, val_split, args.hf_token)
-
-            eval_rows_factory = _hf_eval_rows
-
+    all_class_names = _extract_class_names_from_file(args.class_names_file)
     if not all_class_names:
-        # Fallback: scan eval rows first, then train stream as needed.
-        discovered: set[str] = set()
-        if has_eval_rows:
-            for row in itertools.islice(eval_rows_factory(), 5000):
-                base = _to_base_sample(row)
-                if not base:
-                    continue
-                for item in base.boxes:
-                    if item.class_name:
-                        discovered.add(item.class_name)
-        if not discovered:
-            for _ in range(2000):
-                row = next(train_row_iter)
-                discovery_train_rows_consumed += 1
-                base = _to_base_sample(row)
-                if not base:
-                    continue
-                for item in base.boxes:
-                    if item.class_name:
-                        discovered.add(item.class_name)
-        all_class_names = sorted(discovered)
-
+        all_class_names = discover_class_names(class_source_rows)
     if not all_class_names:
-        raise ValueError("Could not resolve class names for prompting.")
+        raise ValueError("Could not resolve class names for prompting from the train split.")
 
-    if not class_catalog:
-        class_catalog = [(name, name) for name in all_class_names]
-    duplicate_class_names, numeric_class_names = _analyze_class_catalog(class_catalog)
+    if args.include_classes:
+        include_set = set(args.include_classes)
+        missing = [name for name in args.include_classes if name not in set(all_class_names)]
+        if missing:
+            raise ValueError(f"--include-classes contains unknown class names: {missing}")
+        all_class_names = [name for name in all_class_names if name in include_set]
+    if args.exclude_classes:
+        exclude_set = set(args.exclude_classes)
+        all_class_names = [name for name in all_class_names if name not in exclude_set]
+    if not all_class_names:
+        raise ValueError("Class filters removed every class.")
 
-    if duplicate_class_names:
-        duplicate_preview = "; ".join(
-            f'"{class_name}" -> {uids}'
-            for class_name, uids in list(sorted(duplicate_class_names.items()))[:10]
-        )
-        duplicate_msg = (
-            "duplicate class names mapped to multiple class_uids found. "
-            "This can create conflicting rewards for class-conditional prompts. "
-            f"Examples: {duplicate_preview}"
-        )
-        print(f"warning: {duplicate_msg}")
-
-    if numeric_class_names:
-        numeric_preview = ", ".join(f'"{name}"' for name in numeric_class_names[:15])
-        numeric_msg = (
-            "class names with digits detected. This may indicate label parsing issues. "
-            f"Examples: {numeric_preview}"
-        )
-        if args.fail_on_numeric_class_names:
-            raise ValueError(numeric_msg)
-        print(f"warning: {numeric_msg}")
+    prompt_override_unknown = sorted(set(args.prompt_overrides) - set(all_class_names))
+    if prompt_override_unknown:
+        print(f"warning: prompt overrides for unknown classes ignored: {prompt_override_unknown}")
+        args.prompt_overrides = {
+            key: value for key, value in args.prompt_overrides.items() if key in set(all_class_names)
+        }
 
     if not args.finetune_id and not args.finetune_name:
-        args.finetune_name = f"pid-icons-{args.skill}-{_random_suffix()}"
+        args.finetune_name = f"football-detect-{_random_suffix()}"
 
     expected_tasks = args.num_steps * args.batch_size
     if total_train_rows is not None:
@@ -1845,8 +1338,6 @@ def main(argv: Optional[list[str]] = None) -> None:
         )
     if total_val_rows is not None:
         print(f"dataset usage plan: val_rows_total={total_val_rows}")
-    if discovery_train_rows_consumed > 0:
-        print(f"dataset usage note: consumed {discovery_train_rows_consumed} training rows for class discovery")
     print(
         "run control: "
         f"num_steps={args.num_steps} resume_step={args.resume_step} "
@@ -1854,9 +1345,6 @@ def main(argv: Optional[list[str]] = None) -> None:
         f"off_policy={args.off_policy} off_policy_injection_allowed={off_policy_injection_allowed} "
         f"reasoning_train={bool(args.reasoning)} reasoning_eval={eval_reasoning}"
     )
-    effective_point_prompt_style = args.point_prompt_style if args.skill == "point" else "detect_phrase"
-    if args.skill != "point" and args.point_prompt_style != "detect_phrase":
-        print("warning: --point-prompt-style is only applied when --skill=point; using detect_phrase.")
 
     client = TunaClient(api_key=args.api_key, base_url=args.base_url)
     if args.finetune_id:
@@ -1874,13 +1362,12 @@ def main(argv: Optional[list[str]] = None) -> None:
             "dataset_name": dataset_name or None,
             "train_split": train_split,
             "val_split": val_split,
-            "auto_val_split": auto_val_split,
-            "auto_val_fraction": args.val_fraction if auto_val_split else None,
             "train_rows_total": total_train_rows,
             "val_rows_total": total_val_rows,
             "expected_tasks_consumed": expected_tasks,
-            "class_discovery_train_rows_consumed": discovery_train_rows_consumed,
             "class_count": len(all_class_names),
+            "class_names": list(all_class_names),
+            "prompt_overrides": dict(args.prompt_overrides),
             "neg_prompts_per_empty": args.neg_prompts_per_empty,
             "neg_prompts_per_nonempty": args.neg_prompts_per_nonempty,
             "augment_prob": args.augment_prob,
@@ -1898,12 +1385,6 @@ def main(argv: Optional[list[str]] = None) -> None:
             "eval_top_p": args.eval_top_p,
             "max_tokens": args.max_tokens,
             "max_objects": args.max_objects,
-            "skill": args.skill,
-            "reasoning": bool(args.reasoning),
-            "eval_reasoning": bool(eval_reasoning),
-            "eval_reasoning_override": args.eval_reasoning,
-            "point_prompt_style": args.point_prompt_style,
-            "effective_point_prompt_style": effective_point_prompt_style,
             "reward_metric": args.reward_metric,
             "seed": args.seed,
             "off_policy": args.off_policy,
@@ -1917,14 +1398,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             "fp_penalty_exponent": args.fp_penalty_exponent,
             "pos_task_prob": args.pos_task_prob,
             "neg_reward_weight": args.neg_reward_weight,
-            "use_recall_first_preset": args.use_recall_first_preset,
-            "recall_gate_step": args.recall_gate_step,
-            "recall_drop_threshold": args.recall_drop_threshold,
-            "f1_improvement_target": args.f1_improvement_target,
-            "allow_duplicate_class_names": args.allow_duplicate_class_names,
-            "fail_on_numeric_class_names": args.fail_on_numeric_class_names,
-            "duplicate_class_name_count": len(duplicate_class_names),
-            "numeric_class_name_count": len(numeric_class_names),
+            "reasoning": bool(args.reasoning),
+            "eval_reasoning": bool(eval_reasoning),
             "usage_report_every": args.usage_report_every,
             "usage_top_k": args.usage_top_k,
         },
@@ -1942,33 +1417,28 @@ def main(argv: Optional[list[str]] = None) -> None:
                 usage.rows_with_boxes += 1
             else:
                 usage.rows_without_boxes += 1
-            base = _augment_base_sample(
-                base,
-                rng,
-                rng_np,
-                augment_config,
-                augment_prob=args.augment_prob,
-            )
-            new_tasks = _tasks_from_base_sample(
+
+            task_candidates = tasks_from_base_sample(
                 base,
                 all_class_names=all_class_names,
                 rng=rng,
                 neg_prompts_per_empty=args.neg_prompts_per_empty,
                 neg_prompts_per_nonempty=args.neg_prompts_per_nonempty,
-                prompt_style=effective_point_prompt_style,
+                prompt_overrides=args.prompt_overrides,
             )
-            if not new_tasks:
+            if not task_candidates:
                 continue
-            usage.tasks_generated += len(new_tasks)
-            for task in new_tasks:
+            usage.tasks_generated += len(task_candidates)
+            for task in task_candidates:
                 usage.source_tasks_generated[task.source] += 1
                 usage.class_tasks_generated[task.class_name] += 1
                 if task.is_positive:
                     usage.tasks_generated_positive += 1
                 else:
                     usage.tasks_generated_negative += 1
-            positives = [task for task in new_tasks if task.is_positive]
-            negatives = [task for task in new_tasks if not task.is_positive]
+
+            positives = [task for task in task_candidates if task.is_positive]
+            negatives = [task for task in task_candidates if not task.is_positive]
             if positives:
                 if rng.random() < float(args.pos_task_prob):
                     selected_task = rng.choice(positives)
@@ -1978,6 +1448,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                     selected_task = rng.choice(positives)
             else:
                 selected_task = rng.choice(negatives)
+
             usage.tasks_consumed += 1
             usage.source_tasks_consumed[selected_task.source] += 1
             usage.class_tasks_consumed[selected_task.class_name] += 1
@@ -1985,17 +1456,18 @@ def main(argv: Optional[list[str]] = None) -> None:
                 usage.tasks_consumed_positive += 1
             else:
                 usage.tasks_consumed_negative += 1
-            return selected_task
+            return augment_task_sample(
+                selected_task,
+                rng,
+                rng_np,
+                augment_config,
+                augment_prob=args.augment_prob,
+            )
 
     best_metric: Optional[float] = None
     best_step: Optional[int] = None
     successful_updates = args.resume_step
     baseline_eval_metric: Optional[float] = None
-    baseline_eval_tp: Optional[float] = None
-    recall_gate_pass: Optional[bool] = None
-    recall_gate_eval_step: Optional[int] = None
-    recall_gate_eval_tp: Optional[float] = None
-    recall_gate_min_tp: Optional[float] = None
     eval_events_logged = 0
 
     def _run_and_log_eval(*, trigger: str, step_for_log: int) -> Optional[dict[str, float]]:
@@ -2012,6 +1484,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                 finetune=finetune,
                 eval_rows=eval_rows_factory(),
                 all_class_names=all_class_names,
+                prompt_overrides=args.prompt_overrides,
                 rng=eval_rng,
                 neg_prompts_per_empty=args.neg_prompts_per_empty,
                 neg_prompts_per_nonempty=args.neg_prompts_per_nonempty,
@@ -2024,8 +1497,6 @@ def main(argv: Optional[list[str]] = None) -> None:
                 top_p=args.eval_top_p,
                 max_tokens=args.max_tokens,
                 max_objects=args.max_objects,
-                skill=args.skill,
-                point_prompt_style=effective_point_prompt_style,
                 reasoning=eval_reasoning,
             )
             event_payload.update(eval_metrics)
@@ -2041,17 +1512,13 @@ def main(argv: Optional[list[str]] = None) -> None:
             print(f"eval {trigger} failed at step {step_for_log}: {type(exc).__name__}: {exc}")
             return None
 
-    if args.eval_every > 0 and has_eval_rows:
+    if args.eval_every > 0:
         baseline_step = max(0, args.resume_step - 1)
         print("running baseline eval before training...")
         baseline_metrics = _run_and_log_eval(trigger="baseline", step_for_log=baseline_step)
         if baseline_metrics is not None:
-            metric_key = "eval_miou" if args.skill == "detect" else "eval_f1"
-            baseline_eval_metric = float(baseline_metrics.get(metric_key, 0.0))
-            baseline_eval_tp = float(baseline_metrics.get("eval_tp", 0.0))
-            run.summary[f"baseline_{metric_key}"] = baseline_eval_metric
-            run.summary["baseline_eval_tp"] = baseline_eval_tp
-            run.summary["baseline_metric_key"] = metric_key
+            baseline_eval_metric = float(baseline_metrics.get("eval_miou", 0.0))
+            run.summary["baseline_eval_miou"] = baseline_eval_metric
             print(
                 f"baseline eval step {baseline_step} tasks={baseline_metrics['eval_tasks']} "
                 f"miou={baseline_metrics['eval_miou']:.4f} f1={baseline_metrics['eval_f1']:.4f} "
@@ -2063,36 +1530,20 @@ def main(argv: Optional[list[str]] = None) -> None:
         step_start = time.monotonic()
 
         batch = [_next_task() for _ in range(args.batch_size)]
-
-        if args.skill == "point":
-            requests = [
-                _ReasoningPointRequest(
-                    object_name=item.prompt,
-                    image_url=_to_data_url(item.image, quality=92),
-                    settings=PointSettings(
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        max_tokens=args.max_tokens,
-                    ),
-                    reasoning=bool(args.reasoning),
-                )
-                for item in batch
-            ]
-        else:
-            requests = [
-                _ReasoningDetectRequest(
-                    object_name=item.prompt,
-                    image_url=_to_data_url(item.image, quality=92),
-                    settings=DetectSettings(
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        max_tokens=args.max_tokens,
-                        max_objects=args.max_objects,
-                    ),
-                    reasoning=bool(args.reasoning),
-                )
-                for item in batch
-            ]
+        requests = [
+            _ReasoningDetectRequest(
+                object_name=item.prompt,
+                image_url=_to_data_url(item.image, quality=92),
+                settings=DetectSettings(
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    max_tokens=args.max_tokens,
+                    max_objects=args.max_objects,
+                ),
+                reasoning=bool(args.reasoning),
+            )
+            for item in batch
+        ]
 
         try:
             rollout_start = time.monotonic()
@@ -2129,12 +1580,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         train_tp = 0
         train_fp = 0
         train_fn = 0
+
         for idx, (item, result) in enumerate(zip(batch, results)):
             rollouts = list(result.rollouts)
             rewards = _rewards_for_rollouts(
                 rollouts,
                 item.gt_boxes,
-                skill=args.skill,
                 reward_metric=args.reward_metric,
                 fn_penalty_exponent=args.fn_penalty_exponent,
                 fp_penalty_exponent=args.fp_penalty_exponent,
@@ -2152,7 +1603,6 @@ def main(argv: Optional[list[str]] = None) -> None:
                 should_inject = low_max_reward or (
                     low_mean_reward and reward_std < args.off_policy_std_thresh
                 )
-
                 if should_inject:
                     if low_max_reward:
                         off_policy_trigger_low_max += 1
@@ -2161,18 +1611,10 @@ def main(argv: Optional[list[str]] = None) -> None:
                     replace_idx = int(np.argmin(np.asarray(rewards, dtype=np.float32)))
                     old_rollout = rollouts[replace_idx]
                     replacement_objects = list(item.gt_boxes)
-                    replacement_points = [
-                        PointAnnotation(x=(box.x_min + box.x_max) / 2.0, y=(box.y_min + box.y_max) / 2.0)
-                        for box in replacement_objects
-                    ]
                     rollouts[replace_idx] = Rollout(
                         skill=old_rollout.skill,
                         finish_reason=old_rollout.finish_reason,
-                        output=(
-                            PointOutput(points=replacement_points)
-                            if args.skill == "point"
-                            else DetectOutput(objects=replacement_objects)
-                        ),
+                        output=DetectOutput(objects=replacement_objects),
                         answer_tokens=list(old_rollout.answer_tokens),
                         thinking_tokens=list(old_rollout.thinking_tokens),
                         coords=list(old_rollout.coords),
@@ -2199,22 +1641,13 @@ def main(argv: Optional[list[str]] = None) -> None:
             elif args.off_policy and rewards and rollouts and not off_policy_injection_allowed:
                 off_policy_skipped_reasoning_guard += 1
 
-            if args.skill == "point":
-                for rollout in rollouts:
-                    output = rollout.output
-                    pred_points = output.points if isinstance(output, PointOutput) else []
-                    tp, fp, fn = _count_tp_fp_fn_points(pred_points, item.gt_boxes)
-                    train_tp += tp
-                    train_fp += fp
-                    train_fn += fn
-            else:
-                for rollout in rollouts:
-                    output = rollout.output
-                    pred_boxes = output.objects if isinstance(output, DetectOutput) else []
-                    tp, fp, fn = _count_tp_fp_fn(pred_boxes, item.gt_boxes)
-                    train_tp += tp
-                    train_fp += fp
-                    train_fn += fn
+            for rollout in rollouts:
+                output = rollout.output
+                pred_boxes = output.objects if isinstance(output, DetectOutput) else []
+                tp, fp, fn = _count_tp_fp_fn(pred_boxes, item.gt_boxes)
+                train_tp += tp
+                train_fp += fp
+                train_fn += fn
 
             group_request = result.request
             if idx < len(requests):
@@ -2303,47 +1736,20 @@ def main(argv: Optional[list[str]] = None) -> None:
             usage_summary = _usage_snapshot(usage, total_train_rows=total_train_rows, top_k=args.usage_top_k)
             _print_usage_snapshot(usage_summary, prefix=f"usage step {global_step}")
 
-        if args.eval_every > 0 and has_eval_rows and successful_updates % args.eval_every == 0:
+        if args.eval_every > 0 and successful_updates % args.eval_every == 0:
             eval_metrics = _run_and_log_eval(trigger="periodic", step_for_log=global_step)
             if eval_metrics is None:
                 continue
-            metric_key = "eval_miou" if args.skill == "detect" else "eval_f1"
             if baseline_eval_metric is not None:
-                delta_key = f"{metric_key}_delta_vs_baseline"
-                eval_metrics[delta_key] = float(eval_metrics.get(metric_key, 0.0)) - baseline_eval_metric
-                wandb.log({delta_key: eval_metrics[delta_key]}, step=global_step)
-            if (
-                args.skill == "point"
-                and baseline_eval_tp is not None
-                and recall_gate_pass is None
-                and global_step >= args.recall_gate_step
-            ):
-                recall_gate_eval_step = global_step
-                recall_gate_eval_tp = float(eval_metrics.get("eval_tp", 0.0))
-                recall_gate_min_tp = float(baseline_eval_tp) * (1.0 - float(args.recall_drop_threshold))
-                recall_gate_pass = bool(recall_gate_eval_tp >= recall_gate_min_tp)
-                wandb.log(
-                    {
-                        "recall_gate_step": recall_gate_eval_step,
-                        "recall_gate_eval_tp": recall_gate_eval_tp,
-                        "recall_gate_min_tp": recall_gate_min_tp,
-                        "recall_gate_pass": int(recall_gate_pass),
-                    },
-                    step=global_step,
-                )
-                print(
-                    f"recall gate step {recall_gate_eval_step}: "
-                    f"tp={recall_gate_eval_tp:.1f} min_tp={recall_gate_min_tp:.1f} "
-                    f"pass={recall_gate_pass}"
-                )
+                delta = float(eval_metrics.get("eval_miou", 0.0)) - baseline_eval_metric
+                wandb.log({"eval_miou_delta_vs_baseline": delta}, step=global_step)
             print(
                 f"eval step {global_step} tasks={eval_metrics['eval_tasks']} "
                 f"miou={eval_metrics['eval_miou']:.4f} f1={eval_metrics['eval_f1']:.4f} "
-                f"macro_f1={eval_metrics['eval_f1_macro']:.4f} "
-                f"updates={successful_updates}"
+                f"macro_f1={eval_metrics['eval_f1_macro']:.4f} updates={successful_updates}"
             )
 
-            metric = float(eval_metrics.get(metric_key, 0.0))
+            metric = float(eval_metrics.get("eval_miou", 0.0))
             if best_metric is None or metric > best_metric:
                 best_metric = metric
                 best_step = global_step
@@ -2353,51 +1759,15 @@ def main(argv: Optional[list[str]] = None) -> None:
             finetune.save_checkpoint()
 
     finetune.save_checkpoint()
-    metric_key = "eval_miou" if args.skill == "detect" else "eval_f1"
-    f1_target_value: Optional[float] = None
-    f1_target_pass: Optional[bool] = None
     if best_step is not None:
         run.summary["best_step"] = best_step
-        run.summary[f"best_{metric_key}"] = best_metric
-        run.summary["best_metric_key"] = metric_key
-    if metric_key == "eval_f1" and baseline_eval_metric is not None and best_metric is not None:
-        f1_target_value = float(baseline_eval_metric) + float(args.f1_improvement_target)
-        f1_target_pass = bool(float(best_metric) >= f1_target_value)
-        run.summary["f1_target_value"] = f1_target_value
-        run.summary["f1_target_pass"] = int(f1_target_pass)
-    run.summary["f1_target_evaluated"] = int(f1_target_pass is not None)
-    run.summary["recall_gate_evaluated"] = int(recall_gate_pass is not None)
-    if recall_gate_pass is not None:
-        run.summary["recall_gate_pass"] = int(recall_gate_pass)
-    if recall_gate_eval_step is not None:
-        run.summary["recall_gate_eval_step"] = int(recall_gate_eval_step)
-    if recall_gate_eval_tp is not None:
-        run.summary["recall_gate_eval_tp"] = float(recall_gate_eval_tp)
-    if recall_gate_min_tp is not None:
-        run.summary["recall_gate_min_tp"] = float(recall_gate_min_tp)
+        run.summary["best_eval_miou"] = best_metric
     final_usage = _usage_snapshot(usage, total_train_rows=total_train_rows, top_k=args.usage_top_k)
     _print_usage_snapshot(final_usage, prefix="usage final")
     run.summary["rows_seen"] = int(final_usage["rows_seen"])
-    run.summary["rows_seen_fraction"] = float(final_usage["rows_seen_fraction"])
-    run.summary["tasks_generated_total"] = int(final_usage["tasks_generated"])
-    run.summary["tasks_generated_positive_total"] = int(final_usage["tasks_generated_positive"])
-    run.summary["tasks_generated_negative_total"] = int(final_usage["tasks_generated_negative"])
-    run.summary["tasks_consumed_total"] = int(final_usage["tasks_consumed"])
-    run.summary["tasks_consumed_positive_total"] = int(final_usage["tasks_consumed_positive"])
-    run.summary["tasks_consumed_negative_total"] = int(final_usage["tasks_consumed_negative"])
-    run.summary["usage_source_rows_top_json"] = json.dumps(final_usage["source_rows_top"])
-    run.summary["usage_source_tasks_consumed_top_json"] = json.dumps(final_usage["source_tasks_consumed_top"])
-    run.summary["usage_class_tasks_consumed_top_json"] = json.dumps(final_usage["class_tasks_consumed_top"])
-    run.summary["eval_events_logged"] = int(eval_events_logged)
-    run.summary["finetune_id"] = finetune.finetune_id
+    run.summary["tasks_generated"] = int(final_usage["tasks_generated"])
+    run.summary["tasks_consumed"] = int(final_usage["tasks_consumed"])
     run.finish()
-    client.close()
-
-    print(
-        f"done. finetune_id={finetune.finetune_id} "
-        f"best_step={best_step} best_metric={best_metric} "
-        f"recall_gate_pass={recall_gate_pass} f1_target_pass={f1_target_pass}"
-    )
 
 
 if __name__ == "__main__":

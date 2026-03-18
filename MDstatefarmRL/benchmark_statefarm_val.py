@@ -1,7 +1,8 @@
-"""Benchmark State Farm detection on local val set.
+"""Benchmark State Farm detection on local or Hugging Face val set.
 
 Requires:
   pip install pillow numpy python-dotenv
+  pip install datasets  # only if using --hf-dataset
 """
 
 from __future__ import annotations
@@ -20,6 +21,11 @@ from typing import Iterable, List, Optional
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
+
+try:
+    from datasets import load_dataset
+except Exception:  # pragma: no cover - optional dependency for HF mode
+    load_dataset = None
 
 
 OBJECT_NAME = "statefarm logo"
@@ -83,6 +89,21 @@ def _box_from_normalized(x_min: float, y_min: float, x_max: float, y_max: float)
     return Box(x_min=x_min, y_min=y_min, x_max=x_max, y_max=y_max)
 
 
+def _bbox_xyxy_to_box(x_min: float, y_min: float, x_max: float, y_max: float, width: int, height: int) -> Box:
+    x_min = _clamp(float(x_min), 0.0, float(width))
+    y_min = _clamp(float(y_min), 0.0, float(height))
+    x_max = _clamp(float(x_max), 0.0, float(width))
+    y_max = _clamp(float(y_max), 0.0, float(height))
+    if x_max <= x_min or y_max <= y_min:
+        raise ValueError("Invalid bbox after clipping")
+    return Box(
+        x_min=x_min / float(width),
+        y_min=y_min / float(height),
+        x_max=x_max / float(width),
+        y_max=y_max / float(height),
+    )
+
+
 def _parse_val_boxes(answer: Optional[list]) -> List[Box]:
     if not answer:
         return []
@@ -109,7 +130,45 @@ def _parse_val_boxes(answer: Optional[list]) -> List[Box]:
     return boxes
 
 
-def _iter_val_samples(
+def _parse_statefarm_boxes(answer_boxes: Optional[object], width: int, height: int) -> List[Box]:
+    if not answer_boxes:
+        return []
+    raw = answer_boxes
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+
+    boxes: List[Box] = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            x_min = float(item["x_min"])
+            y_min = float(item["y_min"])
+            x_max = float(item["x_max"])
+            y_max = float(item["y_max"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        try:
+            if max(x_max, y_max) > 1.5:
+                boxes.append(_bbox_xyxy_to_box(x_min, y_min, x_max, y_max, width=width, height=height))
+            else:
+                boxes.append(_box_from_normalized(x_min, y_min, x_max, y_max))
+        except ValueError:
+            continue
+    return boxes
+
+
+def _iter_local_val_samples(
     *,
     val_json_path: str,
     image_dir: str,
@@ -143,6 +202,50 @@ def _iter_val_samples(
         boxes = _parse_val_boxes(item.get("answer"))
         if max_boxes is not None:
             boxes = boxes[:max_boxes]
+        yield image, boxes, filename
+
+
+def _iter_hf_val_samples(
+    *,
+    dataset_name: str,
+    split: str,
+    token: Optional[str],
+    max_boxes: Optional[int],
+) -> Iterable[tuple[Image.Image, List[Box], str]]:
+    if load_dataset is None:
+        raise RuntimeError("Hugging Face datasets is not installed. Install with: pip install datasets")
+
+    try:
+        ds = load_dataset(dataset_name, split=split, streaming=True, token=token)
+    except ValueError as exc:
+        if "[" in split and "]" in split:
+            base_split = split.split("[", 1)[0]
+            print(
+                f"eval split '{split}' not supported for streaming; falling back to '{base_split}'."
+            )
+            ds = load_dataset(dataset_name, split=base_split, streaming=True, token=token)
+        else:
+            raise exc
+
+    for idx, row in enumerate(ds):
+        image = row["image"].convert("RGB")
+        width, height = image.size
+        boxes = _parse_statefarm_boxes(row.get("answer_boxes") or row.get("answer"), width=width, height=height)
+        if max_boxes is not None:
+            boxes = boxes[:max_boxes]
+
+        filename = None
+        if getattr(image, "filename", None):
+            filename = str(getattr(image, "filename"))
+        if not filename:
+            for key in ("image_path", "file_name", "filename", "id", "uid"):
+                value = row.get(key)
+                if isinstance(value, str) and value.strip():
+                    filename = value.strip()
+                    break
+        if not filename:
+            filename = f"sample_{idx:06d}.jpg"
+
         yield image, boxes, filename
 
 
@@ -463,8 +566,11 @@ def _evaluate_model(
     *,
     label: str,
     model: str,
-    val_json_path: str,
+    val_json_path: Optional[str],
     image_dir: str,
+    hf_dataset: Optional[str] = None,
+    hf_split: str = "validation",
+    hf_token: Optional[str] = None,
     api_base: str,
     api_key: str,
     object_name: str,
@@ -493,11 +599,23 @@ def _evaluate_model(
     raw_requests = []
     saved_viz = 0
 
-    for image, gt_boxes, filename in _iter_val_samples(
-        val_json_path=val_json_path,
-        image_dir=image_dir,
-        max_boxes=max_boxes,
-    ):
+    if hf_dataset:
+        sample_iter = _iter_hf_val_samples(
+            dataset_name=hf_dataset,
+            split=hf_split,
+            token=hf_token,
+            max_boxes=max_boxes,
+        )
+    else:
+        if val_json_path is None:
+            raise ValueError("val_json_path is required when --hf-dataset is not set.")
+        sample_iter = _iter_local_val_samples(
+            val_json_path=val_json_path,
+            image_dir=image_dir,
+            max_boxes=max_boxes,
+        )
+
+    for image, gt_boxes, filename in sample_iter:
         if max_samples is not None and count >= max_samples:
             break
         try:
@@ -601,6 +719,9 @@ def main() -> None:
     parser.add_argument("--api-base", default=None)
     parser.add_argument("--val-json", default="val/post_train_benchmark/post_train_benchmark.json")
     parser.add_argument("--val-image-dir", default="val/post_train_benchmark/post_train_benchmark")
+    parser.add_argument("--hf-dataset", default=None, help="HF dataset ID for direct streaming eval, e.g. maxs-m87/NBA_StateFarm_Splits_01.")
+    parser.add_argument("--hf-split", default="validation", help="HF split name to evaluate. Defaults to validation.")
+    parser.add_argument("--hf-token", default=None, help="HF auth token.")
     parser.add_argument("--object-name", default=OBJECT_NAME)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-boxes", type=int, default=None)
@@ -631,8 +752,14 @@ def main() -> None:
         args.api_key = os.environ.get("MOONDREAM_API_KEY")
     if not args.api_base:
         args.api_base = os.environ.get("MOONDREAM_BASE_URL", "https://api.moondream.ai/v1")
+    if not args.hf_token:
+        args.hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
     if not args.api_key:
         raise ValueError("MOONDREAM_API_KEY is required")
+    if args.hf_dataset and args.val_json and args.val_json != "val/post_train_benchmark/post_train_benchmark.json":
+        raise ValueError("Do not combine --hf-dataset with a custom --val-json. Omit --val-json for HF mode.")
+    if args.hf_dataset and args.val_json == "val/post_train_benchmark/post_train_benchmark.json":
+        args.val_json = None
     has_checkpoint_candidate = bool(args.finetune_id and args.checkpoint_step is not None)
     if args.skip_baseline and not has_checkpoint_candidate:
         raise ValueError("Provide both --finetune-id and --checkpoint-step, or omit --skip-baseline.")
@@ -644,6 +771,9 @@ def main() -> None:
             model=args.baseline_model,
             val_json_path=args.val_json,
             image_dir=args.val_image_dir,
+            hf_dataset=args.hf_dataset,
+            hf_split=args.hf_split,
+            hf_token=args.hf_token,
             api_base=args.api_base,
             api_key=args.api_key,
             object_name=args.object_name,
@@ -672,6 +802,9 @@ def main() -> None:
             model=model,
             val_json_path=args.val_json,
             image_dir=args.val_image_dir,
+            hf_dataset=args.hf_dataset,
+            hf_split=args.hf_split,
+            hf_token=args.hf_token,
             api_base=args.api_base,
             api_key=args.api_key,
             object_name=args.object_name,
@@ -706,6 +839,8 @@ def main() -> None:
                 "checkpoint_step": args.checkpoint_step,
                 "viz_dir": args.viz_dir,
                 "checkpoint_viz_dir": checkpoint_viz_dir,
+                "hf_dataset": args.hf_dataset,
+                "hf_split": args.hf_split,
             },
         }
         os.makedirs(os.path.dirname(args.metrics_json) or ".", exist_ok=True)

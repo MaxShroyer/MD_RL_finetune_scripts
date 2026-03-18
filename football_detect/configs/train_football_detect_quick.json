@@ -1,0 +1,16 @@
+{
+  "env_file": ".env",
+  "api_key_env_var": "MOONDREAM_API_KEY",
+  "dataset_path": "football_detect/outputs/maxs-m87_football_detect_no_split_splits",
+  "dataset_name": "",
+  "split": "train",
+  "val_split": "val",
+  "num_steps": 20,
+  "batch_size": 16,
+  "group_size": 4,
+  "eval_every": 10,
+  "eval_max_samples": 60,
+  "save_every": 10,
+  "wandb_project": "moondream-football-detect-rl",
+  "wandb_run_name": "football-detect-quick"
+}

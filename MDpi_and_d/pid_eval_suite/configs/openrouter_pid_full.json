@@ -1,29 +1,31 @@
 {
-  "env_file": "tictaktoe_QA/.env",
+  "env_file": ".env",
   "api_base": "https://openrouter.ai/api/v1",
-  "dataset_source": "local_jsonl",
-  "dataset_dir": "tictaktoe_QA/synth_dataset/outputs/v2",
-  "split": "test",
-  "task_types": [
-    "best_move",
-    "available_moves_count",
-    "available_moves_list"
+  "dataset_name": "maxs-m87/pandid_dataset_v2",
+  "dataset_path": "",
+  "split": "post_val",
+  "max_samples": 0,
+  "skills": [
+    "detect",
+    "point"
   ],
-  "max_samples_per_task": 80,
-  "sample_strategy": "stratified",
-  "stratify_tasks": [
-    "turn_player",
-    "available_moves_count"
-  ],
-  "seed": 42,
+  "point_prompt_style": "detect_phrase",
+  "neg_prompts_per_empty": 2,
+  "neg_prompts_per_nonempty": 1,
   "temperature": 0.0,
   "top_p": 1.0,
-  "max_tokens": 256,
+  "max_tokens": 512,
+  "max_objects": 50,
   "timeout": 90.0,
   "retry_429_max_retries": 2,
   "retry_429_backoff_s": 1.0,
   "retry_429_max_backoff_s": 8.0,
-  "best_move_optimal_reward": 0.7,
+  "min_request_interval_s": 0.0,
+  "iou_threshold": 0.5,
+  "seed": 42,
+  "progress_every": 100,
+  "viz_samples": 0,
+  "viz_dir": "outputs/benchmark_viz_openrouter_pid",
   "models": [
     {
       "label": "claude_frontier",

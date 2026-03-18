@@ -16,6 +16,7 @@ import io
 import json
 import os
 import random
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -32,6 +33,93 @@ from scipy.optimize import linear_sum_assignment
 
 def _repo_relative(*parts: str) -> Path:
     return Path(__file__).resolve().parent.joinpath(*parts)
+
+
+DEFAULT_CONFIG_PATH = _repo_relative("configs", "benchmark_pid_icons_default.json")
+
+
+def _resolve_config_path(raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    if path.is_absolute():
+        return path
+    from_cwd = (Path.cwd() / path).resolve()
+    if from_cwd.exists():
+        return from_cwd
+    from_script = (_repo_relative(path.as_posix())).resolve()
+    if from_script.exists():
+        return from_script
+    return from_cwd
+
+
+def _load_json_config(config_path: Path) -> dict[str, Any]:
+    if not config_path.exists():
+        if config_path == DEFAULT_CONFIG_PATH:
+            return {}
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Config must be a JSON object: {config_path}")
+    return payload
+
+
+def _option_for_action(action: argparse.Action) -> str:
+    for opt in action.option_strings:
+        if opt.startswith("--"):
+            return opt
+    return action.option_strings[0]
+
+
+def _config_to_cli_args(
+    parser: argparse.ArgumentParser,
+    config: dict[str, Any],
+    *,
+    config_path: Path,
+    overridden_dests: Optional[set[str]] = None,
+) -> list[str]:
+    overridden = set(overridden_dests or set())
+    by_dest: dict[str, list[argparse.Action]] = {}
+    for action in parser._actions:
+        if not action.option_strings or action.dest == "help":
+            continue
+        by_dest.setdefault(action.dest, []).append(action)
+
+    unknown = sorted(key for key in config if key not in by_dest)
+    if unknown:
+        raise ValueError(
+            f"Unknown config key(s) in {config_path}: {unknown}. "
+            "Remove typos or update script support."
+        )
+
+    cli_args: list[str] = []
+    for key, raw_value in config.items():
+        if key in overridden:
+            continue
+        actions = by_dest[key]
+        const_actions = [a for a in actions if isinstance(a, argparse._StoreConstAction)]
+        store_actions = [a for a in actions if not isinstance(a, argparse._StoreConstAction)]
+
+        if raw_value is None:
+            matched = next((a for a in const_actions if getattr(a, "const", object()) is None), None)
+            if matched is not None:
+                cli_args.append(_option_for_action(matched))
+            continue
+
+        if isinstance(raw_value, bool):
+            matched = next((a for a in const_actions if getattr(a, "const", object()) is raw_value), None)
+            if matched is not None:
+                cli_args.append(_option_for_action(matched))
+            continue
+
+        if not store_actions:
+            continue
+
+        action = store_actions[0]
+        cli_args.append(_option_for_action(action))
+        if isinstance(raw_value, list):
+            cli_args.extend(str(item) for item in raw_value)
+        else:
+            cli_args.append(str(raw_value))
+    return cli_args
 
 
 def _to_data_url(image: Image.Image, *, quality: int = 90) -> str:
@@ -153,6 +241,7 @@ def _call_detect_api(
     retry_429_max_retries: int,
     retry_429_backoff_s: float,
     retry_429_max_backoff_s: float,
+    reasoning: bool,
 ) -> list["Box"]:
     detect_object = _object_from_prompt(prompt)
 
@@ -178,6 +267,9 @@ def _call_detect_api(
             "settings": settings,
         },
     ]
+    if bool(reasoning):
+        for payload in payloads:
+            payload["reasoning"] = True
     data = _post_with_fallback_payloads(
         api_base=api_base,
         api_key=api_key,
@@ -225,6 +317,7 @@ def _call_point_api(
     retry_429_max_retries: int,
     retry_429_backoff_s: float,
     retry_429_max_backoff_s: float,
+    reasoning: bool,
 ) -> list["Point"]:
     object_name = _object_from_prompt(prompt)
     image_url = _to_data_url(image, quality=90)
@@ -248,6 +341,9 @@ def _call_point_api(
             "settings": settings,
         },
     ]
+    if bool(reasoning):
+        for payload in payloads:
+            payload["reasoning"] = True
     data = _post_with_fallback_payloads(
         api_base=api_base,
         api_key=api_key,
@@ -902,6 +998,7 @@ def _evaluate_model(label: str, model: str, args: argparse.Namespace, all_class_
                         retry_429_max_retries=args.retry_429_max_retries,
                         retry_429_backoff_s=args.retry_429_backoff_s,
                         retry_429_max_backoff_s=args.retry_429_max_backoff_s,
+                        reasoning=args.reasoning,
                     )
                     pred_boxes: list[Box] = []
                 else:
@@ -919,6 +1016,7 @@ def _evaluate_model(label: str, model: str, args: argparse.Namespace, all_class_
                         retry_429_max_retries=args.retry_429_max_retries,
                         retry_429_backoff_s=args.retry_429_backoff_s,
                         retry_429_max_backoff_s=args.retry_429_max_backoff_s,
+                        reasoning=args.reasoning,
                     )
                     pred_points = []
             except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
@@ -982,6 +1080,7 @@ def _evaluate_model(label: str, model: str, args: argparse.Namespace, all_class_
             "label": label,
             "skill": effective_skill,
             "model": model,
+            "reasoning": bool(args.reasoning),
             "error": "No tasks evaluated",
             "base_samples": total_base_samples,
             "tasks": 0,
@@ -1013,6 +1112,7 @@ def _evaluate_model(label: str, model: str, args: argparse.Namespace, all_class_
         "label": label,
         "skill": effective_skill,
         "model": model,
+        "reasoning": bool(args.reasoning),
         "dataset_name": args.dataset_name or None,
         "dataset_path": args.dataset_path.strip() or None,
         "split": args.split,
@@ -1055,8 +1155,16 @@ def _print_summary(title: str, metrics: dict[str, Any]) -> None:
         )
 
 
-def main() -> None:
+def main(argv: Optional[list[str]] = None) -> None:
+    raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
+    pre_args, _ = pre_parser.parse_known_args(raw_argv)
+    config_path = _resolve_config_path(pre_args.config)
+    config = _load_json_config(config_path)
+
     parser = argparse.ArgumentParser(description="Benchmark PI&D class-conditional detect/point performance.")
+    parser.add_argument("--config", default=str(config_path))
     parser.add_argument("--env-file", default=str(_repo_relative(".env")))
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--hf-token", default=None)
@@ -1120,6 +1228,21 @@ def main() -> None:
         help="Prompt style for class-conditional tasks (used when --skill=point).",
     )
 
+    reasoning_group = parser.add_mutually_exclusive_group()
+    reasoning_group.add_argument(
+        "--reasoning",
+        dest="reasoning",
+        action="store_true",
+        help="Enable Moondream reasoning for benchmark requests.",
+    )
+    reasoning_group.add_argument(
+        "--no-reasoning",
+        dest="reasoning",
+        action="store_false",
+        help="Disable Moondream reasoning for benchmark requests.",
+    )
+    parser.set_defaults(reasoning=False)
+
     parser.add_argument("--neg-prompts-per-empty", type=int, default=2)
     parser.add_argument("--neg-prompts-per-nonempty", type=int, default=1)
 
@@ -1137,7 +1260,21 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--out-json", default=str(_repo_relative("outputs", "benchmark_pid_icons.json")))
-    args = parser.parse_args()
+    option_to_dest: dict[str, str] = {}
+    for action in parser._actions:
+        if not action.option_strings:
+            continue
+        for opt in action.option_strings:
+            option_to_dest[opt] = action.dest
+    overridden_dests = {option_to_dest[arg] for arg in raw_argv if arg in option_to_dest}
+    config_cli_args = _config_to_cli_args(
+        parser,
+        config,
+        config_path=config_path,
+        overridden_dests=overridden_dests,
+    )
+    args = parser.parse_args(config_cli_args + raw_argv)
+    args.config = str(_resolve_config_path(args.config))
 
     load_dotenv(args.env_file, override=False)
     if not args.api_key:
@@ -1212,12 +1349,14 @@ def main() -> None:
             "baseline": baseline_metrics,
             "candidate": candidate_metrics,
             "config": {
+                "config": args.config,
                 "baseline_model": args.baseline_model,
                 "candidate_model": candidate_model,
                 "dataset_path": args.dataset_path.strip() or None,
                 "dataset_name": args.dataset_name or None,
                 "split": args.split,
                 "skill": args.skill,
+                "reasoning": bool(args.reasoning),
                 "point_prompt_style": args.point_prompt_style,
                 "max_samples": args.max_samples,
                 "viz_samples": args.viz_samples,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -101,6 +102,36 @@ class BenchmarkArgTests(unittest.TestCase):
             self.assertEqual(args.dataset_source, "hf_hub")
             self.assertEqual(args.hf_dataset_repo_id, "maxs-m87/tictactoe-qa-v1")
             self.assertEqual(args.hf_dataset_revision, "main")
+
+    def test_strict_best_move_config_parsing(self) -> None:
+        cfg_path = (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "benchmark_best_move_strict.json"
+        )
+        args = mod._parse_args(["--config", str(cfg_path)])
+        self.assertEqual(args.task_types, ["best_move"])
+        self.assertFalse(args.reasoning)
+        self.assertAlmostEqual(args.temperature, 0.0, places=6)
+        self.assertAlmostEqual(args.top_p, 1.0, places=6)
+        self.assertEqual(args.max_tokens, 96)
+        self.assertEqual(args.best_move_reward_mode, "hybrid_strict")
+        self.assertAlmostEqual(args.best_move_wrong_rank_scale, 0.0, places=6)
+
+    def test_resolve_config_path_supports_repo_prefixed_path_from_nested_cwd(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        nested_cwd = repo_root / "tictaktoe_QA"
+        config_rel = "tictaktoe_QA/configs/benchmark_best_move_strict.json"
+        expected = (repo_root / config_rel).resolve()
+
+        prior_cwd = Path.cwd()
+        os.chdir(nested_cwd)
+        try:
+            resolved = mod._resolve_config_path(config_rel)
+        finally:
+            os.chdir(prior_cwd)
+
+        self.assertEqual(resolved, expected)
 
 
 class QueryPayloadTests(unittest.TestCase):

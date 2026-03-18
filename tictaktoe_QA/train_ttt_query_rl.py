@@ -115,7 +115,23 @@ MAIN_EVAL_WANDB_METRIC_KEYS = (
     "eval_best_move_set_accuracy",
     "eval_best_move_canonical_accuracy",
     "eval_exact_accuracy_non_best_move",
+    "eval_best_move_center_prediction_rate",
+    "eval_best_move_invalid_prediction_rate",
 )
+CHECKPOINT_AVG_METRIC_CHOICES = (
+    "eval_reward_mean",
+    "eval_best_move_set_accuracy",
+    "eval_best_move_canonical_accuracy",
+    "eval_exact_accuracy_non_best_move",
+    "eval_json_parse_rate",
+)
+BEST_MOVE_REWARD_MODES = ("ranked", "hybrid_strict", "binary")
+INTRA_TASK_SAMPLING_STRATEGIES: dict[str, set[str]] = {
+    "turn_player": {"balanced_player"},
+    "available_moves_count": {"uniform_count"},
+    "best_move": {"uniform_canonical_move", "center_hard_negative"},
+}
+WANDB_LOG_PROFILES = ("legacy", "lean")
 
 REQUIRED_ROW_FIELDS = (
     "row_id",
@@ -137,10 +153,17 @@ TRAIN_CONFIG_ALLOWED_KEYS = {
     "base_url",
     "batch_size",
     "best_metric",
+    "best_move_center_not_optimal_ratio",
     "best_move_optimal_reward",
+    "best_move_reward_mode",
+    "best_move_wrong_rank_scale",
     "checkpoint_avg_metric",
     "checkpoint_avg_splits",
     "checkpoint_ranking_output",
+    "center_bias_gate_after_evals",
+    "center_bias_gate_enabled",
+    "center_bias_gate_min_best_move_samples",
+    "center_bias_gate_threshold",
     "dataset_dir",
     "dataset_source",
     "early_stop",
@@ -162,6 +185,7 @@ TRAIN_CONFIG_ALLOWED_KEYS = {
     "hf_dataset_repo_id",
     "hf_dataset_revision",
     "hf_token",
+    "intra_task_sampling_json",
     "lr",
     "max_tokens",
     "max_tokens_by_task",
@@ -189,6 +213,7 @@ TRAIN_CONFIG_ALLOWED_KEYS = {
     "val_split",
     "wandb_project",
     "wandb_run_name",
+    "wandb_log_profile",
 }
 
 EARLY_STOP_MODES = ("conservative", "balanced", "aggressive")
@@ -236,6 +261,10 @@ def _resolve_config_path(raw_path: str) -> Path:
     from_cwd = (Path.cwd() / path).resolve()
     if from_cwd.exists():
         return from_cwd
+
+    from_repo = (REPO_ROOT / path).resolve()
+    if from_repo.exists():
+        return from_repo
 
     from_script = (_repo_relative(path.as_posix())).resolve()
     if from_script.exists():
@@ -460,6 +489,131 @@ def _filter_examples_by_active_tasks(
     return [item for item in examples if item.task_type in active_tasks]
 
 
+def _intra_task_bucket_value(
+    example: QAExample,
+    *,
+    strategy: str,
+) -> Optional[str]:
+    if strategy == "balanced_player":
+        normalized = _normalize_non_best_answer("turn_player", example.expected_answer)
+        if not isinstance(normalized, dict):
+            return None
+        player = normalized.get("player")
+        if isinstance(player, str) and player in {"X", "O"}:
+            return player
+        return None
+    if strategy == "uniform_count":
+        normalized = _normalize_non_best_answer("available_moves_count", example.expected_answer)
+        if not isinstance(normalized, dict):
+            return None
+        count = _parse_int(normalized.get("available_move_count"))
+        if count is None:
+            return None
+        return str(int(count))
+    if strategy == "uniform_canonical_move":
+        if example.task_type != "best_move":
+            return None
+        canonical = _parse_int(example.best_move_canonical)
+        if canonical is None or canonical < 1 or canonical > 9:
+            return None
+        return str(int(canonical))
+    if strategy == "center_hard_negative":
+        if example.task_type != "best_move":
+            return None
+        center_move = 5
+        if center_move in example.best_move_optimal_set:
+            return "other"
+        return "center_not_optimal"
+    return None
+
+
+def _build_intra_task_buckets(
+    examples: list[QAExample],
+    *,
+    strategy: str,
+) -> dict[str, list[QAExample]]:
+    buckets: dict[str, list[QAExample]] = {}
+    for item in examples:
+        bucket_key = _intra_task_bucket_value(item, strategy=strategy)
+        if bucket_key is None:
+            continue
+        buckets.setdefault(bucket_key, []).append(item)
+    return {key: rows for key, rows in buckets.items() if rows}
+
+
+def _prepare_intra_task_sampling_groups(
+    *,
+    train_examples_by_task: dict[str, list[QAExample]],
+    intra_task_sampling: dict[str, str],
+    best_move_center_not_optimal_ratio: float,
+) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for task_name, strategy in sorted(intra_task_sampling.items()):
+        rows = list(train_examples_by_task.get(task_name, []))
+        if not rows:
+            continue
+        buckets = _build_intra_task_buckets(rows, strategy=strategy)
+        if len(buckets) < 2:
+            continue
+        group_payload: dict[str, Any] = {
+            "strategy": strategy,
+            "bucket_keys": sorted(buckets.keys()),
+            "buckets": buckets,
+        }
+        if strategy == "center_hard_negative":
+            center_not_optimal_key = "center_not_optimal"
+            other_key = "other"
+            weights: dict[str, float] = {}
+            for key in sorted(buckets.keys()):
+                if key == center_not_optimal_key:
+                    weights[key] = float(best_move_center_not_optimal_ratio)
+                elif key == other_key:
+                    weights[key] = float(1.0 - best_move_center_not_optimal_ratio)
+                else:
+                    weights[key] = 1.0
+            total = sum(max(0.0, float(value)) for value in weights.values())
+            if total > 0.0:
+                group_payload["bucket_pick_weights"] = {
+                    key: max(0.0, float(weights[key])) / total for key in sorted(weights.keys())
+                }
+        out[task_name] = group_payload
+    return out
+
+
+def _sample_training_example(
+    *,
+    task_name: str,
+    train_examples_by_task: dict[str, list[QAExample]],
+    intra_task_sampling_groups: dict[str, dict[str, Any]],
+    rng: random.Random,
+) -> QAExample:
+    default_rows = train_examples_by_task[task_name]
+    group = intra_task_sampling_groups.get(task_name)
+    if not group:
+        return rng.choice(default_rows)
+
+    bucket_keys = list(group.get("bucket_keys", []))
+    buckets = group.get("buckets", {})
+    if not bucket_keys or not isinstance(buckets, dict):
+        return rng.choice(default_rows)
+
+    bucket_pick_weights_map = group.get("bucket_pick_weights", {})
+    bucket_pick_weights: Optional[list[float]] = None
+    if isinstance(bucket_pick_weights_map, dict):
+        candidate = [float(bucket_pick_weights_map.get(key, 0.0)) for key in bucket_keys]
+        if any(weight > 0.0 for weight in candidate):
+            bucket_pick_weights = candidate
+
+    if bucket_pick_weights is not None:
+        bucket_key = rng.choices(bucket_keys, weights=bucket_pick_weights, k=1)[0]
+    else:
+        bucket_key = rng.choice(bucket_keys)
+    bucket_rows = buckets.get(bucket_key)
+    if isinstance(bucket_rows, list) and bucket_rows:
+        return rng.choice(bucket_rows)
+    return rng.choice(default_rows)
+
+
 def _resolve_max_tokens_by_task(
     *,
     config_map: dict[str, Any],
@@ -473,6 +627,50 @@ def _resolve_max_tokens_by_task(
             _normalize_max_tokens_by_task(
                 cli_map,
                 source="--max-tokens-by-task-json",
+            )
+        )
+    return resolved
+
+
+def _normalize_intra_task_sampling(raw_map: dict[str, Any], *, source: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for raw_task, raw_strategy in raw_map.items():
+        try:
+            task = normalize_task_type(str(raw_task).strip())
+        except ValueError as exc:
+            raise ValueError(f"{source}: unknown task_type '{raw_task}'") from exc
+        strategy = str(raw_strategy).strip().lower()
+        if not strategy:
+            continue
+        allowed = INTRA_TASK_SAMPLING_STRATEGIES.get(task)
+        if not allowed:
+            raise ValueError(
+                f"{source}: task_type '{task}' does not support intra-task sampling strategies"
+            )
+        if strategy not in allowed:
+            raise ValueError(
+                f"{source}: strategy '{strategy}' is not valid for task_type '{task}'. "
+                f"allowed={sorted(allowed)}"
+            )
+        out[task] = strategy
+    return out
+
+
+def _resolve_intra_task_sampling(
+    *,
+    config_map: dict[str, Any],
+    cli_override_json: str,
+) -> dict[str, str]:
+    resolved = _normalize_intra_task_sampling(
+        config_map,
+        source="config intra_task_sampling_json",
+    )
+    if str(cli_override_json or "").strip():
+        cli_map = _parse_json_object_arg(cli_override_json, "--intra-task-sampling-json")
+        resolved.update(
+            _normalize_intra_task_sampling(
+                cli_map,
+                source="--intra-task-sampling-json",
             )
         )
     return resolved
@@ -677,7 +875,7 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
     )
     parser.add_argument(
         "--checkpoint-avg-metric",
-        choices=["eval_reward_mean"],
+        choices=list(CHECKPOINT_AVG_METRIC_CHOICES),
         default=_cfg_str(config, "checkpoint_avg_metric", "eval_reward_mean"),
     )
     parser.add_argument(
@@ -688,19 +886,73 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
 
     parser.add_argument(
         "--best-metric",
-        choices=[
-            "eval_reward_mean",
-            "eval_best_move_set_accuracy",
-            "eval_best_move_canonical_accuracy",
-            "eval_exact_accuracy_non_best_move",
-            "eval_json_parse_rate",
-        ],
+        choices=list(CHECKPOINT_AVG_METRIC_CHOICES),
         default=_cfg_str(config, "best_metric", "eval_reward_mean"),
     )
     parser.add_argument(
         "--best-move-optimal-reward",
         type=float,
         default=_cfg_float(config, "best_move_optimal_reward", 0.7),
+    )
+    parser.add_argument(
+        "--best-move-reward-mode",
+        choices=list(BEST_MOVE_REWARD_MODES),
+        default=_cfg_str(config, "best_move_reward_mode", "ranked"),
+    )
+    parser.add_argument(
+        "--best-move-wrong-rank-scale",
+        type=float,
+        default=_cfg_float(config, "best_move_wrong_rank_scale", 1.0),
+    )
+    parser.add_argument(
+        "--best-move-center-not-optimal-ratio",
+        type=float,
+        default=_cfg_float(config, "best_move_center_not_optimal_ratio", 0.7),
+        help=(
+            "When intra-task strategy center_hard_negative is active for best_move, "
+            "target sampling probability for rows where center is not optimal."
+        ),
+    )
+    parser.add_argument(
+        "--intra-task-sampling-json",
+        default="",
+        help=(
+            "JSON object for intra-task bucket sampling strategies: "
+            "{\"turn_player\":\"balanced_player\",\"available_moves_count\":\"uniform_count\","
+            "\"best_move\":\"center_hard_negative\"}."
+        ),
+    )
+    center_bias_gate_group = parser.add_mutually_exclusive_group()
+    center_bias_gate_group.add_argument(
+        "--center-bias-gate",
+        dest="center_bias_gate_enabled",
+        action="store_true",
+        help="Enable early stop gate for excessive best_move center prediction bias.",
+    )
+    center_bias_gate_group.add_argument(
+        "--no-center-bias-gate",
+        dest="center_bias_gate_enabled",
+        action="store_false",
+        help="Disable early stop gate for best_move center prediction bias.",
+    )
+    parser.set_defaults(center_bias_gate_enabled=_cfg_bool(config, "center_bias_gate_enabled", False))
+    parser.add_argument(
+        "--center-bias-gate-threshold",
+        type=float,
+        default=_cfg_float(config, "center_bias_gate_threshold", 0.6),
+        help="Trigger gate when eval_best_move_center_prediction_rate exceeds this threshold.",
+    )
+    parser.add_argument(
+        "--center-bias-gate-after-evals",
+        type=int,
+        default=_cfg_int(config, "center_bias_gate_after_evals", 1),
+        help="Number of periodic eval windows before center-bias gate activates.",
+    )
+    parser.add_argument(
+        "--center-bias-gate-min-best-move-samples",
+        type=int,
+        default=_cfg_int(config, "center_bias_gate_min_best_move_samples", 100),
+        help="Minimum best_move eval rows required before center-bias gate can trigger.",
     )
     early_stop_group = parser.add_mutually_exclusive_group()
     early_stop_group.add_argument(
@@ -771,6 +1023,12 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
     parser.add_argument("--wandb-project", default=_cfg_str(config, "wandb_project", "moondream-ttt-query-rl"))
     parser.add_argument("--wandb-run-name", default=_cfg_str(config, "wandb_run_name", ""))
     parser.add_argument(
+        "--wandb-log-profile",
+        choices=list(WANDB_LOG_PROFILES),
+        default=_cfg_str(config, "wandb_log_profile", "legacy"),
+        help="legacy keeps all prefixed eval streams; lean keeps only core streams.",
+    )
+    parser.add_argument(
         "--no-progress",
         action="store_true",
         default=_cfg_bool(config, "no_progress", False),
@@ -808,6 +1066,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             DEFAULT_MAX_TOKENS_BY_TASK,
         ),
         cli_override_json=args.max_tokens_by_task_json,
+    )
+    args.intra_task_sampling = _resolve_intra_task_sampling(
+        config_map=_cfg_dict(config, "intra_task_sampling_json", {}),
+        cli_override_json=args.intra_task_sampling_json,
     )
     return args
 
@@ -892,6 +1154,18 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
     if not (0.0 <= args.best_move_optimal_reward <= 1.0):
         raise ValueError("--best-move-optimal-reward must be in [0,1]")
+    if not (0.0 <= args.best_move_wrong_rank_scale <= 1.0):
+        raise ValueError("--best-move-wrong-rank-scale must be in [0,1]")
+    if not (0.0 <= args.best_move_center_not_optimal_ratio <= 1.0):
+        raise ValueError("--best-move-center-not-optimal-ratio must be in [0,1]")
+    if not (0.0 <= args.center_bias_gate_threshold <= 1.0):
+        raise ValueError("--center-bias-gate-threshold must be in [0,1]")
+    if args.center_bias_gate_after_evals < 0:
+        raise ValueError("--center-bias-gate-after-evals must be >= 0")
+    if args.center_bias_gate_min_best_move_samples <= 0:
+        raise ValueError("--center-bias-gate-min-best-move-samples must be > 0")
+    if args.wandb_log_profile not in WANDB_LOG_PROFILES:
+        raise ValueError(f"--wandb-log-profile must be one of {list(WANDB_LOG_PROFILES)}")
     if args.early_stop_mode not in EARLY_STOP_MODES:
         raise ValueError(f"--early-stop-mode must be one of {list(EARLY_STOP_MODES)}")
     if not args.checkpoint_avg_splits:
@@ -1227,6 +1501,8 @@ def _score_payload_for_example(
     pred_payload: Optional[dict[str, Any]],
     *,
     best_move_optimal_reward: float,
+    best_move_reward_mode: str = "ranked",
+    best_move_wrong_rank_scale: float = 1.0,
 ) -> ScoreOutcome:
     if pred_payload is None:
         return ScoreOutcome(
@@ -1248,17 +1524,28 @@ def _score_payload_for_example(
         set_correct = move in example.best_move_optimal_set if move is not None else False
         canonical_correct = move == example.best_move_canonical if move is not None else False
         scores_by_move = {m: (value, depth) for m, value, depth in example.best_move_scores}
-        if scores_by_move:
-            reward = _ranked_best_move_reward(move, scores_by_move=scores_by_move)
-        elif canonical_correct:
-            reward = 1.0
-        elif set_correct:
-            reward = float(best_move_optimal_reward)
+        if best_move_reward_mode == "binary":
+            reward = 1.0 if set_correct else 0.0
+        elif best_move_reward_mode == "hybrid_strict":
+            if set_correct:
+                reward = 1.0
+            elif scores_by_move:
+                ranked_reward = _ranked_best_move_reward(move, scores_by_move=scores_by_move)
+                reward = float(best_move_wrong_rank_scale) * float(ranked_reward)
+            else:
+                reward = 0.0
         else:
-            reward = 0.0
+            if scores_by_move:
+                reward = _ranked_best_move_reward(move, scores_by_move=scores_by_move)
+            elif canonical_correct:
+                reward = 1.0
+            elif set_correct:
+                reward = float(best_move_optimal_reward)
+            else:
+                reward = 0.0
 
         return ScoreOutcome(
-            reward=reward,
+            reward=max(0.0, min(1.0, float(reward))),
             parse_success=True,
             task_correct=set_correct,
             json_object_parsed=True,
@@ -1302,6 +1589,8 @@ def _score_rollout_for_example(
     example: QAExample,
     *,
     best_move_optimal_reward: float,
+    best_move_reward_mode: str = "ranked",
+    best_move_wrong_rank_scale: float = 1.0,
 ) -> ScoreOutcome:
     answer_text = _extract_rollout_answer(rollout)
     pred_payload = _parse_prediction_json(answer_text)
@@ -1309,6 +1598,8 @@ def _score_rollout_for_example(
         example,
         pred_payload,
         best_move_optimal_reward=best_move_optimal_reward,
+        best_move_reward_mode=best_move_reward_mode,
+        best_move_wrong_rank_scale=best_move_wrong_rank_scale,
     )
 
 
@@ -1571,6 +1862,8 @@ def _evaluate_split(
     max_tokens_by_task: dict[str, int],
     reasoning: bool,
     best_move_optimal_reward: float,
+    best_move_reward_mode: str,
+    best_move_wrong_rank_scale: float,
     show_progress: bool,
     fixed_indices: Optional[list[int]] = None,
 ) -> dict[str, float]:
@@ -1591,6 +1884,8 @@ def _evaluate_split(
     best_move_total = 0
     best_move_set_correct = 0
     best_move_canonical_correct = 0
+    best_move_center_prediction_count = 0
+    best_move_invalid_prediction_count = 0
 
     non_best_total = 0
     non_best_exact_correct = 0
@@ -1601,6 +1896,7 @@ def _evaluate_split(
     def _consume_batch(batch_examples: list[QAExample]) -> None:
         nonlocal total_scored, reward_sum, object_parse_count, parse_success_count
         nonlocal best_move_total, best_move_set_correct, best_move_canonical_correct
+        nonlocal best_move_center_prediction_count, best_move_invalid_prediction_count
         nonlocal non_best_total, non_best_exact_correct
 
         if not batch_examples:
@@ -1646,11 +1942,18 @@ def _evaluate_split(
 
             if not result.rollouts:
                 outcome = ScoreOutcome(reward=0.0, parse_success=False, task_correct=False)
+                pred_move: Optional[int] = None
             else:
-                outcome = _score_rollout_for_example(
-                    result.rollouts[0],
+                rollout = result.rollouts[0]
+                answer_text = _extract_rollout_answer(rollout)
+                pred_payload = _parse_prediction_json(answer_text)
+                pred_move = _move_from_payload_obj(pred_payload)
+                outcome = _score_payload_for_example(
                     item,
+                    pred_payload,
                     best_move_optimal_reward=best_move_optimal_reward,
+                    best_move_reward_mode=best_move_reward_mode,
+                    best_move_wrong_rank_scale=best_move_wrong_rank_scale,
                 )
 
             reward_sum += float(outcome.reward)
@@ -1663,6 +1966,10 @@ def _evaluate_split(
 
             if item.task_type == "best_move":
                 best_move_total += 1
+                if pred_move == 5:
+                    best_move_center_prediction_count += 1
+                if pred_move is None:
+                    best_move_invalid_prediction_count += 1
                 if outcome.best_move_set_correct:
                     best_move_set_correct += 1
                 if outcome.best_move_canonical_correct:
@@ -1698,6 +2005,8 @@ def _evaluate_split(
             "eval_json_parse_rate": 0.0,
             "eval_best_move_set_accuracy": 0.0,
             "eval_best_move_canonical_accuracy": 0.0,
+            "eval_best_move_center_prediction_rate": 0.0,
+            "eval_best_move_invalid_prediction_rate": 0.0,
             "eval_exact_accuracy_non_best_move": 0.0,
         }
         for task in sorted(SUPPORTED_TASKS):
@@ -1712,6 +2021,12 @@ def _evaluate_split(
         "eval_json_parse_rate": parse_success_count / total_scored,
         "eval_best_move_set_accuracy": best_move_set_correct / max(1, best_move_total),
         "eval_best_move_canonical_accuracy": best_move_canonical_correct / max(1, best_move_total),
+        "eval_best_move_center_prediction_rate": (
+            best_move_center_prediction_count / max(1, best_move_total)
+        ),
+        "eval_best_move_invalid_prediction_rate": (
+            best_move_invalid_prediction_count / max(1, best_move_total)
+        ),
         "eval_exact_accuracy_non_best_move": non_best_exact_correct / max(1, non_best_total),
     }
 
@@ -1878,12 +2193,16 @@ def _compose_train_groups(
     return mixed, desired_off_policy
 
 
-def _rank_checkpoint_eval_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _rank_checkpoint_eval_history(
+    history: list[dict[str, Any]],
+    *,
+    metric_key: str = "avg_checkpoint_metric",
+) -> list[dict[str, Any]]:
     saved_entries = [item for item in history if bool(item.get("checkpoint_saved"))]
     candidates = saved_entries if saved_entries else history
     return sorted(
         candidates,
-        key=lambda item: float(item.get("avg_eval_reward_mean", 0.0)),
+        key=lambda item: float(item.get(metric_key, item.get("avg_eval_reward_mean", 0.0))),
         reverse=True,
     )
 
@@ -1896,9 +2215,21 @@ def _build_checkpoint_ranking_payload(
     checkpoint_eval_history: list[dict[str, Any]],
     training_status: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    ranking = _rank_checkpoint_eval_history(checkpoint_eval_history)
-    best_avg_eval_reward = float(ranking[0]["avg_eval_reward_mean"]) if ranking else 0.0
-    best_avg_eval_reward_step = int(ranking[0]["step"]) if ranking else -1
+    ranking = _rank_checkpoint_eval_history(
+        checkpoint_eval_history,
+        metric_key="avg_checkpoint_metric",
+    )
+    best_avg_checkpoint_metric = (
+        float(ranking[0].get("avg_checkpoint_metric", ranking[0].get("avg_eval_reward_mean", 0.0)))
+        if ranking
+        else 0.0
+    )
+    best_avg_checkpoint_metric_step = int(ranking[0]["step"]) if ranking else -1
+    best_avg_eval_reward = (
+        float(ranking[0].get("avg_eval_reward_mean", best_avg_checkpoint_metric))
+        if ranking
+        else 0.0
+    )
     status_payload = dict(training_status or {})
     status_payload.setdefault("stopped_early", False)
     status_payload.setdefault("stop_reason", "")
@@ -1910,8 +2241,10 @@ def _build_checkpoint_ranking_payload(
         "finetune_id": finetune_id,
         "checkpoint_avg_metric": checkpoint_avg_metric,
         "checkpoint_avg_splits": checkpoint_avg_splits,
+        "best_avg_checkpoint_metric": best_avg_checkpoint_metric,
+        "best_avg_checkpoint_metric_step": best_avg_checkpoint_metric_step,
         "best_avg_eval_reward": best_avg_eval_reward,
-        "best_avg_eval_reward_step": best_avg_eval_reward_step,
+        "best_avg_eval_reward_step": best_avg_checkpoint_metric_step,
         "training_status": status_payload,
         "rankings": ranking,
     }
@@ -1925,9 +2258,50 @@ def _select_eval_wandb_metrics(metrics: dict[str, float]) -> dict[str, float]:
     selected = _filter_wandb_metrics(metrics, MAIN_EVAL_WANDB_METRIC_KEYS)
     for task in sorted(SUPPORTED_TASKS):
         key = f"eval_task_accuracy_{task}"
-        if key in metrics:
+        count_key = f"eval_task_count_{task}"
+        task_count = float(metrics.get(count_key, 0.0))
+        if key in metrics and task_count > 0.0:
             selected[key] = metrics[key]
     return selected
+
+
+def _should_log_prefixed_eval_streams(*, wandb_log_profile: str) -> bool:
+    return str(wandb_log_profile).strip().lower() == "legacy"
+
+
+def _checkpoint_wandb_payload(
+    *,
+    avg_checkpoint_metric: float,
+    avg_eval_reward_mean: float,
+    wandb_log_profile: str,
+) -> dict[str, float]:
+    if _should_log_prefixed_eval_streams(wandb_log_profile=wandb_log_profile):
+        return {
+            "checkpoint_avg_metric": float(avg_checkpoint_metric),
+            "checkpoint_avg_eval_reward_mean": float(avg_eval_reward_mean),
+        }
+    return {
+        "checkpoint_avg_metric_value": float(avg_checkpoint_metric),
+    }
+
+
+def _should_trigger_center_bias_gate(
+    *,
+    enabled: bool,
+    eval_index: int,
+    gate_after_evals: int,
+    center_prediction_rate: float,
+    gate_threshold: float,
+    best_move_samples: float,
+    min_best_move_samples: int,
+) -> bool:
+    if not bool(enabled):
+        return False
+    if int(eval_index) < int(gate_after_evals):
+        return False
+    if float(best_move_samples) < float(min_best_move_samples):
+        return False
+    return float(center_prediction_rate) > float(gate_threshold)
 
 
 def _is_checkpoint_not_found_error(exc: Exception) -> bool:
@@ -1965,6 +2339,9 @@ def _select_checkpoint_step_for_auto_benchmark(
     ranking_payload: dict[str, Any],
     fallback_step: Optional[int],
 ) -> Optional[int]:
+    ranked_checkpoint_metric_step = _parse_int(ranking_payload.get("best_avg_checkpoint_metric_step"))
+    if ranked_checkpoint_metric_step is not None and ranked_checkpoint_metric_step >= 0:
+        return int(ranked_checkpoint_metric_step)
     ranked_step = _parse_int(ranking_payload.get("best_avg_eval_reward_step"))
     if ranked_step is not None and ranked_step >= 0:
         return int(ranked_step)
@@ -2055,6 +2432,10 @@ def _build_auto_benchmark_command(
         str(args.dataset_source),
         "--best-move-optimal-reward",
         str(float(args.best_move_optimal_reward)),
+        "--best-move-reward-mode",
+        str(args.best_move_reward_mode),
+        "--best-move-wrong-rank-scale",
+        str(float(args.best_move_wrong_rank_scale)),
         "--output-json",
         str(output_json),
         "--predictions-jsonl",
@@ -2240,6 +2621,36 @@ def main(argv: Optional[list[str]] = None) -> None:
         train_examples_by_task.setdefault(item.task_type, []).append(item)
     if not train_examples_by_task:
         raise ValueError("train split has no task-indexable examples")
+    intra_task_sampling_groups = _prepare_intra_task_sampling_groups(
+        train_examples_by_task=train_examples_by_task,
+        intra_task_sampling=args.intra_task_sampling,
+        best_move_center_not_optimal_ratio=float(args.best_move_center_not_optimal_ratio),
+    )
+    if args.intra_task_sampling:
+        for task_name, strategy in sorted(args.intra_task_sampling.items()):
+            rows = train_examples_by_task.get(task_name, [])
+            if not rows:
+                print(
+                    f"intra-task sampling ignored for task={task_name}: no train rows available"
+                )
+                continue
+            group = intra_task_sampling_groups.get(task_name)
+            if group is None:
+                print(
+                    f"intra-task sampling ignored for task={task_name}: strategy={strategy} "
+                    "requires >=2 non-empty buckets"
+                )
+                continue
+            bucket_sizes = {
+                key: len(group["buckets"][key])
+                for key in group["bucket_keys"]
+                if isinstance(group["buckets"].get(key), list)
+            }
+            print(
+                f"intra-task sampling active for task={task_name}: strategy={strategy} "
+                f"buckets={bucket_sizes} "
+                f"weights={group.get('bucket_pick_weights', {})}"
+            )
 
     sampling_tasks = sorted(train_examples_by_task.keys())
     sampling_weights = _weights_for_sampling_tasks(
@@ -2382,11 +2793,20 @@ def main(argv: Optional[list[str]] = None) -> None:
             "skip_final_eval": args.skip_final_eval,
             "best_metric": args.best_metric,
             "best_move_optimal_reward": args.best_move_optimal_reward,
+            "best_move_reward_mode": args.best_move_reward_mode,
+            "best_move_wrong_rank_scale": args.best_move_wrong_rank_scale,
+            "best_move_center_not_optimal_ratio": args.best_move_center_not_optimal_ratio,
+            "center_bias_gate_enabled": bool(args.center_bias_gate_enabled),
+            "center_bias_gate_threshold": args.center_bias_gate_threshold,
+            "center_bias_gate_after_evals": args.center_bias_gate_after_evals,
+            "center_bias_gate_min_best_move_samples": args.center_bias_gate_min_best_move_samples,
+            "intra_task_sampling_json": dict(args.intra_task_sampling),
             "checkpoint_ranking_output": args.checkpoint_ranking_output,
             "auto_benchmark_best_checkpoint": bool(args.auto_benchmark_best_checkpoint),
             "auto_benchmark_config": str(args.auto_benchmark_config),
             "auto_benchmark_output_json": str(args.auto_benchmark_output_json or ""),
             "auto_benchmark_predictions_jsonl": str(args.auto_benchmark_predictions_jsonl or ""),
+            "wandb_log_profile": str(args.wandb_log_profile),
         },
     )
     run.summary["finetune_id"] = finetune.finetune_id
@@ -2398,6 +2818,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     reward_drop_streak = 0
     recent_eval_rewards: list[float] = []
     completed_steps = 0
+    periodic_eval_count = 0
     training_status = _default_training_status(
         target_steps=int(args.num_steps),
         early_stop_mode=str(args.early_stop_mode),
@@ -2429,13 +2850,16 @@ def main(argv: Optional[list[str]] = None) -> None:
                 max_tokens_by_task=args.max_tokens_by_task,
                 reasoning=eval_reasoning,
                 best_move_optimal_reward=args.best_move_optimal_reward,
+                best_move_reward_mode=args.best_move_reward_mode,
+                best_move_wrong_rank_scale=args.best_move_wrong_rank_scale,
                 show_progress=show_progress,
                 fixed_indices=fixed_eval_indices_by_split.get(split_name),
             )
             by_split[split_name] = split_metrics
-            prefix = f"checkpoint_{_sanitize_split_name(split_name)}_"
-            split_wandb_metrics = _select_eval_wandb_metrics(split_metrics)
-            wandb.log({f"{prefix}{k}": v for k, v in split_wandb_metrics.items()}, step=step_for_log)
+            if _should_log_prefixed_eval_streams(wandb_log_profile=args.wandb_log_profile):
+                prefix = f"checkpoint_{_sanitize_split_name(split_name)}_"
+                split_wandb_metrics = _select_eval_wandb_metrics(split_metrics)
+                wandb.log({f"{prefix}{k}": v for k, v in split_wandb_metrics.items()}, step=step_for_log)
             print(
                 f"{stage_label} eval step={step_for_log} split={split_name} "
                 f"reward={split_metrics['eval_reward_mean']:.4f} "
@@ -2443,19 +2867,30 @@ def main(argv: Optional[list[str]] = None) -> None:
                 f"parse={split_metrics['eval_json_parse_rate']:.4f}"
             )
 
-        avg_eval_reward = float(
+        avg_checkpoint_metric = float(
             np.mean([float(m.get(args.checkpoint_avg_metric, 0.0)) for m in by_split.values()])
         )
-        wandb.log({"checkpoint_avg_eval_reward_mean": avg_eval_reward}, step=step_for_log)
+        avg_eval_reward_mean = float(
+            np.mean([float(m.get("eval_reward_mean", 0.0)) for m in by_split.values()])
+        )
+        wandb.log(
+            _checkpoint_wandb_payload(
+                avg_checkpoint_metric=avg_checkpoint_metric,
+                avg_eval_reward_mean=avg_eval_reward_mean,
+                wandb_log_profile=args.wandb_log_profile,
+            ),
+            step=step_for_log,
+        )
         print(
             f"{stage_label} checkpoint average step={step_for_log} "
-            f"{args.checkpoint_avg_metric}={avg_eval_reward:.4f}"
+            f"{args.checkpoint_avg_metric}={avg_checkpoint_metric:.4f}"
         )
 
         checkpoint_eval_history.append(
             {
                 "step": int(step_for_log),
-                "avg_eval_reward_mean": avg_eval_reward,
+                "avg_checkpoint_metric": avg_checkpoint_metric,
+                "avg_eval_reward_mean": avg_eval_reward_mean,
                 "checkpoint_avg_metric": args.checkpoint_avg_metric,
                 "split_metrics": {k: _numeric_metrics_only(v) for k, v in by_split.items()},
             }
@@ -2487,11 +2922,14 @@ def main(argv: Optional[list[str]] = None) -> None:
                 max_tokens_by_task=args.max_tokens_by_task,
                 reasoning=eval_reasoning,
                 best_move_optimal_reward=args.best_move_optimal_reward,
+                best_move_reward_mode=args.best_move_reward_mode,
+                best_move_wrong_rank_scale=args.best_move_wrong_rank_scale,
                 show_progress=show_progress,
                 fixed_indices=fixed_eval_indices_by_split.get(args.val_split),
             )
         baseline_wandb_metrics = _select_eval_wandb_metrics(baseline_metrics)
-        wandb.log({f"baseline_{k}": v for k, v in baseline_wandb_metrics.items()}, step=args.resume_step)
+        if _should_log_prefixed_eval_streams(wandb_log_profile=args.wandb_log_profile):
+            wandb.log({f"baseline_{k}": v for k, v in baseline_wandb_metrics.items()}, step=args.resume_step)
 
         baseline_metric = float(baseline_metrics.get(args.best_metric, 0.0))
         best_metric_value = baseline_metric
@@ -2529,7 +2967,15 @@ def main(argv: Optional[list[str]] = None) -> None:
         completed_steps = step + 1
 
         sampled_tasks = rng.choices(sampling_tasks, weights=sampling_weights, k=args.batch_size)
-        batch = [rng.choice(train_examples_by_task[task_name]) for task_name in sampled_tasks]
+        batch = [
+            _sample_training_example(
+                task_name=task_name,
+                train_examples_by_task=train_examples_by_task,
+                intra_task_sampling_groups=intra_task_sampling_groups,
+                rng=rng,
+            )
+            for task_name in sampled_tasks
+        ]
         requests, active_examples = _prepare_requests(
             batch,
             temperature=args.temperature,
@@ -2580,6 +3026,8 @@ def main(argv: Optional[list[str]] = None) -> None:
                     rollout,
                     item,
                     best_move_optimal_reward=args.best_move_optimal_reward,
+                    best_move_reward_mode=args.best_move_reward_mode,
+                    best_move_wrong_rank_scale=args.best_move_wrong_rank_scale,
                 )
                 rewards.append(outcome.reward)
                 rewards_all.append(outcome.reward)
@@ -2661,6 +3109,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             )
 
         if args.eval_every > 0 and (global_step + 1) % args.eval_every == 0:
+            periodic_eval_count += 1
             eval_by_split = _run_checkpoint_eval(
                 step_for_log=global_step,
                 seed_base=args.seed + 1000 + (global_step * 13),
@@ -2684,6 +3133,8 @@ def main(argv: Optional[list[str]] = None) -> None:
                     max_tokens_by_task=args.max_tokens_by_task,
                     reasoning=eval_reasoning,
                     best_move_optimal_reward=args.best_move_optimal_reward,
+                    best_move_reward_mode=args.best_move_reward_mode,
+                    best_move_wrong_rank_scale=args.best_move_wrong_rank_scale,
                     show_progress=show_progress,
                     fixed_indices=fixed_eval_indices_by_split.get(args.val_split),
                 )
@@ -2732,6 +3183,37 @@ def main(argv: Optional[list[str]] = None) -> None:
                     print(f"checkpoint saved at eval step={global_step} (save_on_eval=true)")
             elif checkpoint_eval_history and "checkpoint_saved" not in checkpoint_eval_history[-1]:
                 checkpoint_eval_history[-1]["checkpoint_saved"] = False
+
+            center_prediction_rate = float(
+                eval_metrics.get("eval_best_move_center_prediction_rate", 0.0)
+            )
+            best_move_eval_samples = float(
+                eval_metrics.get("eval_task_count_best_move", 0.0)
+            )
+            if _should_trigger_center_bias_gate(
+                enabled=bool(args.center_bias_gate_enabled),
+                eval_index=int(periodic_eval_count),
+                gate_after_evals=int(args.center_bias_gate_after_evals),
+                center_prediction_rate=center_prediction_rate,
+                gate_threshold=float(args.center_bias_gate_threshold),
+                best_move_samples=best_move_eval_samples,
+                min_best_move_samples=int(args.center_bias_gate_min_best_move_samples),
+            ):
+                training_status.update(
+                    {
+                        "stopped_early": True,
+                        "stop_reason": "collapse_center_bias",
+                        "completed_steps": int(completed_steps),
+                        "collapse_detected": True,
+                    }
+                )
+                print(
+                    f"center-bias gate triggered at step={global_step}: "
+                    f"center_rate={center_prediction_rate:.4f} "
+                    f"threshold={float(args.center_bias_gate_threshold):.4f} "
+                    f"best_move_samples={best_move_eval_samples:.0f}"
+                )
+                break
 
             eval_reward_value = float(eval_metrics.get("eval_reward_mean", 0.0))
             eval_parse_rate_value = float(eval_metrics.get("eval_json_parse_rate", 0.0))
@@ -2811,12 +3293,15 @@ def main(argv: Optional[list[str]] = None) -> None:
                 max_tokens_by_task=args.max_tokens_by_task,
                 reasoning=eval_reasoning,
                 best_move_optimal_reward=args.best_move_optimal_reward,
+                best_move_reward_mode=args.best_move_reward_mode,
+                best_move_wrong_rank_scale=args.best_move_wrong_rank_scale,
                 show_progress=show_progress,
                 fixed_indices=fixed_eval_indices_by_split.get(split_name),
             )
             prefix = _metric_prefix_for_split(split_name)
             final_eval_wandb_metrics = _select_eval_wandb_metrics(eval_metrics)
-            wandb.log({f"{prefix}{k}": v for k, v in final_eval_wandb_metrics.items()}, step=final_eval_step)
+            if _should_log_prefixed_eval_streams(wandb_log_profile=args.wandb_log_profile):
+                wandb.log({f"{prefix}{k}": v for k, v in final_eval_wandb_metrics.items()}, step=final_eval_step)
 
             print(
                 f"final eval split={split_name} reward={eval_metrics['eval_reward_mean']:.4f} "
@@ -2835,12 +3320,16 @@ def main(argv: Optional[list[str]] = None) -> None:
         training_status=training_status,
     )
     checkpoint_ranking = ranking_payload["rankings"]
+    best_avg_checkpoint_metric = float(ranking_payload.get("best_avg_checkpoint_metric", 0.0))
+    best_avg_checkpoint_metric_step = int(ranking_payload.get("best_avg_checkpoint_metric_step", -1))
     best_avg_eval_reward = float(ranking_payload["best_avg_eval_reward"])
     best_avg_eval_reward_step = int(ranking_payload["best_avg_eval_reward_step"])
     if checkpoint_ranking:
         print(
-            "best checkpoint by average eval reward: "
-            f"step={best_avg_eval_reward_step} avg_eval_reward_mean={best_avg_eval_reward:.4f} "
+            "best checkpoint by configured average metric: "
+            f"step={best_avg_checkpoint_metric_step} "
+            f"{args.checkpoint_avg_metric}={best_avg_checkpoint_metric:.4f} "
+            f"avg_eval_reward_mean={best_avg_eval_reward:.4f} "
             f"splits={checkpoint_avg_splits}"
         )
     else:
@@ -2892,9 +3381,16 @@ def main(argv: Optional[list[str]] = None) -> None:
     run.summary["best_metric_name"] = args.best_metric
     run.summary["best_metric_value"] = float(best_metric_value or 0.0)
     run.summary["best_metric_step"] = int(best_step if best_step is not None else -1)
+    run.summary["wandb_log_profile"] = str(args.wandb_log_profile)
+    run.summary["best_move_center_not_optimal_ratio"] = float(args.best_move_center_not_optimal_ratio)
+    run.summary["center_bias_gate_enabled"] = bool(args.center_bias_gate_enabled)
+    run.summary["center_bias_gate_threshold"] = float(args.center_bias_gate_threshold)
     run.summary["finetune_id"] = finetune.finetune_id
     run.summary["train_rows"] = len(train_examples)
     run.summary["val_rows"] = len(val_examples)
+    run.summary["checkpoint_avg_metric_name"] = args.checkpoint_avg_metric
+    run.summary["best_avg_checkpoint_metric"] = float(best_avg_checkpoint_metric)
+    run.summary["best_avg_checkpoint_metric_step"] = int(best_avg_checkpoint_metric_step)
     run.summary["best_avg_eval_reward"] = float(best_avg_eval_reward)
     run.summary["best_avg_eval_reward_step"] = int(best_avg_eval_reward_step)
     run.summary["best_avg_eval_reward_splits"] = ",".join(checkpoint_avg_splits)
@@ -2932,8 +3428,9 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     print(
         f"done. finetune_id={finetune.finetune_id} best_{args.best_metric}={best_metric_value} "
-        f"best_step={best_step} best_avg_eval_reward={best_avg_eval_reward} "
-        f"best_avg_eval_reward_step={best_avg_eval_reward_step} "
+        f"best_step={best_step} best_avg_checkpoint_metric={best_avg_checkpoint_metric} "
+        f"best_avg_checkpoint_metric_step={best_avg_checkpoint_metric_step} "
+        f"best_avg_eval_reward={best_avg_eval_reward} "
         f"auto_benchmark_success={auto_benchmark_success} "
         f"auto_benchmark_step={auto_benchmark_checkpoint_step} "
         f"stopped_early={training_status.get('stopped_early')} "

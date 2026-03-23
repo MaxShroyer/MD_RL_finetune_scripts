@@ -106,6 +106,10 @@ python football_detect/train_football_detect.py \
   --prompt-overrides-json '{"ball holder":"player holding the football"}'
 ```
 
+Experimental prompt variant:
+
+- `football_detect/configs/cicd/cicd_train_football_detect_repaired_offpolicy_lr1e4_r32_g2_f1_playfocus_groupbox.json` narrows `area of focus` to the ball carrier and nearby play participants, and asks grouped player classes to return one enclosing box instead of per-player boxes.
+
 Default football prompts:
 
 - `ball holder` -> `ball carrier`

@@ -543,6 +543,21 @@ def _tasks_from_base_sample(
     return tasks
 
 
+def _single_class_point_mode_warnings(
+    *,
+    skill: str,
+    all_class_names: list[str],
+) -> list[str]:
+    if skill != "point" or len(all_class_names) != 1:
+        return []
+    return [
+        "warning: single-class point mode: --neg-prompts-per-nonempty is inert because non-empty rows have no absent classes.",
+        "warning: single-class point mode: --pos-task-prob is inert because non-empty rows only generate positive tasks.",
+        "warning: single-class point mode: --max-objects is inert because point requests do not use object caps.",
+        "warning: single-class point mode: eval_miou is not meaningful; rank runs by eval_f1 instead.",
+    ]
+
+
 def _box_from_normalized(x_min: float, y_min: float, x_max: float, y_max: float) -> DetectAnnotation:
     x_min = _clamp(float(x_min))
     y_min = _clamp(float(y_min))
@@ -1022,6 +1037,30 @@ def _reward_f1_points(
     return (2.0 * float(tp)) / denom
 
 
+def _micro_f1_from_counts(tp: int, fp: int, fn: int) -> float:
+    denom = (2 * int(tp)) + int(fp) + int(fn)
+    if denom == 0:
+        return 1.0
+    return (2.0 * float(tp)) / float(denom)
+
+
+def _update_kl_guard(
+    *,
+    kl_value: float,
+    warning_threshold: float,
+    stop_threshold: float,
+    stop_consecutive: int,
+    consecutive_hits: int,
+) -> tuple[int, bool, bool]:
+    warn = bool(warning_threshold > 0.0 and kl_value >= warning_threshold)
+    if stop_threshold > 0.0 and kl_value >= stop_threshold:
+        consecutive_hits += 1
+    else:
+        consecutive_hits = 0
+    stop = bool(stop_threshold > 0.0 and consecutive_hits >= max(1, int(stop_consecutive)))
+    return consecutive_hits, warn, stop
+
+
 def _rewards_for_rollouts(
     rollouts: list[Rollout],
     gt_boxes: list[DetectAnnotation],
@@ -1179,11 +1218,24 @@ def _evaluate(
     total_tp = 0
     total_fp = 0
     total_fn = 0
+    positive_tasks = 0
+    positive_f1_sum = 0.0
+    positive_tp = 0
+    positive_fp = 0
+    positive_fn = 0
+    negative_tasks = 0
+    negative_f1_sum = 0.0
+    negative_tp = 0
+    negative_fp = 0
+    negative_fn = 0
     effective_skill = (skill or "detect").strip().lower()
     reasoning_failure_hint_emitted = False
 
     def _drain_batch(batch: list[TaskSample]) -> None:
-        nonlocal total, total_f1, total_miou, total_tp, total_fp, total_fn, reasoning_failure_hint_emitted
+        nonlocal total, total_f1, total_miou, total_tp, total_fp, total_fn
+        nonlocal positive_tasks, positive_f1_sum, positive_tp, positive_fp, positive_fn
+        nonlocal negative_tasks, negative_f1_sum, negative_tp, negative_fp, negative_fn
+        nonlocal reasoning_failure_hint_emitted
         if not batch:
             return
         chunk_size = max(1, min(max_workers, len(batch)))
@@ -1253,16 +1305,30 @@ def _evaluate(
                 if not result.rollouts:
                     if effective_skill == "point":
                         pred_points: list[PointAnnotation] = []
-                        total_f1 += _reward_f1_points(pred_points, item.gt_boxes)
+                        f1_value = _reward_f1_points(pred_points, item.gt_boxes)
                         tp, fp, fn = _count_tp_fp_fn_points(pred_points, item.gt_boxes)
                     else:
                         pred_boxes: list[DetectAnnotation] = []
-                        total_f1 += _reward_f1(pred_boxes, item.gt_boxes)
-                        total_miou += _reward_miou(pred_boxes, item.gt_boxes)
+                        f1_value = _reward_f1(pred_boxes, item.gt_boxes)
+                        miou_value = _reward_miou(pred_boxes, item.gt_boxes)
                         tp, fp, fn = _count_tp_fp_fn(pred_boxes, item.gt_boxes)
+                        total_miou += miou_value
+                    total_f1 += f1_value
                     total_tp += tp
                     total_fp += fp
                     total_fn += fn
+                    if item.is_positive:
+                        positive_tasks += 1
+                        positive_f1_sum += f1_value
+                        positive_tp += tp
+                        positive_fp += fp
+                        positive_fn += fn
+                    else:
+                        negative_tasks += 1
+                        negative_f1_sum += f1_value
+                        negative_tp += tp
+                        negative_fp += fp
+                        negative_fn += fn
                     total += 1
                     continue
 
@@ -1270,17 +1336,31 @@ def _evaluate(
                 if effective_skill == "point":
                     output = rollout0.output
                     pred_points = output.points if isinstance(output, PointOutput) else []
-                    total_f1 += _reward_f1_points(pred_points, item.gt_boxes)
+                    f1_value = _reward_f1_points(pred_points, item.gt_boxes)
                     tp, fp, fn = _count_tp_fp_fn_points(pred_points, item.gt_boxes)
                 else:
                     output = rollout0.output
                     pred_boxes = output.objects if isinstance(output, DetectOutput) else []
-                    total_f1 += _reward_f1(pred_boxes, item.gt_boxes)
-                    total_miou += _reward_miou(pred_boxes, item.gt_boxes)
+                    f1_value = _reward_f1(pred_boxes, item.gt_boxes)
+                    miou_value = _reward_miou(pred_boxes, item.gt_boxes)
                     tp, fp, fn = _count_tp_fp_fn(pred_boxes, item.gt_boxes)
+                    total_miou += miou_value
+                total_f1 += f1_value
                 total_tp += tp
                 total_fp += fp
                 total_fn += fn
+                if item.is_positive:
+                    positive_tasks += 1
+                    positive_f1_sum += f1_value
+                    positive_tp += tp
+                    positive_fp += fp
+                    positive_fn += fn
+                else:
+                    negative_tasks += 1
+                    negative_f1_sum += f1_value
+                    negative_tp += tp
+                    negative_fp += fp
+                    negative_fn += fn
                 total += 1
 
     for row in eval_rows:
@@ -1317,10 +1397,19 @@ def _evaluate(
             "eval_tp": 0,
             "eval_fp": 0,
             "eval_fn": 0,
+            "eval_positive_tasks": 0,
+            "eval_positive_f1": 0.0,
+            "eval_positive_tp": 0,
+            "eval_positive_fp": 0,
+            "eval_positive_fn": 0,
+            "eval_negative_tasks": 0,
+            "eval_negative_f1": 0.0,
+            "eval_negative_tp": 0,
+            "eval_negative_fp": 0,
+            "eval_negative_fn": 0,
         }
 
-    micro_denom = 2 * total_tp + total_fp + total_fn
-    micro_f1 = 1.0 if micro_denom == 0 else (2 * total_tp) / micro_denom
+    micro_f1 = _micro_f1_from_counts(total_tp, total_fp, total_fn)
     return {
         "eval_tasks": total,
         "eval_f1": micro_f1,
@@ -1329,6 +1418,18 @@ def _evaluate(
         "eval_tp": total_tp,
         "eval_fp": total_fp,
         "eval_fn": total_fn,
+        "eval_positive_tasks": positive_tasks,
+        "eval_positive_f1": (_micro_f1_from_counts(positive_tp, positive_fp, positive_fn) if positive_tasks else 0.0),
+        "eval_positive_f1_macro": (positive_f1_sum / positive_tasks) if positive_tasks else 0.0,
+        "eval_positive_tp": positive_tp,
+        "eval_positive_fp": positive_fp,
+        "eval_positive_fn": positive_fn,
+        "eval_negative_tasks": negative_tasks,
+        "eval_negative_f1": (_micro_f1_from_counts(negative_tp, negative_fp, negative_fn) if negative_tasks else 0.0),
+        "eval_negative_f1_macro": (negative_f1_sum / negative_tasks) if negative_tasks else 0.0,
+        "eval_negative_tp": negative_tp,
+        "eval_negative_fp": negative_fp,
+        "eval_negative_fn": negative_fn,
     }
 
 
@@ -1389,7 +1490,42 @@ def _print_usage_snapshot(snapshot: dict[str, Any], *, prefix: str) -> None:
     print(f"{prefix} class_tasks_consumed_top={snapshot.get('class_tasks_consumed_top', [])}")
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def _resolve_env_file(env_file: str) -> str:
+    path = Path(env_file).expanduser()
+    if path.is_absolute():
+        return str(path)
+
+    from_cwd = (Path.cwd() / path).resolve()
+    if from_cwd.exists():
+        return str(from_cwd)
+
+    from_repo = (REPO_ROOT / path).resolve()
+    if from_repo.exists():
+        return str(from_repo)
+
+    from_script = (_repo_relative(path.as_posix())).resolve()
+    if from_script.exists():
+        return str(from_script)
+
+    return str(from_cwd)
+
+
+def _resolve_runtime_env(args: argparse.Namespace) -> argparse.Namespace:
+    args.env_file = _resolve_env_file(str(args.env_file))
+    args.api_key_env_var = str(getattr(args, "api_key_env_var", "") or "").strip() or "MOONDREAM_API_KEY"
+    load_dotenv(args.env_file, override=True)
+    if not args.api_key:
+        args.api_key = os.environ.get(args.api_key_env_var, "")
+    if not args.api_key and args.api_key_env_var != "MOONDREAM_API_KEY":
+        args.api_key = os.environ.get("MOONDREAM_API_KEY", "")
+    if not args.hf_token:
+        args.hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    if not args.base_url:
+        args.base_url = os.environ.get("TUNA_BASE_URL", "https://api.moondream.ai/v1")
+    return args
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
@@ -1400,9 +1536,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="RL finetune Moondream for PI&D icon detection (class-conditional).")
     parser.add_argument("--config", default=str(config_path))
     parser.add_argument("--env-file", default=str(_repo_relative(".env")))
-    parser.add_argument("--api-key", default=os.environ.get("MOONDREAM_API_KEY"))
+    parser.add_argument("--api-key", default="")
+    parser.add_argument("--api-key-env-var", default="MOONDREAM_API_KEY")
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN"))
-    parser.add_argument("--base-url", default=os.environ.get("TUNA_BASE_URL", "https://api.moondream.ai/v1"))
+    parser.add_argument("--base-url", default="")
 
     parser.add_argument("--dataset-path", default="")
     parser.add_argument("--dataset-name", default="maxs-m87/pid-icons-merged" )
@@ -1567,6 +1704,24 @@ def main(argv: Optional[list[str]] = None) -> None:
         default=0.01,
         help="Required best eval_f1 improvement over baseline eval_f1.",
     )
+    parser.add_argument(
+        "--kl-warning-threshold",
+        type=float,
+        default=0.0,
+        help="Log a warning when a train step KL reaches this threshold. <=0 disables warnings.",
+    )
+    parser.add_argument(
+        "--kl-stop-threshold",
+        type=float,
+        default=0.0,
+        help="Stop training early when train-step KL reaches this threshold for N consecutive updates. <=0 disables stopping.",
+    )
+    parser.add_argument(
+        "--kl-stop-consecutive",
+        type=int,
+        default=1,
+        help="How many consecutive KL threshold hits are required before early stop.",
+    )
     parser.add_argument("--augment-prob", type=float, default=0.5)
     parser.add_argument("--eval-temperature", type=float, default=0.0)
     parser.add_argument("--eval-top-p", type=float, default=1.0)
@@ -1612,21 +1767,18 @@ def main(argv: Optional[list[str]] = None) -> None:
         args.neg_prompts_per_empty = 1
         args.neg_reward_weight = 0.15
         args.fn_penalty_exponent = 2.0
-        args.fp_penalty_exponent = 2.0
+        args.fp_penalty_exponent = 1.0
         print(
             "applied recall-first preset: "
             "lr=5e-4 pos_task_prob=0.995 neg_prompts_per_nonempty=0 "
             "neg_prompts_per_empty=1 neg_reward_weight=0.15 fn_exp=2.0 fp_exp=1.0"
         )
 
-    load_dotenv(args.env_file, override=False)
-    if not args.api_key:
-        args.api_key = os.environ.get("MOONDREAM_API_KEY")
-    if not args.hf_token:
-        args.hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-    if not args.base_url:
-        args.base_url = os.environ.get("TUNA_BASE_URL", "https://api.moondream.ai/v1")
+    return args
 
+
+def run(args: argparse.Namespace) -> None:
+    args = _resolve_runtime_env(args)
     if not args.api_key:
         raise ValueError("MOONDREAM_API_KEY is required")
     if args.neg_prompts_per_empty < 0 or args.neg_prompts_per_nonempty < 0:
@@ -1662,6 +1814,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         raise ValueError("--recall-drop-threshold must be in [0, 1)")
     if args.f1_improvement_target < 0.0:
         raise ValueError("--f1-improvement-target must be >= 0")
+    if args.kl_warning_threshold < 0.0:
+        raise ValueError("--kl-warning-threshold must be >= 0")
+    if args.kl_stop_threshold < 0.0:
+        raise ValueError("--kl-stop-threshold must be >= 0")
+    if args.kl_stop_consecutive <= 0:
+        raise ValueError("--kl-stop-consecutive must be > 0")
 
     eval_reasoning = bool(args.reasoning) if args.eval_reasoning is None else bool(args.eval_reasoning)
     off_policy_injection_allowed = bool(
@@ -1679,6 +1837,11 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     all_class_names = _load_class_names(args.class_names_file, dataset_path if use_local else None)
     class_catalog = _load_class_catalog(args.class_names_file, dataset_path if use_local else None)
+    for warning_text in _single_class_point_mode_warnings(
+        skill=args.skill,
+        all_class_names=all_class_names,
+    ):
+        print(warning_text)
 
     rng = random.Random(args.seed)
     rng_np = np.random.default_rng(args.seed)
@@ -1997,6 +2160,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     recall_gate_eval_tp: Optional[float] = None
     recall_gate_min_tp: Optional[float] = None
     eval_events_logged = 0
+    kl_consecutive_hits = 0
+    stopped_early = False
+    early_stop_reason = ""
 
     def _run_and_log_eval(*, trigger: str, step_for_log: int) -> Optional[dict[str, float]]:
         nonlocal eval_events_logged
@@ -2055,7 +2221,9 @@ def main(argv: Optional[list[str]] = None) -> None:
             print(
                 f"baseline eval step {baseline_step} tasks={baseline_metrics['eval_tasks']} "
                 f"miou={baseline_metrics['eval_miou']:.4f} f1={baseline_metrics['eval_f1']:.4f} "
-                f"macro_f1={baseline_metrics['eval_f1_macro']:.4f}"
+                f"macro_f1={baseline_metrics['eval_f1_macro']:.4f} "
+                f"pos_f1={baseline_metrics['eval_positive_f1']:.4f} "
+                f"neg_f1={baseline_metrics['eval_negative_f1']:.4f}"
             )
 
     for step in range(args.num_steps):
@@ -2252,6 +2420,14 @@ def main(argv: Optional[list[str]] = None) -> None:
             if total_train_rows and total_train_rows > 0
             else 0.0
         )
+        kl_value = float(train_out.kl or 0.0)
+        kl_consecutive_hits, kl_warning_triggered, kl_stop_triggered = _update_kl_guard(
+            kl_value=kl_value,
+            warning_threshold=float(args.kl_warning_threshold),
+            stop_threshold=float(args.kl_stop_threshold),
+            stop_consecutive=int(args.kl_stop_consecutive),
+            consecutive_hits=kl_consecutive_hits,
+        )
 
         wandb.log(
             {
@@ -2275,9 +2451,12 @@ def main(argv: Optional[list[str]] = None) -> None:
                 "off_policy_skipped_high_reward": off_policy_skipped_high_reward,
                 "off_policy_skipped_high_variance": off_policy_skipped_high_variance,
                 "off_policy_skipped_reasoning_guard": off_policy_skipped_reasoning_guard,
-                "kl": train_out.kl if train_out.kl is not None else 0.0,
+                "kl": kl_value,
                 "router_kl": train_out.router_kl if train_out.router_kl is not None else 0.0,
                 "grad_norm": train_out.grad_norm if train_out.grad_norm is not None else 0.0,
+                "kl_warning_triggered": int(kl_warning_triggered),
+                "kl_stop_triggered": int(kl_stop_triggered),
+                "kl_stop_consecutive_hits": kl_consecutive_hits,
                 "rows_seen": usage.rows_seen,
                 "rows_seen_fraction": rows_seen_fraction,
                 "tasks_generated_total": usage.tasks_generated,
@@ -2292,13 +2471,26 @@ def main(argv: Optional[list[str]] = None) -> None:
 
         total_s = time.monotonic() - step_start
         print(
-            f"step {global_step} reward={reward_mean:.4f} kl={float(train_out.kl or 0.0):.4f} "
+            f"step {global_step} reward={reward_mean:.4f} kl={kl_value:.4f} "
             f"train_p={train_precision:.3f} train_r={train_recall:.3f} "
             f"pos={pos_tasks} neg={neg_tasks} rollout_s={(rollout_end-rollout_start):.2f} "
             f"train_s={(train_end-train_start):.2f} total_s={total_s:.2f} "
             f"offp={off_policy_injected_total}/{off_policy_considered} "
             f"offp_guarded={off_policy_skipped_reasoning_guard} updates={successful_updates}"
         )
+        if kl_warning_triggered:
+            print(
+                f"warning: step {global_step} kl={kl_value:.4f} exceeded "
+                f"warning threshold {float(args.kl_warning_threshold):.4f}"
+            )
+        if kl_stop_triggered:
+            stopped_early = True
+            early_stop_reason = (
+                f"kl={kl_value:.4f} reached stop threshold {float(args.kl_stop_threshold):.4f} "
+                f"for {kl_consecutive_hits} consecutive update(s)"
+            )
+            print(f"stopping early at step {global_step}: {early_stop_reason}")
+            break
         if args.usage_report_every > 0 and (global_step + 1) % args.usage_report_every == 0:
             usage_summary = _usage_snapshot(usage, total_train_rows=total_train_rows, top_k=args.usage_top_k)
             _print_usage_snapshot(usage_summary, prefix=f"usage step {global_step}")
@@ -2340,6 +2532,8 @@ def main(argv: Optional[list[str]] = None) -> None:
                 f"eval step {global_step} tasks={eval_metrics['eval_tasks']} "
                 f"miou={eval_metrics['eval_miou']:.4f} f1={eval_metrics['eval_f1']:.4f} "
                 f"macro_f1={eval_metrics['eval_f1_macro']:.4f} "
+                f"pos_f1={eval_metrics['eval_positive_f1']:.4f} "
+                f"neg_f1={eval_metrics['eval_negative_f1']:.4f} "
                 f"updates={successful_updates}"
             )
 
@@ -2375,6 +2569,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         run.summary["recall_gate_eval_tp"] = float(recall_gate_eval_tp)
     if recall_gate_min_tp is not None:
         run.summary["recall_gate_min_tp"] = float(recall_gate_min_tp)
+    run.summary["stopped_early"] = int(stopped_early)
+    run.summary["early_stop_reason"] = early_stop_reason
     final_usage = _usage_snapshot(usage, total_train_rows=total_train_rows, top_k=args.usage_top_k)
     _print_usage_snapshot(final_usage, prefix="usage final")
     run.summary["rows_seen"] = int(final_usage["rows_seen"])
@@ -2396,8 +2592,13 @@ def main(argv: Optional[list[str]] = None) -> None:
     print(
         f"done. finetune_id={finetune.finetune_id} "
         f"best_step={best_step} best_metric={best_metric} "
-        f"recall_gate_pass={recall_gate_pass} f1_target_pass={f1_target_pass}"
+        f"recall_gate_pass={recall_gate_pass} f1_target_pass={f1_target_pass} "
+        f"stopped_early={stopped_early}"
     )
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    run(parse_args(argv))
 
 
 if __name__ == "__main__":

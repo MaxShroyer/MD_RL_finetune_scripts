@@ -26,6 +26,7 @@ DEFAULT_CLASS_PROMPTS: dict[str, str] = {
     BALL_HOLDER_CLASS: "ball carrier",
     AREA_OF_FOCUS_CLASS: "main action area",
     LINE_INTERACTION_CLASS: "offensive and defensive lines engaged after the snap",
+    PLAYERS_ON_FIELD_CLASS: "outline of all players on the field",
 }
 
 

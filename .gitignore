@@ -3,6 +3,9 @@
 .cache
 .env.staging
 .env*
+logs/
+raw_dataset/
+raw_datasets/
 
 .DS_Store
 __pycache__
@@ -43,3 +46,4 @@ tictaktoe_QA/tictaktoe_QA/
 rawdatasets/
 
 .env-staging
+configs/

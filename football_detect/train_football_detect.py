@@ -12,6 +12,8 @@ import random
 import string
 import sys
 import time
+import urllib.error
+import urllib.request
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,6 +79,13 @@ from tuna_sdk.errors import TunaAPIError, TunaNetworkError  # noqa: E402
 DEFAULT_CONFIG_PATH = repo_relative("configs", "train_football_detect_default.json")
 DEFAULT_BASE_URL = "https://api.moondream.ai/v1"
 VAL_SPLIT_CANDIDATES = ("validation", "val", "dev", "test", "post_val")
+TEST_SPLIT_CANDIDATES = ("test", "post_val")
+SELECTION_METRIC_CHOICES = ("f1", "f1_macro", "miou")
+DEFAULT_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0 Safari/537.36"
+)
 
 
 def _random_suffix(length: int = 6) -> str:
@@ -89,6 +98,99 @@ def _to_data_url(image: Image.Image, *, quality: int = 90) -> str:
     image.save(buf, format="JPEG", quality=max(1, min(100, int(quality))))
     encoded = base64.b64encode(buf.getvalue()).decode("ascii")
     return f"data:image/jpeg;base64,{encoded}"
+
+
+def _build_auth_headers(api_key: str) -> dict[str, str]:
+    header_name = os.environ.get("MOONDREAM_AUTH_HEADER", "X-Moondream-Auth")
+    user_agent = os.environ.get("MOONDREAM_USER_AGENT") or DEFAULT_BROWSER_USER_AGENT
+    key = api_key.strip()
+    if header_name.lower() == "authorization" and not key.lower().startswith("bearer "):
+        key = f"Bearer {key}"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        header_name: key,
+        "User-Agent": user_agent,
+    }
+    return headers
+
+
+def _micro_f1(tp: int, fp: int, fn: int) -> float:
+    micro_denom = (2 * tp) + fp + fn
+    return 1.0 if micro_denom == 0 else (2 * tp) / micro_denom
+
+
+def _empty_eval_metrics(prefix: str) -> dict[str, float]:
+    return {
+        f"{prefix}_tasks": 0,
+        f"{prefix}_f1": 0.0,
+        f"{prefix}_f1_macro": 0.0,
+        f"{prefix}_miou": 0.0,
+        f"{prefix}_tp": 0,
+        f"{prefix}_fp": 0,
+        f"{prefix}_fn": 0,
+    }
+
+
+def _finalize_eval_metrics(
+    prefix: str,
+    *,
+    tasks: int,
+    total_f1: float,
+    total_miou: float,
+    tp: int,
+    fp: int,
+    fn: int,
+) -> dict[str, float]:
+    if tasks <= 0:
+        return _empty_eval_metrics(prefix)
+    return {
+        f"{prefix}_tasks": tasks,
+        f"{prefix}_f1": _micro_f1(tp, fp, fn),
+        f"{prefix}_f1_macro": total_f1 / tasks,
+        f"{prefix}_miou": total_miou / tasks,
+        f"{prefix}_tp": tp,
+        f"{prefix}_fp": fp,
+        f"{prefix}_fn": fn,
+    }
+
+
+def _selection_metric_key(selection_metric: str, *, prefix: str = "eval") -> str:
+    metric = str(selection_metric or "").strip()
+    if metric not in SELECTION_METRIC_CHOICES:
+        raise ValueError(f"unknown selection metric: {selection_metric}")
+    return f"{prefix}_{metric}"
+
+
+def _selection_metric_value(metrics: Mapping[str, Any], selection_metric: str, *, prefix: str = "eval") -> float:
+    return float(metrics.get(_selection_metric_key(selection_metric, prefix=prefix), 0.0))
+
+
+def _update_kl_guard(
+    *,
+    kl_value: float,
+    warning_threshold: float,
+    stop_threshold: float,
+    stop_consecutive: int,
+    consecutive_hits: int,
+) -> tuple[int, bool, bool]:
+    warn = bool(warning_threshold > 0.0 and kl_value >= warning_threshold)
+    if stop_threshold > 0.0 and kl_value >= stop_threshold:
+        consecutive_hits += 1
+    else:
+        consecutive_hits = 0
+    stop = bool(stop_threshold > 0.0 and consecutive_hits >= max(1, int(stop_consecutive)))
+    return consecutive_hits, warn, stop
+
+
+def _prefix_eval_metrics(metrics: Mapping[str, Any], *, prefix: str) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in metrics.items():
+        if key.startswith("eval_"):
+            out[f"{prefix}{key[len('eval_'):]}"] = value
+        else:
+            out[f"{prefix}{key}"] = value
+    return out
 
 
 @dataclass(frozen=True)
@@ -168,6 +270,13 @@ class UsageStats:
     source_tasks_consumed: Counter[str] = field(default_factory=Counter)
     class_tasks_generated: Counter[str] = field(default_factory=Counter)
     class_tasks_consumed: Counter[str] = field(default_factory=Counter)
+
+
+class _DetectEvalError(RuntimeError):
+    def __init__(self, message: str, *, failure_count: int, last_error: str = "") -> None:
+        super().__init__(message)
+        self.failure_count = int(failure_count)
+        self.last_error = str(last_error or "")
 
 
 def _to_detect_annotation(box: NormalizedBox) -> DetectAnnotation:
@@ -293,10 +402,13 @@ def tasks_from_base_sample(
     prompt_overrides: Mapping[str, str],
 ) -> list[TaskSample]:
     tasks: list[TaskSample] = []
-    present_names = {item.class_name for item in sample.boxes}
+    active_class_names = list(all_class_names)
+    active_class_set = set(active_class_names)
+    positive_boxes = [item for item in sample.boxes if item.class_name in active_class_set]
+    present_names = {item.class_name for item in positive_boxes}
 
-    if sample.boxes:
-        for item in sample.boxes:
+    if positive_boxes:
+        for item in positive_boxes:
             tasks.append(
                 TaskSample(
                     image=sample.image,
@@ -308,7 +420,7 @@ def tasks_from_base_sample(
                 )
             )
 
-        absent = [name for name in all_class_names if name not in present_names]
+        absent = [name for name in active_class_names if name not in present_names]
         if absent and neg_prompts_per_nonempty > 0:
             picks = rng.sample(absent, k=min(neg_prompts_per_nonempty, len(absent)))
             for class_name in picks:
@@ -324,9 +436,26 @@ def tasks_from_base_sample(
                 )
         return tasks
 
-    if not all_class_names or neg_prompts_per_empty <= 0:
+    if sample.boxes:
+        if not active_class_names or neg_prompts_per_nonempty <= 0:
+            return []
+        picks = rng.sample(active_class_names, k=min(neg_prompts_per_nonempty, len(active_class_names)))
+        for class_name in picks:
+            tasks.append(
+                TaskSample(
+                    image=sample.image,
+                    prompt=_prompt_for_class(class_name, prompt_overrides=prompt_overrides),
+                    gt_boxes=[],
+                    class_name=class_name,
+                    is_positive=False,
+                    source=sample.source,
+                )
+            )
+        return tasks
+
+    if not active_class_names or neg_prompts_per_empty <= 0:
         return []
-    picks = rng.sample(all_class_names, k=min(neg_prompts_per_empty, len(all_class_names)))
+    picks = rng.sample(active_class_names, k=min(neg_prompts_per_empty, len(active_class_names)))
     for class_name in picks:
         tasks.append(
             TaskSample(
@@ -566,6 +695,10 @@ def _iter_hf_rows_once(dataset_name: str, split: str, token: Optional[str]) -> I
     return load_dataset(dataset_name, split=split, token=token, streaming=True)
 
 
+def _materialize_rows(rows: Iterable[dict]) -> list[dict]:
+    return list(rows)
+
+
 def _resolve_val_split(available_splits: list[str], train_split: str, val_split: str) -> str:
     if not available_splits:
         raise ValueError("Dataset exposes no splits.")
@@ -585,6 +718,42 @@ def _resolve_val_split(available_splits: list[str], train_split: str, val_split:
         if base_split in available_splits:
             return val_split
     raise ValueError(f"val split '{val_split}' not found. Available splits: {available_splits}")
+
+
+def _resolve_test_split(
+    available_splits: list[str],
+    *,
+    train_split: str,
+    val_split: str,
+    test_split: str,
+) -> str:
+    if not available_splits:
+        raise ValueError("Dataset exposes no splits.")
+
+    train_base_split = train_split.split("[", 1)[0]
+    val_base_split = val_split.split("[", 1)[0]
+    blocked = {train_base_split, val_base_split}
+
+    if test_split:
+        if test_split in available_splits:
+            resolved = test_split
+        elif "[" in test_split and "]" in test_split:
+            base_split = test_split.split("[", 1)[0]
+            if base_split not in available_splits:
+                raise ValueError(f"test split '{test_split}' not found. Available splits: {available_splits}")
+            resolved = test_split
+        else:
+            raise ValueError(f"test split '{test_split}' not found. Available splits: {available_splits}")
+        if resolved.split("[", 1)[0] in blocked:
+            raise ValueError("test split must differ from both train and validation splits")
+        return resolved
+
+    for candidate in TEST_SPLIT_CANDIDATES:
+        if candidate in available_splits and candidate not in blocked:
+            return candidate
+    raise ValueError(
+        f"Dataset must already contain a held-out test split. Available splits: {available_splits}"
+    )
 
 
 def _box_iou(a: DetectAnnotation, b: DetectAnnotation) -> float:
@@ -730,6 +899,90 @@ def _rewards_for_rollouts(
     return rewards
 
 
+def _extract_boxes(payload: Mapping[str, Any]) -> list[DetectAnnotation]:
+    raw_boxes = payload.get("objects")
+    if raw_boxes is None and isinstance(payload.get("output"), dict):
+        raw_boxes = payload["output"].get("objects")
+    boxes: list[DetectAnnotation] = []
+    for item in raw_boxes or []:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            boxes.append(_box_from_normalized(item["x_min"], item["y_min"], item["x_max"], item["y_max"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return boxes
+
+
+def _call_detect_api(
+    *,
+    api_base: str,
+    api_key: str,
+    model: str,
+    image: Image.Image,
+    object_name: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    max_objects: int,
+    timeout: float,
+) -> list[DetectAnnotation]:
+    url = api_base.rstrip("/") + "/detect"
+    payload = {
+        "model": model,
+        "object": object_name,
+        "image_url": _to_data_url(image, quality=92),
+        "settings": {
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_tokens": max_tokens,
+            "max_objects": max_objects,
+        },
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=_build_auth_headers(api_key), method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8") if exc.fp else ""
+        detail = error_body.strip() or exc.reason
+        request_id = None
+        try:
+            request_id = exc.headers.get("x-request-id")
+        except Exception:
+            request_id = None
+        suffix = f" (x-request-id={request_id})" if request_id else ""
+        raise RuntimeError(f"HTTP {exc.code} from {url}: {detail}{suffix}") from exc
+    parsed = json.loads(body) if body else {}
+    if not isinstance(parsed, dict):
+        return []
+    return _extract_boxes(parsed)
+
+
+def _iter_eval_tasks(
+    *,
+    eval_rows: Iterable[dict],
+    all_class_names: list[str],
+    prompt_overrides: Mapping[str, str],
+    rng: random.Random,
+    neg_prompts_per_empty: int,
+    neg_prompts_per_nonempty: int,
+) -> Iterable[TaskSample]:
+    for row in eval_rows:
+        base = _to_base_sample(row)
+        if base is None:
+            continue
+        yield from tasks_from_base_sample(
+            base,
+            all_class_names=all_class_names,
+            rng=rng,
+            neg_prompts_per_empty=neg_prompts_per_empty,
+            neg_prompts_per_nonempty=neg_prompts_per_nonempty,
+            prompt_overrides=prompt_overrides,
+        )
+
+
 def _is_rate_limit_error(exc: Exception) -> bool:
     if isinstance(exc, TunaAPIError) and exc.status_code == 429:
         return True
@@ -826,7 +1079,7 @@ def _evaluate(
     max_tokens: int,
     max_objects: int,
     reasoning: bool,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     tasks: list[TaskSample] = []
     total = 0
     total_f1 = 0.0
@@ -834,10 +1087,67 @@ def _evaluate(
     total_tp = 0
     total_fp = 0
     total_fn = 0
+    positive_total = 0
+    positive_total_f1 = 0.0
+    positive_total_miou = 0.0
+    positive_total_tp = 0
+    positive_total_fp = 0
+    positive_total_fn = 0
+    negative_total = 0
+    negative_total_f1 = 0.0
+    negative_total_miou = 0.0
+    negative_total_tp = 0
+    negative_total_fp = 0
+    negative_total_fn = 0
+    class_task_counts: Counter[str] = Counter()
+    class_positive_task_counts: Counter[str] = Counter()
+    class_negative_task_counts: Counter[str] = Counter()
+    class_tp: Counter[str] = Counter()
+    class_fp: Counter[str] = Counter()
+    class_fn: Counter[str] = Counter()
     reasoning_failure_hint_emitted = False
 
+    def _record_metrics(item: TaskSample, pred_boxes: list[DetectAnnotation]) -> None:
+        nonlocal total, total_f1, total_miou, total_tp, total_fp, total_fn
+        nonlocal positive_total, positive_total_f1, positive_total_miou, positive_total_tp, positive_total_fp
+        nonlocal positive_total_fn, negative_total, negative_total_f1, negative_total_miou, negative_total_tp
+        nonlocal negative_total_fp, negative_total_fn
+
+        f1 = _reward_f1(pred_boxes, item.gt_boxes)
+        miou = _reward_miou(pred_boxes, item.gt_boxes)
+        tp, fp, fn = _count_tp_fp_fn(pred_boxes, item.gt_boxes)
+
+        total += 1
+        total_f1 += f1
+        total_miou += miou
+        total_tp += tp
+        total_fp += fp
+        total_fn += fn
+
+        class_task_counts[item.class_name] += 1
+        class_tp[item.class_name] += tp
+        class_fp[item.class_name] += fp
+        class_fn[item.class_name] += fn
+
+        if item.is_positive:
+            positive_total += 1
+            positive_total_f1 += f1
+            positive_total_miou += miou
+            positive_total_tp += tp
+            positive_total_fp += fp
+            positive_total_fn += fn
+            class_positive_task_counts[item.class_name] += 1
+        else:
+            negative_total += 1
+            negative_total_f1 += f1
+            negative_total_miou += miou
+            negative_total_tp += tp
+            negative_total_fp += fp
+            negative_total_fn += fn
+            class_negative_task_counts[item.class_name] += 1
+
     def _drain_batch(batch: list[TaskSample]) -> None:
-        nonlocal total, total_f1, total_miou, total_tp, total_fp, total_fn, reasoning_failure_hint_emitted
+        nonlocal reasoning_failure_hint_emitted
         if not batch:
             return
         chunk_size = max(1, min(max_workers, len(batch)))
@@ -888,61 +1198,232 @@ def _evaluate(
                     rollout0 = result.rollouts[0]
                     output = rollout0.output
                     pred_boxes = output.objects if isinstance(output, DetectOutput) else []
-                total_f1 += _reward_f1(pred_boxes, item.gt_boxes)
-                total_miou += _reward_miou(pred_boxes, item.gt_boxes)
-                tp, fp, fn = _count_tp_fp_fn(pred_boxes, item.gt_boxes)
-                total_tp += tp
-                total_fp += fp
-                total_fn += fn
-                total += 1
+                _record_metrics(item, pred_boxes)
 
-    for row in eval_rows:
-        base = _to_base_sample(row)
-        if base is None:
-            continue
-        task_list = tasks_from_base_sample(
-            base,
-            all_class_names=all_class_names,
-            rng=rng,
-            neg_prompts_per_empty=neg_prompts_per_empty,
-            neg_prompts_per_nonempty=neg_prompts_per_nonempty,
-            prompt_overrides=prompt_overrides,
-        )
-        for task in task_list:
-            tasks.append(task)
-            if len(tasks) >= batch_size:
-                _drain_batch(tasks)
-                tasks = []
-            if max_samples and total >= max_samples:
-                break
-        if max_samples and total >= max_samples:
+    for task in _iter_eval_tasks(
+        eval_rows=eval_rows,
+        all_class_names=all_class_names,
+        prompt_overrides=prompt_overrides,
+        rng=rng,
+        neg_prompts_per_empty=neg_prompts_per_empty,
+        neg_prompts_per_nonempty=neg_prompts_per_nonempty,
+    ):
+        if max_samples and total + len(tasks) >= max_samples:
+            remaining = max_samples - total
+            if remaining > 0:
+                batch = tasks[:remaining]
+                if len(batch) < remaining:
+                    batch.append(task)
+                _drain_batch(batch[:remaining])
+            tasks = []
             break
+        tasks.append(task)
+        if len(tasks) >= batch_size:
+            _drain_batch(tasks)
+            tasks = []
 
     if tasks and (not max_samples or total < max_samples):
         _drain_batch(tasks)
 
-    if total == 0:
-        return {
-            "eval_tasks": 0,
-            "eval_f1": 0.0,
-            "eval_f1_macro": 0.0,
-            "eval_miou": 0.0,
-            "eval_tp": 0,
-            "eval_fp": 0,
-            "eval_fn": 0,
-        }
+    metrics: dict[str, Any] = {}
+    metrics.update(
+        _finalize_eval_metrics(
+            "eval",
+            tasks=total,
+            total_f1=total_f1,
+            total_miou=total_miou,
+            tp=total_tp,
+            fp=total_fp,
+            fn=total_fn,
+        )
+    )
+    metrics.update(
+        _finalize_eval_metrics(
+            "eval_positive",
+            tasks=positive_total,
+            total_f1=positive_total_f1,
+            total_miou=positive_total_miou,
+            tp=positive_total_tp,
+            fp=positive_total_fp,
+            fn=positive_total_fn,
+        )
+    )
+    metrics.update(
+        _finalize_eval_metrics(
+            "eval_negative",
+            tasks=negative_total,
+            total_f1=negative_total_f1,
+            total_miou=negative_total_miou,
+            tp=negative_total_tp,
+            fp=negative_total_fp,
+            fn=negative_total_fn,
+        )
+    )
+    metrics["eval_class_task_counts"] = dict(class_task_counts)
+    metrics["eval_class_positive_task_counts"] = dict(class_positive_task_counts)
+    metrics["eval_class_negative_task_counts"] = dict(class_negative_task_counts)
+    metrics["eval_class_tp"] = dict(class_tp)
+    metrics["eval_class_fp"] = dict(class_fp)
+    metrics["eval_class_fn"] = dict(class_fn)
+    return metrics
 
-    micro_denom = 2 * total_tp + total_fp + total_fn
-    micro_f1 = 1.0 if micro_denom == 0 else (2 * total_tp) / micro_denom
-    return {
-        "eval_tasks": total,
-        "eval_f1": micro_f1,
-        "eval_f1_macro": total_f1 / total,
-        "eval_miou": total_miou / total,
-        "eval_tp": total_tp,
-        "eval_fp": total_fp,
-        "eval_fn": total_fn,
-    }
+
+def _evaluate_api(
+    *,
+    model: str,
+    eval_rows: Iterable[dict],
+    all_class_names: list[str],
+    prompt_overrides: Mapping[str, str],
+    rng: random.Random,
+    neg_prompts_per_empty: int,
+    neg_prompts_per_nonempty: int,
+    max_samples: int,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    max_objects: int,
+    api_base: str,
+    api_key: str,
+    timeout: float = 120.0,
+) -> dict[str, Any]:
+    total = 0
+    total_f1 = 0.0
+    total_miou = 0.0
+    total_tp = 0
+    total_fp = 0
+    total_fn = 0
+    positive_total = 0
+    positive_total_f1 = 0.0
+    positive_total_miou = 0.0
+    positive_total_tp = 0
+    positive_total_fp = 0
+    positive_total_fn = 0
+    negative_total = 0
+    negative_total_f1 = 0.0
+    negative_total_miou = 0.0
+    negative_total_tp = 0
+    negative_total_fp = 0
+    negative_total_fn = 0
+    class_task_counts: Counter[str] = Counter()
+    class_positive_task_counts: Counter[str] = Counter()
+    class_negative_task_counts: Counter[str] = Counter()
+    class_tp: Counter[str] = Counter()
+    class_fp: Counter[str] = Counter()
+    class_fn: Counter[str] = Counter()
+    api_failures = 0
+    last_api_error = ""
+
+    for task in _iter_eval_tasks(
+        eval_rows=eval_rows,
+        all_class_names=all_class_names,
+        prompt_overrides=prompt_overrides,
+        rng=rng,
+        neg_prompts_per_empty=neg_prompts_per_empty,
+        neg_prompts_per_nonempty=neg_prompts_per_nonempty,
+    ):
+        if max_samples and total >= max_samples:
+            break
+        try:
+            pred_boxes = _call_detect_api(
+                api_base=api_base,
+                api_key=api_key,
+                model=model,
+                image=task.image,
+                object_name=task.prompt,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                max_objects=max_objects,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            api_failures += 1
+            last_api_error = f"{type(exc).__name__}: {exc}"
+            print(f"eval detect failed: {exc}. skipping sample.")
+            continue
+
+        f1 = _reward_f1(pred_boxes, task.gt_boxes)
+        miou = _reward_miou(pred_boxes, task.gt_boxes)
+        tp, fp, fn = _count_tp_fp_fn(pred_boxes, task.gt_boxes)
+
+        total += 1
+        total_f1 += f1
+        total_miou += miou
+        total_tp += tp
+        total_fp += fp
+        total_fn += fn
+        class_task_counts[task.class_name] += 1
+        class_tp[task.class_name] += tp
+        class_fp[task.class_name] += fp
+        class_fn[task.class_name] += fn
+
+        if task.is_positive:
+            positive_total += 1
+            positive_total_f1 += f1
+            positive_total_miou += miou
+            positive_total_tp += tp
+            positive_total_fp += fp
+            positive_total_fn += fn
+            class_positive_task_counts[task.class_name] += 1
+        else:
+            negative_total += 1
+            negative_total_f1 += f1
+            negative_total_miou += miou
+            negative_total_tp += tp
+            negative_total_fp += fp
+            negative_total_fn += fn
+            class_negative_task_counts[task.class_name] += 1
+
+    metrics: dict[str, Any] = {}
+    metrics.update(
+        _finalize_eval_metrics(
+            "eval",
+            tasks=total,
+            total_f1=total_f1,
+            total_miou=total_miou,
+            tp=total_tp,
+            fp=total_fp,
+            fn=total_fn,
+        )
+    )
+    metrics.update(
+        _finalize_eval_metrics(
+            "eval_positive",
+            tasks=positive_total,
+            total_f1=positive_total_f1,
+            total_miou=positive_total_miou,
+            tp=positive_total_tp,
+            fp=positive_total_fp,
+            fn=positive_total_fn,
+        )
+    )
+    metrics.update(
+        _finalize_eval_metrics(
+            "eval_negative",
+            tasks=negative_total,
+            total_f1=negative_total_f1,
+            total_miou=negative_total_miou,
+            tp=negative_total_tp,
+            fp=negative_total_fp,
+            fn=negative_total_fn,
+        )
+    )
+    metrics["eval_class_task_counts"] = dict(class_task_counts)
+    metrics["eval_class_positive_task_counts"] = dict(class_positive_task_counts)
+    metrics["eval_class_negative_task_counts"] = dict(class_negative_task_counts)
+    metrics["eval_class_tp"] = dict(class_tp)
+    metrics["eval_class_fp"] = dict(class_fp)
+    metrics["eval_class_fn"] = dict(class_fn)
+    metrics["eval_api_failures"] = int(api_failures)
+    if last_api_error:
+        metrics["eval_api_last_error"] = last_api_error
+    if api_failures > 0 and total == 0:
+        raise _DetectEvalError(
+            f"all /detect eval calls failed ({api_failures} failures); last_error={last_api_error or 'unknown'}",
+            failure_count=api_failures,
+            last_error=last_api_error,
+        )
+    return metrics
 
 
 def _counter_top(counter: Counter[str], top_k: int) -> list[tuple[str, int]]:
@@ -1055,6 +1536,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default="",
         help="Validation split name. If omitted, uses validation/val/dev/test/post_val when present.",
     )
+    parser.add_argument(
+        "--test-split",
+        default="",
+        help="Held-out test split name. If omitted, uses test/post_val when present.",
+    )
     parser.add_argument("--class-names-file", default="")
     parser.add_argument("--include-classes", nargs="*", default=None)
     parser.add_argument("--exclude-classes", nargs="*", default=None)
@@ -1084,6 +1570,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         choices=["f1", "miou"],
         default="f1",
         help="Training reward metric for detect rollouts.",
+    )
+    parser.add_argument(
+        "--selection-metric",
+        choices=SELECTION_METRIC_CHOICES,
+        default="",
+        help="Validation metric used to select the best checkpoint. Defaults to --reward-metric.",
     )
 
     reasoning_group = parser.add_mutually_exclusive_group()
@@ -1166,6 +1658,29 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=50)
     parser.add_argument("--eval-max-samples", type=int, default=200)
     parser.add_argument("--eval-batch-size", type=int, default=20)
+    parser.add_argument(
+        "--kl-warning-threshold",
+        type=float,
+        default=0.0,
+        help="Log a warning when a train step KL reaches this threshold. <=0 disables warnings.",
+    )
+    parser.add_argument(
+        "--kl-stop-threshold",
+        type=float,
+        default=0.0,
+        help="Stop training early when train-step KL reaches this threshold for N consecutive updates. <=0 disables stopping.",
+    )
+    parser.add_argument(
+        "--kl-stop-consecutive",
+        type=int,
+        default=1,
+        help="How many consecutive KL threshold hits are required before early stop.",
+    )
+    parser.add_argument(
+        "--run-final-test",
+        action="store_true",
+        help="Evaluate the best validation checkpoint once on the held-out test split after training.",
+    )
 
     parser.add_argument("--save-every", type=int, default=20)
     parser.add_argument(
@@ -1235,6 +1750,21 @@ def main(argv: Optional[list[str]] = None) -> None:
         raise ValueError("--rollout-retries must be >= 0")
     if args.rollout_retry_backoff_s <= 0.0:
         raise ValueError("--rollout-retry-backoff-s must be > 0")
+    if args.kl_warning_threshold < 0.0:
+        raise ValueError("--kl-warning-threshold must be >= 0")
+    if args.kl_stop_threshold < 0.0:
+        raise ValueError("--kl-stop-threshold must be >= 0")
+    if args.kl_stop_consecutive <= 0:
+        raise ValueError("--kl-stop-consecutive must be > 0")
+    if args.run_final_test and args.eval_every <= 0:
+        raise ValueError("--run-final-test requires --eval-every > 0 so a best validation checkpoint can be selected")
+
+    selection_metric = str(args.selection_metric or "").strip()
+    if not selection_metric:
+        selection_metric = "miou" if args.reward_metric == "miou" else "f1"
+    if selection_metric not in SELECTION_METRIC_CHOICES:
+        raise ValueError(f"--selection-metric must be one of {SELECTION_METRIC_CHOICES}")
+    args.selection_metric = selection_metric
 
     eval_reasoning = bool(args.reasoning) if args.eval_reasoning is None else bool(args.eval_reasoning)
     off_policy_injection_allowed = bool(
@@ -1249,8 +1779,18 @@ def main(argv: Optional[list[str]] = None) -> None:
     dataset_path = str(args.dataset_path or "").strip()
     dataset_name = str(args.dataset_name or "").strip()
     use_local = bool(dataset_path)
-    if use_local and dataset_name:
-        print("warning: both --dataset-path and --dataset-name provided; using --dataset-path.")
+    if use_local:
+        dataset_path_exists = Path(dataset_path).exists()
+        if dataset_name and not dataset_path_exists:
+            print(f"warning: local dataset path '{dataset_path}' not found; falling back to --dataset-name.")
+            dataset_path = ""
+            use_local = False
+        elif dataset_name:
+            print("warning: both --dataset-path and --dataset-name provided; using --dataset-path.")
+        elif not dataset_path_exists:
+            raise ValueError(
+                f"local dataset path '{dataset_path}' not found. Provide an existing --dataset-path or set --dataset-name."
+            )
     if not use_local and not dataset_name:
         raise ValueError("Provide --dataset-path or --dataset-name.")
 
@@ -1260,12 +1800,16 @@ def main(argv: Optional[list[str]] = None) -> None:
     usage = UsageStats()
     total_train_rows: Optional[int] = None
     total_val_rows: Optional[int] = None
+    total_test_rows: Optional[int] = None
 
     eval_rows_factory: Callable[[], Iterable[dict]]
+    test_rows_factory: Optional[Callable[[], Iterable[dict]]] = None
     train_row_iter: Iterable[dict]
     train_split = args.split.strip() or "train"
     requested_val_split = args.val_split.strip()
+    requested_test_split = args.test_split.strip()
     val_split: str
+    test_split: Optional[str] = None
 
     if use_local:
         dataset_obj = _load_local_dataset_dict(dataset_path)
@@ -1282,18 +1826,47 @@ def main(argv: Optional[list[str]] = None) -> None:
 
         eval_rows_factory = _local_eval_rows
         class_source_rows: Iterable[Mapping[str, Any]] = iter(train_ds)
+        if args.run_final_test or requested_test_split:
+            test_split = _resolve_test_split(
+                list(dataset_obj.keys()),
+                train_split=train_split,
+                val_split=val_split,
+                test_split=requested_test_split,
+            )
+            total_test_rows = len(dataset_obj[test_split])
+
+            def _local_test_rows() -> Iterable[dict]:
+                return _iter_local_rows_once(dataset_obj, test_split)
+
+            test_rows_factory = _local_test_rows
     else:
         split_names = list(get_dataset_split_names(dataset_name, token=args.hf_token))
         if train_split not in split_names:
             raise ValueError(f"train split '{train_split}' not found in dataset splits: {split_names}")
         val_split = _resolve_val_split(split_names, train_split, requested_val_split)
         train_row_iter = _iter_hf_rows(dataset_name, train_split, args.hf_token, args.seed, args.buffer_size)
+        materialized_val_rows = _materialize_rows(_iter_hf_rows_once(dataset_name, val_split, args.hf_token))
+        total_val_rows = len(materialized_val_rows)
 
         def _hf_eval_rows() -> Iterable[dict]:
-            return _iter_hf_rows_once(dataset_name, val_split, args.hf_token)
+            return iter(materialized_val_rows)
 
         eval_rows_factory = _hf_eval_rows
         class_source_rows = _iter_hf_rows_once(dataset_name, train_split, args.hf_token)
+        if args.run_final_test or requested_test_split:
+            test_split = _resolve_test_split(
+                split_names,
+                train_split=train_split,
+                val_split=val_split,
+                test_split=requested_test_split,
+            )
+            materialized_test_rows = _materialize_rows(_iter_hf_rows_once(dataset_name, test_split, args.hf_token))
+            total_test_rows = len(materialized_test_rows)
+
+            def _hf_test_rows() -> Iterable[dict]:
+                return iter(materialized_test_rows)
+
+            test_rows_factory = _hf_test_rows
 
     all_class_names = _extract_class_names_from_file(args.class_names_file)
     if not all_class_names:
@@ -1338,12 +1911,15 @@ def main(argv: Optional[list[str]] = None) -> None:
         )
     if total_val_rows is not None:
         print(f"dataset usage plan: val_rows_total={total_val_rows}")
+    if total_test_rows is not None:
+        print(f"dataset usage plan: test_rows_total={total_test_rows}")
     print(
         "run control: "
         f"num_steps={args.num_steps} resume_step={args.resume_step} "
         f"eval_every={args.eval_every} save_every={args.save_every} "
         f"off_policy={args.off_policy} off_policy_injection_allowed={off_policy_injection_allowed} "
-        f"reasoning_train={bool(args.reasoning)} reasoning_eval={eval_reasoning}"
+        f"reasoning_train={bool(args.reasoning)} reasoning_eval={eval_reasoning} "
+        f"selection_metric={args.selection_metric} run_final_test={bool(args.run_final_test)}"
     )
 
     client = TunaClient(api_key=args.api_key, base_url=args.base_url)
@@ -1362,8 +1938,10 @@ def main(argv: Optional[list[str]] = None) -> None:
             "dataset_name": dataset_name or None,
             "train_split": train_split,
             "val_split": val_split,
+            "test_split": test_split,
             "train_rows_total": total_train_rows,
             "val_rows_total": total_val_rows,
+            "test_rows_total": total_test_rows,
             "expected_tasks_consumed": expected_tasks,
             "class_count": len(all_class_names),
             "class_names": list(all_class_names),
@@ -1386,6 +1964,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             "max_tokens": args.max_tokens,
             "max_objects": args.max_objects,
             "reward_metric": args.reward_metric,
+            "selection_metric": args.selection_metric,
             "seed": args.seed,
             "off_policy": args.off_policy,
             "allow_off_policy_with_reasoning": args.allow_off_policy_with_reasoning,
@@ -1400,6 +1979,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             "neg_reward_weight": args.neg_reward_weight,
             "reasoning": bool(args.reasoning),
             "eval_reasoning": bool(eval_reasoning),
+            "run_final_test": bool(args.run_final_test),
             "usage_report_every": args.usage_report_every,
             "usage_top_k": args.usage_top_k,
         },
@@ -1466,11 +2046,17 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     best_metric: Optional[float] = None
     best_step: Optional[int] = None
+    best_checkpoint_step: Optional[int] = None
+    best_eval_metrics: Optional[dict[str, Any]] = None
     successful_updates = args.resume_step
-    baseline_eval_metric: Optional[float] = None
+    baseline_eval_metrics: Optional[dict[str, Any]] = None
+    baseline_selection_metric: Optional[float] = None
     eval_events_logged = 0
+    kl_consecutive_hits = 0
+    stopped_early = False
+    early_stop_reason = ""
 
-    def _run_and_log_eval(*, trigger: str, step_for_log: int) -> Optional[dict[str, float]]:
+    def _run_and_log_eval(*, trigger: str, step_for_log: int) -> Optional[dict[str, Any]]:
         nonlocal eval_events_logged
         eval_events_logged += 1
         event_payload: dict[str, Any] = {
@@ -1517,12 +2103,18 @@ def main(argv: Optional[list[str]] = None) -> None:
         print("running baseline eval before training...")
         baseline_metrics = _run_and_log_eval(trigger="baseline", step_for_log=baseline_step)
         if baseline_metrics is not None:
-            baseline_eval_metric = float(baseline_metrics.get("eval_miou", 0.0))
-            run.summary["baseline_eval_miou"] = baseline_eval_metric
+            baseline_eval_metrics = dict(baseline_metrics)
+            baseline_selection_metric = _selection_metric_value(baseline_metrics, args.selection_metric)
+            run.summary["baseline_eval_miou"] = float(baseline_metrics.get("eval_miou", 0.0))
+            run.summary["baseline_eval_f1"] = float(baseline_metrics.get("eval_f1", 0.0))
+            run.summary["baseline_eval_f1_macro"] = float(baseline_metrics.get("eval_f1_macro", 0.0))
+            run.summary["baseline_selection_metric_name"] = args.selection_metric
+            run.summary["baseline_selection_metric"] = float(baseline_selection_metric)
             print(
                 f"baseline eval step {baseline_step} tasks={baseline_metrics['eval_tasks']} "
                 f"miou={baseline_metrics['eval_miou']:.4f} f1={baseline_metrics['eval_f1']:.4f} "
-                f"macro_f1={baseline_metrics['eval_f1_macro']:.4f}"
+                f"macro_f1={baseline_metrics['eval_f1_macro']:.4f} "
+                f"{args.selection_metric}={_selection_metric_value(baseline_metrics, args.selection_metric):.4f}"
             )
 
     for step in range(args.num_steps):
@@ -1685,6 +2277,17 @@ def main(argv: Optional[list[str]] = None) -> None:
             if total_train_rows and total_train_rows > 0
             else 0.0
         )
+        kl_value = float(train_out.kl or 0.0)
+        kl_consecutive_hits, kl_warning_triggered, kl_stop_triggered = _update_kl_guard(
+            kl_value=kl_value,
+            warning_threshold=float(args.kl_warning_threshold),
+            stop_threshold=float(args.kl_stop_threshold),
+            stop_consecutive=int(args.kl_stop_consecutive),
+            consecutive_hits=kl_consecutive_hits,
+        )
+        fully_off_policy_injection_step = int(
+            off_policy_considered > 0 and off_policy_injected_total == off_policy_considered
+        )
 
         wandb.log(
             {
@@ -1708,9 +2311,13 @@ def main(argv: Optional[list[str]] = None) -> None:
                 "off_policy_skipped_high_reward": off_policy_skipped_high_reward,
                 "off_policy_skipped_high_variance": off_policy_skipped_high_variance,
                 "off_policy_skipped_reasoning_guard": off_policy_skipped_reasoning_guard,
-                "kl": train_out.kl if train_out.kl is not None else 0.0,
+                "fully_off_policy_injection_step": fully_off_policy_injection_step,
+                "kl": kl_value,
                 "router_kl": train_out.router_kl if train_out.router_kl is not None else 0.0,
                 "grad_norm": train_out.grad_norm if train_out.grad_norm is not None else 0.0,
+                "kl_warning_triggered": int(kl_warning_triggered),
+                "kl_stop_triggered": int(kl_stop_triggered),
+                "kl_stop_consecutive_hits": kl_consecutive_hits,
                 "rows_seen": usage.rows_seen,
                 "rows_seen_fraction": rows_seen_fraction,
                 "tasks_generated_total": usage.tasks_generated,
@@ -1725,13 +2332,31 @@ def main(argv: Optional[list[str]] = None) -> None:
 
         total_s = time.monotonic() - step_start
         print(
-            f"step {global_step} reward={reward_mean:.4f} kl={float(train_out.kl or 0.0):.4f} "
+            f"step {global_step} reward={reward_mean:.4f} kl={kl_value:.4f} "
             f"train_p={train_precision:.3f} train_r={train_recall:.3f} "
             f"pos={pos_tasks} neg={neg_tasks} rollout_s={(rollout_end-rollout_start):.2f} "
             f"train_s={(train_end-train_start):.2f} total_s={total_s:.2f} "
             f"offp={off_policy_injected_total}/{off_policy_considered} "
             f"offp_guarded={off_policy_skipped_reasoning_guard} updates={successful_updates}"
         )
+        if fully_off_policy_injection_step:
+            print(
+                f"warning: step {global_step} fully off-policy injected "
+                f"({off_policy_injected_total}/{off_policy_considered} tasks)"
+            )
+        if kl_warning_triggered:
+            print(
+                f"warning: step {global_step} kl={kl_value:.4f} exceeded "
+                f"warning threshold {float(args.kl_warning_threshold):.4f}"
+            )
+        if kl_stop_triggered:
+            stopped_early = True
+            early_stop_reason = (
+                f"kl={kl_value:.4f} reached stop threshold {float(args.kl_stop_threshold):.4f} "
+                f"for {kl_consecutive_hits} consecutive update(s)"
+            )
+            print(f"stopping early at step {global_step}: {early_stop_reason}")
+            break
         if args.usage_report_every > 0 and (global_step + 1) % args.usage_report_every == 0:
             usage_summary = _usage_snapshot(usage, total_train_rows=total_train_rows, top_k=args.usage_top_k)
             _print_usage_snapshot(usage_summary, prefix=f"usage step {global_step}")
@@ -1740,28 +2365,112 @@ def main(argv: Optional[list[str]] = None) -> None:
             eval_metrics = _run_and_log_eval(trigger="periodic", step_for_log=global_step)
             if eval_metrics is None:
                 continue
-            if baseline_eval_metric is not None:
-                delta = float(eval_metrics.get("eval_miou", 0.0)) - baseline_eval_metric
-                wandb.log({"eval_miou_delta_vs_baseline": delta}, step=global_step)
+            delta_payload: dict[str, Any] = {}
+            if baseline_eval_metrics is not None:
+                delta_payload["eval_miou_delta_vs_baseline"] = (
+                    float(eval_metrics.get("eval_miou", 0.0)) - float(baseline_eval_metrics.get("eval_miou", 0.0))
+                )
+            if baseline_selection_metric is not None:
+                delta_payload["eval_selection_metric_delta_vs_baseline"] = (
+                    _selection_metric_value(eval_metrics, args.selection_metric) - baseline_selection_metric
+                )
+            if delta_payload:
+                wandb.log(delta_payload, step=global_step)
             print(
                 f"eval step {global_step} tasks={eval_metrics['eval_tasks']} "
                 f"miou={eval_metrics['eval_miou']:.4f} f1={eval_metrics['eval_f1']:.4f} "
-                f"macro_f1={eval_metrics['eval_f1_macro']:.4f} updates={successful_updates}"
+                f"macro_f1={eval_metrics['eval_f1_macro']:.4f} "
+                f"{args.selection_metric}={_selection_metric_value(eval_metrics, args.selection_metric):.4f} "
+                f"updates={successful_updates}"
             )
 
-            metric = float(eval_metrics.get("eval_miou", 0.0))
+            metric = _selection_metric_value(eval_metrics, args.selection_metric)
             if best_metric is None or metric > best_metric:
                 best_metric = metric
                 best_step = global_step
-                finetune.save_checkpoint()
+                best_eval_metrics = dict(eval_metrics)
+                saved_checkpoint = finetune.save_checkpoint()
+                checkpoint = getattr(saved_checkpoint, "checkpoint", None)
+                checkpoint_step_raw = getattr(checkpoint, "step", global_step)
+                best_checkpoint_step = int(checkpoint_step_raw)
+                run.summary["best_selection_metric_name"] = args.selection_metric
+                run.summary["best_selection_metric"] = float(best_metric)
+                run.summary["best_step"] = int(best_step)
+                run.summary["best_checkpoint_step"] = int(best_checkpoint_step)
+                run.summary["best_eval_f1"] = float(eval_metrics.get("eval_f1", 0.0))
+                run.summary["best_eval_f1_macro"] = float(eval_metrics.get("eval_f1_macro", 0.0))
+                run.summary["best_eval_miou"] = float(eval_metrics.get("eval_miou", 0.0))
 
         if args.save_every > 0 and (global_step + 1) % args.save_every == 0:
             finetune.save_checkpoint()
 
     finetune.save_checkpoint()
     if best_step is not None:
-        run.summary["best_step"] = best_step
-        run.summary["best_eval_miou"] = best_metric
+        run.summary["best_step"] = int(best_step)
+        run.summary["best_selection_metric_name"] = args.selection_metric
+        run.summary["best_selection_metric"] = float(best_metric or 0.0)
+        if best_checkpoint_step is not None:
+            run.summary["best_checkpoint_step"] = int(best_checkpoint_step)
+        if best_eval_metrics is not None:
+            run.summary["best_eval_f1"] = float(best_eval_metrics.get("eval_f1", 0.0))
+            run.summary["best_eval_f1_macro"] = float(best_eval_metrics.get("eval_f1_macro", 0.0))
+            run.summary["best_eval_miou"] = float(best_eval_metrics.get("eval_miou", 0.0))
+    run.summary["stopped_early"] = int(stopped_early)
+    run.summary["early_stop_reason"] = early_stop_reason
+    if args.run_final_test:
+        if test_rows_factory is None or test_split is None:
+            raise ValueError("--run-final-test requested, but no held-out test split could be resolved")
+        if best_checkpoint_step is None:
+            print("warning: final test skipped because no best validation checkpoint was saved.")
+        else:
+            model = f"moondream3-preview/{finetune.finetune_id}@{best_checkpoint_step}"
+            test_rng = random.Random(args.seed + 54321)
+            test_log_step = best_step if best_step is not None else successful_updates
+            try:
+                test_metrics = _evaluate_api(
+                    model=model,
+                    eval_rows=test_rows_factory(),
+                    all_class_names=all_class_names,
+                    prompt_overrides=args.prompt_overrides,
+                    rng=test_rng,
+                    neg_prompts_per_empty=args.neg_prompts_per_empty,
+                    neg_prompts_per_nonempty=args.neg_prompts_per_nonempty,
+                    max_samples=args.eval_max_samples,
+                    temperature=args.eval_temperature,
+                    top_p=args.eval_top_p,
+                    max_tokens=args.max_tokens,
+                    max_objects=args.max_objects,
+                    api_base=args.base_url,
+                    api_key=args.api_key,
+                )
+            except _DetectEvalError as exc:
+                failure_payload = {
+                    "test_eval_failures": int(exc.failure_count),
+                    "test_eval_error": str(exc),
+                }
+                wandb.log(failure_payload, step=test_log_step)
+                run.summary["test_eval_failures"] = int(exc.failure_count)
+                run.summary["test_eval_error"] = str(exc)
+                print(
+                    f"final test failed checkpoint_step={best_checkpoint_step} split={test_split} "
+                    f"failures={exc.failure_count} error={exc}"
+                )
+            else:
+                test_payload = _prefix_eval_metrics(test_metrics, prefix="test_")
+                test_payload["test_eval_failures"] = int(test_metrics.get("eval_api_failures", 0))
+                wandb.log(test_payload, step=test_log_step)
+                for key, value in test_payload.items():
+                    run.summary[key] = value
+                try:
+                    del run.summary["test_eval_error"]
+                except KeyError:
+                    pass
+                print(
+                    f"final test checkpoint_step={best_checkpoint_step} split={test_split} "
+                    f"tasks={test_payload['test_tasks']} miou={test_payload['test_miou']:.4f} "
+                    f"f1={test_payload['test_f1']:.4f} macro_f1={test_payload['test_f1_macro']:.4f} "
+                    f"failures={test_payload['test_eval_failures']}"
+                )
     final_usage = _usage_snapshot(usage, total_train_rows=total_train_rows, top_k=args.usage_top_k)
     _print_usage_snapshot(final_usage, prefix="usage final")
     run.summary["rows_seen"] = int(final_usage["rows_seen"])

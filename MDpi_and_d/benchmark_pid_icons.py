@@ -16,6 +16,7 @@ import io
 import json
 import os
 import random
+import socket
 import sys
 import time
 import urllib.error
@@ -117,6 +118,8 @@ def _config_to_cli_args(
         cli_args.append(_option_for_action(action))
         if isinstance(raw_value, list):
             cli_args.extend(str(item) for item in raw_value)
+        elif isinstance(raw_value, dict):
+            cli_args.append(json.dumps(raw_value))
         else:
             cli_args.append(str(raw_value))
     return cli_args
@@ -169,9 +172,12 @@ def _post_with_fallback_payloads(
     retry_429_max_retries: int,
     retry_429_backoff_s: float,
     retry_429_max_backoff_s: float,
+    retry_timeout_max_retries: int,
+    retry_timeout_backoff_s: float,
+    retry_timeout_max_backoff_s: float,
 ) -> dict[str, Any]:
     data: dict[str, Any] = {}
-    first_http_error: Optional[urllib.error.HTTPError] = None
+    first_request_error: Optional[Exception] = None
     for payload in payloads:
         attempts = 0
         while True:
@@ -185,7 +191,7 @@ def _post_with_fallback_payloads(
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     body = resp.read().decode("utf-8")
                 data = json.loads(body) if body else {}
-                first_http_error = None
+                first_request_error = None
                 break
             except urllib.error.HTTPError as exc:
                 detail = ""
@@ -216,13 +222,31 @@ def _post_with_fallback_payloads(
                         time.sleep(sleep_s)
                     attempts += 1
                     continue
-                if first_http_error is None:
-                    first_http_error = exc
+                if first_request_error is None:
+                    first_request_error = exc
                 break
-        if first_http_error is None:
+            except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
+                reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+                detail = str(reason or exc).strip()
+                lower_detail = detail.lower()
+                is_timeout = isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in lower_detail
+                if not is_timeout:
+                    raise
+                if attempts < max(0, int(retry_timeout_max_retries)):
+                    backoff_s = max(0.0, float(retry_timeout_backoff_s)) * (2.0**attempts)
+                    capped_backoff_s = min(max(0.0, float(retry_timeout_max_backoff_s)), backoff_s)
+                    sleep_s = capped_backoff_s * random.uniform(0.9, 1.1)
+                    if sleep_s > 0.0:
+                        time.sleep(sleep_s)
+                    attempts += 1
+                    continue
+                if first_request_error is None:
+                    first_request_error = TimeoutError(detail or "The read operation timed out")
+                break
+        if first_request_error is None:
             break
-    if first_http_error is not None:
-        raise first_http_error
+    if first_request_error is not None:
+        raise first_request_error
     return data
 
 
@@ -241,6 +265,9 @@ def _call_detect_api(
     retry_429_max_retries: int,
     retry_429_backoff_s: float,
     retry_429_max_backoff_s: float,
+    retry_timeout_max_retries: int,
+    retry_timeout_backoff_s: float,
+    retry_timeout_max_backoff_s: float,
     reasoning: bool,
 ) -> list["Box"]:
     detect_object = _object_from_prompt(prompt)
@@ -279,6 +306,9 @@ def _call_detect_api(
         retry_429_max_retries=retry_429_max_retries,
         retry_429_backoff_s=retry_429_backoff_s,
         retry_429_max_backoff_s=retry_429_max_backoff_s,
+        retry_timeout_max_retries=retry_timeout_max_retries,
+        retry_timeout_backoff_s=retry_timeout_backoff_s,
+        retry_timeout_max_backoff_s=retry_timeout_max_backoff_s,
     )
 
     objects = data.get("objects")
@@ -317,6 +347,9 @@ def _call_point_api(
     retry_429_max_retries: int,
     retry_429_backoff_s: float,
     retry_429_max_backoff_s: float,
+    retry_timeout_max_retries: int,
+    retry_timeout_backoff_s: float,
+    retry_timeout_max_backoff_s: float,
     reasoning: bool,
 ) -> list["Point"]:
     object_name = _object_from_prompt(prompt)
@@ -353,6 +386,9 @@ def _call_point_api(
         retry_429_max_retries=retry_429_max_retries,
         retry_429_backoff_s=retry_429_backoff_s,
         retry_429_max_backoff_s=retry_429_max_backoff_s,
+        retry_timeout_max_retries=retry_timeout_max_retries,
+        retry_timeout_backoff_s=retry_timeout_backoff_s,
+        retry_timeout_max_backoff_s=retry_timeout_max_backoff_s,
     )
 
     points_raw: Any = data.get("points")
@@ -473,6 +509,33 @@ def _load_class_names(class_names_file: str, dataset_path: Optional[str]) -> lis
     return []
 
 
+def _normalize_class_name_list(values: Optional[list[str]]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        class_name = str(value or "").strip()
+        if not class_name or class_name in seen:
+            continue
+        seen.add(class_name)
+        out.append(class_name)
+    return out
+
+
+def _filter_class_names(
+    class_names: list[str],
+    *,
+    include_classes: Optional[list[str]] = None,
+    exclude_classes: Optional[list[str]] = None,
+) -> list[str]:
+    include_set = set(_normalize_class_name_list(include_classes))
+    exclude_set = set(_normalize_class_name_list(exclude_classes))
+    return [
+        class_name
+        for class_name in class_names
+        if (not include_set or class_name in include_set) and class_name not in exclude_set
+    ]
+
+
 def _resolve_dataset_source(dataset_path: str, dataset_name: str) -> tuple[str, str]:
     path = dataset_path.strip()
     name = dataset_name.strip()
@@ -520,6 +583,97 @@ def _infer_class_names_from_dataset(
     return sorted(names)
 
 
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_element_class_names(attributes: Any) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for attr in _as_list(attributes):
+        if not isinstance(attr, dict):
+            continue
+        key = str(attr.get("key") or "").strip().lower()
+        if key != "element":
+            continue
+        for item in _as_list(attr.get("value")):
+            class_name = str(item or "").strip()
+            if not class_name or class_name in seen:
+                continue
+            seen.add(class_name)
+            out.append(class_name)
+    return out
+
+
+def _parse_box_item(item: dict[str, Any], *, width: int, height: int) -> Optional[Box]:
+    x_min = _coerce_float(item.get("x_min", item.get("xmin")))
+    y_min = _coerce_float(item.get("y_min", item.get("ymin")))
+    x_max = _coerce_float(item.get("x_max", item.get("xmax")))
+    y_max = _coerce_float(item.get("y_max", item.get("ymax")))
+    if None not in (x_min, y_min, x_max, y_max):
+        x0 = float(x_min)
+        y0 = float(y_min)
+        x1 = float(x_max)
+        y1 = float(y_max)
+    else:
+        nested = item.get("box")
+        if isinstance(nested, dict):
+            return _parse_box_item(nested, width=width, height=height)
+
+        x_center = _coerce_float(item.get("x_center", item.get("cx", item.get("x"))))
+        y_center = _coerce_float(item.get("y_center", item.get("cy", item.get("y"))))
+        box_w = _coerce_float(item.get("width", item.get("w")))
+        box_h = _coerce_float(item.get("height", item.get("h")))
+        if None in (x_center, y_center, box_w, box_h):
+            return None
+
+        x_center_n = float(x_center)
+        y_center_n = float(y_center)
+        width_n = float(box_w)
+        height_n = float(box_h)
+        if abs(x_center_n) > 1.5 and width > 0:
+            x_center_n /= float(width)
+        if abs(y_center_n) > 1.5 and height > 0:
+            y_center_n /= float(height)
+        if abs(width_n) > 1.5 and width > 0:
+            width_n /= float(width)
+        if abs(height_n) > 1.5 and height > 0:
+            height_n /= float(height)
+        x0 = x_center_n - (width_n / 2.0)
+        y0 = y_center_n - (height_n / 2.0)
+        x1 = x_center_n + (width_n / 2.0)
+        y1 = y_center_n + (height_n / 2.0)
+
+    if max(abs(x0), abs(y0), abs(x1), abs(y1)) > 1.5:
+        if width <= 0 or height <= 0:
+            return None
+        x0 /= width
+        y0 /= height
+        x1 /= width
+        y1 /= height
+
+    x0 = max(0.0, min(1.0, x0))
+    y0 = max(0.0, min(1.0, y0))
+    x1 = max(0.0, min(1.0, x1))
+    y1 = max(0.0, min(1.0, y1))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return Box(x0, y0, x1, y1)
+
+
 def _parse_answer_boxes(value: Any, width: int, height: int) -> list[ClassBox]:
     if value is None:
         return []
@@ -542,34 +696,24 @@ def _parse_answer_boxes(value: Any, width: int, height: int) -> list[ClassBox]:
     for item in raw:
         if not isinstance(item, dict):
             continue
-        class_name = str(item.get("class_name") or item.get("source_class_name") or "").strip()
-        class_uid = str(item.get("class_uid") or class_name).strip()
-        if not class_name:
-            continue
-        try:
-            x_min = float(item.get("x_min"))
-            y_min = float(item.get("y_min"))
-            x_max = float(item.get("x_max"))
-            y_max = float(item.get("y_max"))
-        except (TypeError, ValueError):
+        box = _parse_box_item(item, width=width, height=height)
+        if box is None:
             continue
 
-        if max(abs(x_min), abs(y_min), abs(x_max), abs(y_max)) > 1.5:
-            if width <= 0 or height <= 0:
-                continue
-            x_min /= width
-            y_min /= height
-            x_max /= width
-            y_max /= height
-
-        x_min = max(0.0, min(1.0, x_min))
-        y_min = max(0.0, min(1.0, y_min))
-        x_max = max(0.0, min(1.0, x_max))
-        y_max = max(0.0, min(1.0, y_max))
-        if x_max <= x_min or y_max <= y_min:
+        class_names: list[str] = []
+        explicit_class_name = str(item.get("class_name") or item.get("source_class_name") or "").strip()
+        if explicit_class_name:
+            class_names.append(explicit_class_name)
+        for attr_class_name in _extract_element_class_names(item.get("attributes")):
+            if attr_class_name not in class_names:
+                class_names.append(attr_class_name)
+        if not class_names:
             continue
 
-        parsed.append(ClassBox(class_uid=class_uid, class_name=class_name, box=Box(x_min, y_min, x_max, y_max)))
+        explicit_class_uid = str(item.get("class_uid") or "").strip()
+        for class_name in class_names:
+            class_uid = explicit_class_uid if explicit_class_uid and len(class_names) == 1 else class_name
+            parsed.append(ClassBox(class_uid=class_uid, class_name=class_name, box=box))
 
     return parsed
 
@@ -585,7 +729,49 @@ def _to_base_sample(row: dict, fallback_id: int) -> Optional[BaseSample]:
     return BaseSample(image=image, boxes=boxes, sample_id=sample_id)
 
 
-def _prompt_for_class(class_name: str, *, style: str = "detect_phrase") -> str:
+def _filter_sample_boxes(
+    sample: BaseSample,
+    *,
+    include_classes: Optional[list[str]] = None,
+    exclude_classes: Optional[list[str]] = None,
+) -> BaseSample:
+    include_set = set(_normalize_class_name_list(include_classes))
+    exclude_set = set(_normalize_class_name_list(exclude_classes))
+    if not include_set and not exclude_set:
+        return sample
+    filtered_boxes = [
+        item
+        for item in sample.boxes
+        if (not include_set or item.class_name in include_set) and item.class_name not in exclude_set
+    ]
+    return BaseSample(image=sample.image, boxes=filtered_boxes, sample_id=sample.sample_id)
+
+
+def _parse_prompt_overrides_json(raw_value: str) -> dict[str, str]:
+    text = str(raw_value or "").strip()
+    if not text:
+        return {}
+    payload = json.loads(text)
+    if not isinstance(payload, dict):
+        raise ValueError("--prompt-overrides-json must decode to an object")
+    out: dict[str, str] = {}
+    for key, value in payload.items():
+        class_name = str(key or "").strip()
+        prompt = str(value or "").strip()
+        if class_name and prompt:
+            out[class_name] = prompt
+    return out
+
+
+def _prompt_for_class(
+    class_name: str,
+    *,
+    style: str = "detect_phrase",
+    prompt_overrides: Optional[dict[str, str]] = None,
+) -> str:
+    override = str((prompt_overrides or {}).get(class_name, "") or "").strip()
+    if override:
+        return override
     normalized_style = (style or "detect_phrase").strip().lower()
     if normalized_style == "class_name":
         return class_name
@@ -601,6 +787,7 @@ def _tasks_from_sample(
     neg_prompts_per_empty: int,
     neg_prompts_per_nonempty: int,
     prompt_style: str = "detect_phrase",
+    prompt_overrides: Optional[dict[str, str]] = None,
 ) -> list[TaskSample]:
     grouped: dict[str, tuple[str, list[Box]]] = {}
     for item in sample.boxes:
@@ -616,7 +803,7 @@ def _tasks_from_sample(
         tasks.append(
             TaskSample(
                 image=sample.image,
-                prompt=_prompt_for_class(class_name, style=prompt_style),
+                prompt=_prompt_for_class(class_name, style=prompt_style, prompt_overrides=prompt_overrides),
                 gt_boxes=list(boxes),
                 class_name=class_name,
                 sample_id=sample.sample_id,
@@ -631,21 +818,21 @@ def _tasks_from_sample(
                 tasks.append(
                     TaskSample(
                         image=sample.image,
-                        prompt=_prompt_for_class(class_name, style=prompt_style),
+                        prompt=_prompt_for_class(class_name, style=prompt_style, prompt_overrides=prompt_overrides),
                         gt_boxes=[],
                         class_name=class_name,
                         sample_id=sample.sample_id,
                     )
                 )
     else:
-        if all_class_names:
-            k = max(1, neg_prompts_per_empty)
+        if all_class_names and neg_prompts_per_empty > 0:
+            k = min(int(neg_prompts_per_empty), len(all_class_names))
             picks = rng.sample(all_class_names, k=min(k, len(all_class_names)))
             for class_name in picks:
                 tasks.append(
                     TaskSample(
                         image=sample.image,
-                        prompt=_prompt_for_class(class_name, style=prompt_style),
+                        prompt=_prompt_for_class(class_name, style=prompt_style, prompt_overrides=prompt_overrides),
                         gt_boxes=[],
                         class_name=class_name,
                         sample_id=sample.sample_id,
@@ -945,6 +1132,9 @@ def _evaluate_model(label: str, model: str, args: argparse.Namespace, all_class_
     total_fp = 0
     total_fn = 0
     total_latency = 0.0
+    total_gt_boxes = 0
+    positive_tasks = 0
+    negative_tasks = 0
     failed_tasks = 0
 
     per_class: dict[str, dict[str, Any]] = {}
@@ -966,6 +1156,11 @@ def _evaluate_model(label: str, model: str, args: argparse.Namespace, all_class_
         sample = _to_base_sample(row, idx)
         if sample is None:
             continue
+        sample = _filter_sample_boxes(
+            sample,
+            include_classes=args.include_classes,
+            exclude_classes=args.exclude_classes,
+        )
         total_base_samples += 1
 
         tasks = _tasks_from_sample(
@@ -975,9 +1170,15 @@ def _evaluate_model(label: str, model: str, args: argparse.Namespace, all_class_
             neg_prompts_per_empty=args.neg_prompts_per_empty,
             neg_prompts_per_nonempty=args.neg_prompts_per_nonempty,
             prompt_style=args.point_prompt_style if effective_skill == "point" else "detect_phrase",
+            prompt_overrides=args.prompt_overrides,
         )
 
         for task in tasks:
+            total_gt_boxes += len(task.gt_boxes)
+            if task.gt_boxes:
+                positive_tasks += 1
+            else:
+                negative_tasks += 1
             if args.min_request_interval_s > 0.0 and last_request_end is not None:
                 wait_s = float(args.min_request_interval_s) - (time.monotonic() - last_request_end)
                 if wait_s > 0.0:
@@ -998,6 +1199,9 @@ def _evaluate_model(label: str, model: str, args: argparse.Namespace, all_class_
                         retry_429_max_retries=args.retry_429_max_retries,
                         retry_429_backoff_s=args.retry_429_backoff_s,
                         retry_429_max_backoff_s=args.retry_429_max_backoff_s,
+                        retry_timeout_max_retries=args.retry_timeout_max_retries,
+                        retry_timeout_backoff_s=args.retry_timeout_backoff_s,
+                        retry_timeout_max_backoff_s=args.retry_timeout_max_backoff_s,
                         reasoning=args.reasoning,
                     )
                     pred_boxes: list[Box] = []
@@ -1016,6 +1220,9 @@ def _evaluate_model(label: str, model: str, args: argparse.Namespace, all_class_
                         retry_429_max_retries=args.retry_429_max_retries,
                         retry_429_backoff_s=args.retry_429_backoff_s,
                         retry_429_max_backoff_s=args.retry_429_max_backoff_s,
+                        retry_timeout_max_retries=args.retry_timeout_max_retries,
+                        retry_timeout_backoff_s=args.retry_timeout_backoff_s,
+                        retry_timeout_max_backoff_s=args.retry_timeout_max_backoff_s,
                         reasoning=args.reasoning,
                     )
                     pred_points = []
@@ -1086,6 +1293,9 @@ def _evaluate_model(label: str, model: str, args: argparse.Namespace, all_class_
             "tasks": 0,
             "failed_tasks": failed_tasks,
             "attempted_tasks": failed_tasks,
+            "total_gt_boxes": total_gt_boxes,
+            "positive_tasks": positive_tasks,
+            "negative_tasks": negative_tasks,
             "visualizations_saved": viz_saved,
             "visualization_paths": viz_paths,
         }
@@ -1120,6 +1330,9 @@ def _evaluate_model(label: str, model: str, args: argparse.Namespace, all_class_
         "tasks": total_tasks,
         "failed_tasks": failed_tasks,
         "attempted_tasks": total_tasks + failed_tasks,
+        "total_gt_boxes": total_gt_boxes,
+        "positive_tasks": positive_tasks,
+        "negative_tasks": negative_tasks,
         "eval_f1": micro_f1,
         "eval_f1_macro": total_f1 / total_tasks,
         "eval_miou": total_miou / total_tasks,
@@ -1155,7 +1368,42 @@ def _print_summary(title: str, metrics: dict[str, Any]) -> None:
         )
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def _resolve_env_file(env_file: str) -> str:
+    path = Path(env_file).expanduser()
+    if path.is_absolute():
+        return str(path)
+
+    from_cwd = (Path.cwd() / path).resolve()
+    if from_cwd.exists():
+        return str(from_cwd)
+
+    from_script = (_repo_relative(path.as_posix())).resolve()
+    if from_script.exists():
+        return str(from_script)
+
+    return str(from_cwd)
+
+
+def _resolve_runtime_env(args: argparse.Namespace) -> argparse.Namespace:
+    args.env_file = _resolve_env_file(str(args.env_file))
+    args.api_key_env_var = str(getattr(args, "api_key_env_var", "") or "").strip() or "MOONDREAM_API_KEY"
+    load_dotenv(args.env_file, override=True)
+    if not args.api_key:
+        args.api_key = os.environ.get(args.api_key_env_var, "")
+    if not args.api_key and args.api_key_env_var != "MOONDREAM_API_KEY":
+        args.api_key = os.environ.get("MOONDREAM_API_KEY", "")
+    if not args.hf_token:
+        args.hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    if not args.api_base:
+        args.api_base = (
+            os.environ.get("TUNA_BASE_URL")
+            or os.environ.get("MOONDREAM_BASE_URL")
+            or "https://api.moondream.ai/v1"
+        )
+    return args
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
@@ -1166,9 +1414,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Benchmark PI&D class-conditional detect/point performance.")
     parser.add_argument("--config", default=str(config_path))
     parser.add_argument("--env-file", default=str(_repo_relative(".env")))
-    parser.add_argument("--api-key", default=None)
-    parser.add_argument("--hf-token", default=None)
-    parser.add_argument("--api-base", default=None)
+    parser.add_argument("--api-key", default="")
+    parser.add_argument("--api-key-env-var", default="MOONDREAM_API_KEY")
+    parser.add_argument("--hf-token", default="")
+    parser.add_argument("--api-base", default="")
 
     parser.add_argument("--dataset-path", default=str(_repo_relative("outputs", "pid_icons_merged")))
     parser.add_argument("--dataset-name", default="")
@@ -1181,6 +1430,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             "or plain text label key lines (e.g. '12 generic valve closed')."
         ),
     )
+    parser.add_argument("--include-classes", nargs="*", default=None)
+    parser.add_argument("--exclude-classes", nargs="*", default=None)
     parser.add_argument(
         "--max-samples",
         type=int,
@@ -1212,6 +1463,11 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     parser.add_argument("--baseline-model", default="moondream3-preview")
     parser.add_argument("--skip-baseline", action="store_true")
+    parser.add_argument(
+        "--prompt-overrides-json",
+        default="{}",
+        help="Optional JSON object mapping class name to benchmark prompt/object string.",
+    )
     parser.add_argument(
         "--skill",
         choices=["detect", "point"],
@@ -1254,6 +1510,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--retry-429-max-retries", type=int, default=6)
     parser.add_argument("--retry-429-backoff-s", type=float, default=0.5)
     parser.add_argument("--retry-429-max-backoff-s", type=float, default=12.0)
+    parser.add_argument("--retry-timeout-max-retries", type=int, default=3)
+    parser.add_argument("--retry-timeout-backoff-s", type=float, default=2.0)
+    parser.add_argument("--retry-timeout-max-backoff-s", type=float, default=20.0)
     parser.add_argument("--min-request-interval-s", type=float, default=0.0)
     parser.add_argument("--iou-threshold", type=float, default=0.5)
     parser.add_argument("--progress-every", type=int, default=100)
@@ -1275,19 +1534,15 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
     args = parser.parse_args(config_cli_args + raw_argv)
     args.config = str(_resolve_config_path(args.config))
+    args.prompt_overrides = _parse_prompt_overrides_json(args.prompt_overrides_json)
+    args.include_classes = _normalize_class_name_list(args.include_classes)
+    args.exclude_classes = _normalize_class_name_list(args.exclude_classes)
 
-    load_dotenv(args.env_file, override=False)
-    if not args.api_key:
-        args.api_key = os.environ.get("MOONDREAM_API_KEY")
-    if not args.hf_token:
-        args.hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-    if not args.api_base:
-        args.api_base = (
-            os.environ.get("TUNA_BASE_URL")
-            or os.environ.get("MOONDREAM_BASE_URL")
-            or "https://api.moondream.ai/v1"
-        )
+    return args
 
+
+def run(args: argparse.Namespace) -> None:
+    args = _resolve_runtime_env(args)
     if not args.api_key:
         raise ValueError("MOONDREAM_API_KEY is required")
     if args.max_samples is not None and args.max_samples <= 0:
@@ -1326,6 +1581,13 @@ def main(argv: Optional[list[str]] = None) -> None:
         raise ValueError(
             "Could not resolve class names from class file, local metadata, or dataset rows."
         )
+    all_class_names = _filter_class_names(
+        all_class_names,
+        include_classes=args.include_classes,
+        exclude_classes=args.exclude_classes,
+    )
+    if not all_class_names:
+        raise ValueError("No class names remain after applying include/exclude filters.")
 
     candidate_model = args.model.strip()
     if not candidate_model and args.finetune_id.strip() and args.checkpoint_step is not None:
@@ -1355,6 +1617,8 @@ def main(argv: Optional[list[str]] = None) -> None:
                 "dataset_path": args.dataset_path.strip() or None,
                 "dataset_name": args.dataset_name or None,
                 "split": args.split,
+                "include_classes": list(args.include_classes),
+                "exclude_classes": list(args.exclude_classes),
                 "skill": args.skill,
                 "reasoning": bool(args.reasoning),
                 "point_prompt_style": args.point_prompt_style,
@@ -1373,6 +1637,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"saved metrics -> {out_path}")
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    run(parse_args(argv))
 
 
 if __name__ == "__main__":

@@ -6,6 +6,8 @@
   "hf_cache_dir": "",
   "dataset_dir": "synth_dataset/outputs/v2",
   "train_split": "train",
+  "train_max_samples": 0,
+  "train_subset_seed": -1,
   "val_split": "val",
   "final_eval_splits": [
     "val",

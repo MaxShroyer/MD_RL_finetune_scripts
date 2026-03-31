@@ -1,0 +1,9 @@
+python aerial_airport/benchmark_aerial_airport_point.py \
+  --config aerial_airport/configs/benchmark_aerial_airport_point_tiling.json \
+  --dataset-name '' \
+  --finetune-id "01KMCN8BH49QCW32G9MKKA8Z0C" \
+  --checkpoint-step 199 \
+  --tile-overlap 0.3 \
+  --viz-samples 40 \
+  --viz-dir aerial_airport/outputs/benchmark_viz/runtime_best_overlap30_step199 \
+  --out-json aerial_airport/outputs/benchmarks/runtime_best_overlap30_step199.json

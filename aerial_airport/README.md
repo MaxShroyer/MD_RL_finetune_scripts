@@ -44,7 +44,7 @@ Key behavior:
 - Defaults to `skill=point`, `point_prompt_style=class_name`, and `reward_metric=f1`.
 - Uses recall-gated point defaults tuned for single-class point supervision.
 - Uses W&B project `moondream-aerial-airport-point-rl`.
-- Uses `MOONDREAM_API_KEY_1` by default; the round-2 recall grid rotates across keys `1` through `4`.
+- Uses `CICID_GPUB_MOONDREAM_API_KEY_1` by default; the round-2 recall grid rotates across keys `1` through `4`.
 
 ## Benchmark
 
@@ -58,7 +58,7 @@ python aerial_airport/benchmark_aerial_airport_point.py \
 ```
 
 This runs held-out evaluation on the dataset `test` split rather than adding trainer-level final-test logic.
-The benchmark default config uses the local normalized dataset output and `MOONDREAM_API_KEY_4`.
+The benchmark default config uses the local normalized dataset output and `CICID_GPUB_MOONDREAM_API_KEY_4`.
 
 ## Round-2 Recall Grid
 

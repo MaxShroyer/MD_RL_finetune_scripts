@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Query-skill RL finetuning for Chess QA."""
+"""Train a query-model finetune for Chess QA.
+
+Requires:
+  pip install pillow numpy wandb python-dotenv tqdm
+
+Examples:
+  python chess_QA/train_chess_query_rl.py --config chess_QA/configs/query_rl_chess_default.json
+  python chess_QA/train_chess_query_rl.py \
+      --env-file .env \
+      --dataset-source local_jsonl \
+      --dataset-dir chess_QA/synth-chess-dataset/outputs \
+      --dataset-variant-tag mixed_tasks_v1
+"""
 
 from __future__ import annotations
 
@@ -14,6 +26,7 @@ import shlex
 import subprocess
 import string
 import sys
+import textwrap
 import time
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
@@ -163,6 +176,20 @@ CHECKPOINT_AVG_METRIC_CHOICES = (
     "eval_task_accuracy_color_presence_check",
 )
 WANDB_LOG_PROFILES = ("legacy", "lean")
+CLI_EPILOG = textwrap.dedent(
+    """\
+    Config precedence:
+      1. Built-in defaults
+      2. Values from --config
+      3. Explicit CLI flags
+
+    Local dataset layout:
+      <dataset_dir>/<dataset_variant_tag>/jsonl/{train,val,test}.jsonl
+
+    The script can also read credentials from --env-file and will fall back to
+    MOONDREAM_API_KEY when --api-key is omitted.
+    """
+)
 
 REQUIRED_ROW_FIELDS = (
     "row_id",
@@ -249,6 +276,13 @@ TRAIN_CONFIG_ALLOWED_KEYS = {
 }
 
 EARLY_STOP_MODES = ("conservative", "balanced", "aggressive")
+
+
+class _HelpFormatter(
+    argparse.ArgumentDefaultsHelpFormatter,
+    argparse.RawDescriptionHelpFormatter,
+):
+    """Show defaults while preserving multiline help text."""
 
 
 def _strip_inline_env_comment(value: str) -> str:
@@ -444,6 +478,26 @@ class CheckpointSaveOutcome:
     checkpoint_step: int = -1
 
 
+@dataclass(frozen=True)
+class EvalRuntimeConfig:
+    batch_size: int
+    max_workers: int
+    max_samples: Optional[int]
+    rollout_retries: int
+    rollout_retry_backoff_s: float
+    temperature: float
+    top_p: float
+    max_tokens: int
+    max_tokens_by_task: dict[str, int]
+    reasoning: bool
+    image_jpeg_quality: int
+    show_progress: bool
+    list_piece_reward_mode: str
+    list_piece_reward_weights: dict[str, float]
+    save_predictions: bool
+    predictions_output_dir: Optional[Path]
+
+
 def _repo_relative(*parts: str) -> Path:
     return Path(__file__).resolve().parent.joinpath(*parts)
 
@@ -453,24 +507,24 @@ def _random_suffix(length: int = 6) -> str:
     return "".join(random.choices(chars, k=length))
 
 
-def _resolve_config_path(raw_path: str) -> Path:
+def _resolve_from_search_roots(raw_path: str | Path) -> Path:
     path = Path(raw_path).expanduser()
     if path.is_absolute():
-        return path
+        return path.resolve()
 
-    from_cwd = (Path.cwd() / path).resolve()
-    if from_cwd.exists():
-        return from_cwd
+    candidates = [
+        (Path.cwd() / path).resolve(),
+        (REPO_ROOT / path).resolve(),
+        (_repo_relative(path.as_posix())).resolve(),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
-    from_repo = (REPO_ROOT / path).resolve()
-    if from_repo.exists():
-        return from_repo
 
-    from_script = (_repo_relative(path.as_posix())).resolve()
-    if from_script.exists():
-        return from_script
-
-    return from_cwd
+def _resolve_config_path(raw_path: str) -> Path:
+    return _resolve_from_search_roots(raw_path)
 
 
 def _load_json_config(config_path: Path) -> dict[str, Any]:
@@ -763,110 +817,219 @@ def _resolve_list_piece_reward_weights(
 
 
 def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="RL query finetuning for Chess QA")
-    parser.add_argument("--config", default=str(config_path))
-    parser.add_argument("--env-file", default=_cfg_str(config, "env_file", str(_repo_relative(".env"))))
-    parser.add_argument("--api-key", default=_cfg_str(config, "api_key", ""))
+    parser = argparse.ArgumentParser(
+        description="Train a Moondream query finetune on the Chess QA dataset.",
+        epilog=CLI_EPILOG,
+        formatter_class=_HelpFormatter,
+    )
     parser.add_argument(
+        "--config",
+        default=str(config_path),
+        help="JSON config file. Explicit CLI flags override values from this file.",
+    )
+
+    auth_group = parser.add_argument_group("Auth and Finetune")
+    auth_group.add_argument(
+        "--env-file",
+        default=_cfg_str(config, "env_file", str(_repo_relative(".env"))),
+        help="Environment file to load before resolving auth and base URL.",
+    )
+    auth_group.add_argument(
+        "--api-key",
+        default=_cfg_str(config, "api_key", ""),
+        help="Explicit API key override. If omitted, the script reads from the env file.",
+    )
+    auth_group.add_argument(
         "--api-key-env-var",
         default=_cfg_str(config, "api_key_env_var", "MOONDREAM_API_KEY"),
+        help="Environment variable name used to resolve the API key.",
     )
-    parser.add_argument("--base-url", default=_cfg_str(config, "base_url", ""))
+    auth_group.add_argument(
+        "--base-url",
+        default=_cfg_str(config, "base_url", ""),
+        help="API base URL override. Defaults to TUNA_BASE_URL or the production endpoint.",
+    )
+    auth_group.add_argument(
+        "--finetune-id",
+        default=_cfg_str(config, "finetune_id", ""),
+        help="Existing finetune to resume or continue training.",
+    )
+    auth_group.add_argument(
+        "--finetune-name",
+        default=_cfg_str(config, "finetune_name", ""),
+        help="Name for a new finetune when --finetune-id is not provided.",
+    )
+    auth_group.add_argument(
+        "--rank",
+        type=int,
+        default=_cfg_int(config, "rank", 16),
+        help="LoRA rank used when creating a new finetune.",
+    )
 
-    parser.add_argument(
+    dataset_group = parser.add_argument_group("Dataset")
+    dataset_group.add_argument(
         "--dataset-source",
         choices=sorted(dataset_loader.SUPPORTED_DATASET_SOURCES),
         default=_cfg_str(config, "dataset_source", DEFAULT_DATASET_SOURCE),
-        help="Dataset source: HF Hub or local JSONL directory.",
+        help="Where to read the dataset from.",
     )
-    parser.add_argument(
+    dataset_group.add_argument(
         "--dataset-dir",
         default=_cfg_str(config, "dataset_dir", str(_repo_relative("synth-chess-dataset/outputs"))),
-        help="Local dataset dir (required when --dataset-source=local_jsonl).",
+        help="Local dataset root. Required when --dataset-source=local_jsonl.",
     )
-    parser.add_argument(
+    dataset_group.add_argument(
         "--dataset-variant-tag",
         default=_cfg_str(config, "dataset_variant_tag", DEFAULT_DATASET_VARIANT_TAG),
         help=(
-            "Dataset variant tag under dataset root. "
-            "Expected local path contract: <dataset_dir>/<dataset_variant_tag>/jsonl/<split>.jsonl"
+            "Dataset variant under the dataset root. Expected local layout: "
+            "<dataset_dir>/<dataset_variant_tag>/jsonl/<split>.jsonl"
         ),
     )
-    parser.add_argument(
+    dataset_group.add_argument(
         "--hf-dataset-repo-id",
         default=_cfg_str(config, "hf_dataset_repo_id", DEFAULT_HF_DATASET_REPO_ID),
+        help="Hugging Face dataset repo id when --dataset-source=hf_hub.",
     )
-    parser.add_argument(
+    dataset_group.add_argument(
         "--hf-dataset-revision",
         default=_cfg_str(config, "hf_dataset_revision", DEFAULT_HF_DATASET_REVISION),
+        help="Dataset revision to load from Hugging Face Hub.",
     )
-    parser.add_argument("--hf-token", default=_cfg_str(config, "hf_token", ""))
-    parser.add_argument("--hf-cache-dir", default=_cfg_str(config, "hf_cache_dir", ""))
-    parser.add_argument("--train-split", default=_cfg_str(config, "train_split", "train"))
-    parser.add_argument("--val-split", default=_cfg_str(config, "val_split", "val"))
-    parser.add_argument(
+    dataset_group.add_argument(
+        "--hf-token",
+        default=_cfg_str(config, "hf_token", ""),
+        help="Optional Hugging Face token override.",
+    )
+    dataset_group.add_argument(
+        "--hf-cache-dir",
+        default=_cfg_str(config, "hf_cache_dir", ""),
+        help="Optional Hugging Face cache directory.",
+    )
+    dataset_group.add_argument(
+        "--train-split",
+        default=_cfg_str(config, "train_split", "train"),
+        help="Training split name.",
+    )
+    dataset_group.add_argument(
+        "--val-split",
+        default=_cfg_str(config, "val_split", "val"),
+        help="Validation split name used for periodic eval.",
+    )
+    dataset_group.add_argument(
         "--final-eval-splits",
         nargs="+",
         default=_cfg_list_str(config, "final_eval_splits", DEFAULT_FINAL_EVAL_SPLITS),
-        help="Split names to evaluate after training.",
+        help="Split names to evaluate after training completes.",
     )
 
-    parser.add_argument("--finetune-id", default=_cfg_str(config, "finetune_id", ""))
-    parser.add_argument("--finetune-name", default=_cfg_str(config, "finetune_name", ""))
-    parser.add_argument("--rank", type=int, default=_cfg_int(config, "rank", 16))
-
-    parser.add_argument("--seed", type=int, default=_cfg_int(config, "seed", 42))
-    parser.add_argument("--num-steps", type=int, default=_cfg_int(config, "num_steps", 100))
-    parser.add_argument("--resume-step", type=int, default=_cfg_int(config, "resume_step", 0))
-    parser.add_argument("--batch-size", type=int, default=_cfg_int(config, "batch_size", 16))
-    parser.add_argument("--group-size", type=int, default=_cfg_int(config, "group_size", 4))
-    parser.add_argument("--lr", type=float, default=_cfg_float(config, "lr", 2e-3))
-    parser.add_argument("--max-workers", type=int, default=_cfg_int(config, "max_workers", 4))
-    parser.add_argument("--rollout-retries", type=int, default=_cfg_int(config, "rollout_retries", 2))
-    parser.add_argument(
+    train_group = parser.add_argument_group("Training")
+    train_group.add_argument("--seed", type=int, default=_cfg_int(config, "seed", 42), help="RNG seed.")
+    train_group.add_argument(
+        "--num-steps",
+        type=int,
+        default=_cfg_int(config, "num_steps", 100),
+        help="Number of optimizer steps to run.",
+    )
+    train_group.add_argument(
+        "--resume-step",
+        type=int,
+        default=_cfg_int(config, "resume_step", 0),
+        help="Initial global step index for resumed runs.",
+    )
+    train_group.add_argument(
+        "--batch-size",
+        type=int,
+        default=_cfg_int(config, "batch_size", 16),
+        help="Number of prompts sampled per rollout batch.",
+    )
+    train_group.add_argument(
+        "--group-size",
+        type=int,
+        default=_cfg_int(config, "group_size", 4),
+        help="Number of rollouts sampled per prompt.",
+    )
+    train_group.add_argument(
+        "--lr",
+        type=float,
+        default=_cfg_float(config, "lr", 2e-3),
+        help="Learning rate passed to train_step.",
+    )
+    train_group.add_argument(
+        "--max-workers",
+        type=int,
+        default=_cfg_int(config, "max_workers", 4),
+        help="Maximum concurrent API workers for rollout calls.",
+    )
+    train_group.add_argument(
+        "--rollout-retries",
+        type=int,
+        default=_cfg_int(config, "rollout_retries", 2),
+        help="Retry count for rollout batches after transient failures.",
+    )
+    train_group.add_argument(
         "--rollout-retry-backoff-s",
         type=float,
         default=_cfg_float(config, "rollout_retry_backoff_s", 1.0),
+        help="Initial exponential backoff in seconds for rollout retries.",
     )
-
-    parser.add_argument("--temperature", type=float, default=_cfg_float(config, "temperature", 1.0))
-    parser.add_argument("--top-p", type=float, default=_cfg_float(config, "top_p", 0.9))
-    parser.add_argument("--max-tokens", type=int, default=_cfg_int(config, "max_tokens", 256))
-    parser.add_argument(
+    train_group.add_argument(
+        "--temperature",
+        type=float,
+        default=_cfg_float(config, "temperature", 1.0),
+        help="Sampling temperature for training rollouts.",
+    )
+    train_group.add_argument(
+        "--top-p",
+        type=float,
+        default=_cfg_float(config, "top_p", 0.9),
+        help="Top-p sampling threshold for training rollouts.",
+    )
+    train_group.add_argument(
+        "--max-tokens",
+        type=int,
+        default=_cfg_int(config, "max_tokens", 256),
+        help="Default max token cap for query responses.",
+    )
+    train_group.add_argument(
         "--image-jpeg-quality",
         type=int,
         default=_cfg_int(config, "image_jpeg_quality", 92),
-        help="JPEG quality used when embedding images as data URLs for rollouts/train_step payloads.",
+        help="JPEG quality used when embedding images as data URLs.",
     )
-    parser.add_argument(
-        "--eval-temperature",
-        type=_parse_optional_float_arg,
-        default=_cfg_optional_float(config, "eval_temperature"),
-        help="Eval temperature override. Use inherit/none/null to reuse rollout temperature.",
+    reasoning_group = train_group.add_mutually_exclusive_group()
+    reasoning_group.add_argument(
+        "--reasoning",
+        dest="reasoning",
+        action="store_true",
+        help="Enable reasoning mode for training rollouts.",
     )
-    parser.add_argument(
-        "--eval-top-p",
-        type=_parse_optional_float_arg,
-        default=_cfg_optional_float(config, "eval_top_p"),
-        help="Eval top-p override. Use inherit/none/null to reuse rollout top-p.",
+    reasoning_group.add_argument(
+        "--no-reasoning",
+        dest="reasoning",
+        action="store_false",
+        help="Disable reasoning mode for training rollouts.",
     )
-    parser.add_argument(
+    parser.set_defaults(reasoning=_cfg_bool(config, "reasoning", DEFAULT_REASONING))
+
+    reward_group = parser.add_argument_group("Task Sampling and Reward")
+    reward_group.add_argument(
         "--task-sampling-weights-json",
         default="",
         help="JSON object override for task sampling weights: {\"task_type\": weight}.",
     )
-    parser.add_argument(
+    reward_group.add_argument(
         "--max-tokens-by-task-json",
         default="",
-        help="JSON object override for per-task max token caps: {\"task_type\": int}.",
+        help="JSON object override for per-task token caps: {\"task_type\": int}.",
     )
-    parser.add_argument(
+    reward_group.add_argument(
         "--list-piece-reward-mode",
         choices=list(LIST_PIECE_REWARD_MODES),
         default=_cfg_str(config, "list_piece_reward_mode", DEFAULT_LIST_PIECE_REWARD_MODE),
         help="Reward mode for list_* piece tasks.",
     )
-    parser.add_argument(
+    reward_group.add_argument(
         "--list-piece-reward-weights-json",
         default="",
         help=(
@@ -874,8 +1037,7 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
             "{\"typed_f1\":0.6,\"square_f1\":0.2,\"piece_recall\":0.2}."
         ),
     )
-
-    off_policy_group = parser.add_mutually_exclusive_group()
+    off_policy_group = reward_group.add_mutually_exclusive_group()
     off_policy_group.add_argument(
         "--off-policy",
         dest="off_policy",
@@ -889,70 +1051,78 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
         help="Disable off-policy replay mixing in train_step updates.",
     )
     parser.set_defaults(off_policy=_cfg_bool(config, "off_policy", False))
-    parser.add_argument(
+    reward_group.add_argument(
         "--off-policy-mix-ratio",
         type=float,
         default=_cfg_float(config, "off_policy_mix_ratio", 0.5),
-        help="Fraction of train groups sourced from replay when off-policy is active.",
+        help="Fraction of selected train groups sourced from replay.",
     )
-    parser.add_argument(
+    reward_group.add_argument(
         "--off-policy-buffer-size",
         type=int,
         default=_cfg_int(config, "off_policy_buffer_size", 4096),
-        help="Max number of train groups stored in off-policy replay buffer.",
+        help="Maximum number of train groups retained in replay.",
     )
-    parser.add_argument(
+    reward_group.add_argument(
         "--off-policy-warmup-steps",
         type=int,
         default=_cfg_int(config, "off_policy_warmup_steps", 10),
-        help="Minimum number of train steps before off-policy replay can be used.",
+        help="Minimum number of train steps before replay can be used.",
     )
-    parser.add_argument(
+    reward_group.add_argument(
         "--off-policy-min-buffer-groups",
         type=int,
         default=_cfg_int(config, "off_policy_min_buffer_groups", 64),
-        help="Minimum replay groups required before off-policy replay is used.",
+        help="Minimum replay groups required before replay mixing is allowed.",
     )
 
-    reasoning_group = parser.add_mutually_exclusive_group()
-    reasoning_group.add_argument(
-        "--reasoning",
-        dest="reasoning",
-        action="store_true",
-        help="Enable reasoning mode in query requests.",
+    eval_group = parser.add_argument_group("Evaluation and Checkpoints")
+    eval_group.add_argument(
+        "--eval-temperature",
+        type=_parse_optional_float_arg,
+        default=_cfg_optional_float(config, "eval_temperature"),
+        help="Eval temperature override. Use inherit/none/null to reuse training temperature.",
     )
-    reasoning_group.add_argument(
-        "--no-reasoning",
-        dest="reasoning",
-        action="store_false",
-        help="Disable reasoning mode in query requests.",
+    eval_group.add_argument(
+        "--eval-top-p",
+        type=_parse_optional_float_arg,
+        default=_cfg_optional_float(config, "eval_top_p"),
+        help="Eval top-p override. Use inherit/none/null to reuse training top-p.",
     )
-    parser.set_defaults(reasoning=_cfg_bool(config, "reasoning", DEFAULT_REASONING))
-    eval_reasoning_group = parser.add_mutually_exclusive_group()
+    eval_reasoning_group = eval_group.add_mutually_exclusive_group()
     eval_reasoning_group.add_argument(
         "--eval-reasoning",
         dest="eval_reasoning",
         action="store_true",
-        help="Force reasoning=true for eval requests.",
+        help="Force reasoning=true during evaluation.",
     )
     eval_reasoning_group.add_argument(
         "--no-eval-reasoning",
         dest="eval_reasoning",
         action="store_false",
-        help="Force reasoning=false for eval requests.",
+        help="Force reasoning=false during evaluation.",
     )
     eval_reasoning_group.add_argument(
         "--eval-reasoning-inherit",
         dest="eval_reasoning",
         action="store_const",
         const=None,
-        help="Inherit eval reasoning from rollout --reasoning.",
+        help="Reuse the training reasoning setting for evaluation.",
     )
     parser.set_defaults(eval_reasoning=_cfg_optional_bool(config, "eval_reasoning"))
-
-    parser.add_argument("--eval-every", type=int, default=_cfg_int(config, "eval_every", 20))
-    parser.add_argument("--save-every", type=int, default=_cfg_int(config, "save_every", 20))
-    save_on_eval_group = parser.add_mutually_exclusive_group()
+    eval_group.add_argument(
+        "--eval-every",
+        type=int,
+        default=_cfg_int(config, "eval_every", 20),
+        help="Run validation every N train steps. Set 0 to disable periodic eval.",
+    )
+    eval_group.add_argument(
+        "--save-every",
+        type=int,
+        default=_cfg_int(config, "save_every", 20),
+        help="Save a checkpoint every N train steps. Set 0 to disable.",
+    )
+    save_on_eval_group = eval_group.add_mutually_exclusive_group()
     save_on_eval_group.add_argument(
         "--save-on-eval",
         dest="save_on_eval",
@@ -963,17 +1133,22 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
         "--no-save-on-eval",
         dest="save_on_eval",
         action="store_false",
-        help="Disable automatic checkpoint save at periodic evaluations.",
+        help="Disable automatic checkpoint saves during periodic eval.",
     )
     parser.set_defaults(save_on_eval=_cfg_bool(config, "save_on_eval", True))
-    parser.add_argument("--eval-batch-size", type=int, default=_cfg_int(config, "eval_batch_size", 32))
-    parser.add_argument(
+    eval_group.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=_cfg_int(config, "eval_batch_size", 32),
+        help="Batch size used for evaluation rollout calls.",
+    )
+    eval_group.add_argument(
         "--eval-max-samples",
         type=int,
         default=_cfg_int(config, "eval_max_samples", 1000),
-        help="Max samples per eval split. <=0 means full split.",
+        help="Max samples per eval split. Use <=0 to score the full split.",
     )
-    save_eval_predictions_group = parser.add_mutually_exclusive_group()
+    save_eval_predictions_group = eval_group.add_mutually_exclusive_group()
     save_eval_predictions_group.add_argument(
         "--save-eval-predictions",
         dest="save_eval_predictions",
@@ -987,120 +1162,130 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
         help="Disable eval prediction artifact writing.",
     )
     parser.set_defaults(save_eval_predictions=_cfg_bool(config, "save_eval_predictions", False))
-    parser.add_argument(
+    eval_group.add_argument(
         "--eval-predictions-output-dir",
         default=_cfg_str(config, "eval_predictions_output_dir", ""),
-        help="Directory where eval prediction JSONL artifacts are written when enabled.",
+        help="Directory where eval prediction JSONL artifacts are written.",
     )
-    parser.add_argument(
+    eval_group.add_argument(
         "--eval-fixed-subset-size",
         type=int,
         default=_cfg_int(config, "eval_fixed_subset_size", 0),
-        help="Fixed deterministic eval subset size per split. <=0 disables fixed subsets.",
+        help="Deterministic eval subset size per split. Use 0 to disable.",
     )
-    parser.add_argument(
+    eval_group.add_argument(
         "--eval-fixed-subset-seed",
         type=int,
         default=_cfg_int(config, "eval_fixed_subset_seed", 1337),
-        help="Seed used for deterministic eval fixed subset index generation.",
+        help="Seed used when constructing deterministic eval subsets.",
     )
-    parser.add_argument(
+    eval_group.add_argument(
         "--checkpoint-avg-splits",
         nargs="+",
         default=_cfg_list_str(config, "checkpoint_avg_splits", ["val", "test"]),
-        help="Splits used for periodic checkpoint average ranking.",
+        help="Splits used to rank periodic checkpoints.",
     )
-    parser.add_argument(
+    eval_group.add_argument(
         "--checkpoint-avg-metric",
         choices=list(CHECKPOINT_AVG_METRIC_CHOICES),
         default=_cfg_str(config, "checkpoint_avg_metric", "eval_reward_mean"),
+        help="Metric averaged across checkpoint ranking splits.",
     )
-    parser.add_argument(
+    eval_group.add_argument(
         "--checkpoint-ranking-output",
         default=_cfg_str(config, "checkpoint_ranking_output", ""),
-        help="Path to write periodic checkpoint ranking JSON.",
+        help="Optional JSON output path for checkpoint ranking metadata.",
     )
-
-    parser.add_argument(
+    eval_group.add_argument(
         "--best-metric",
         choices=list(CHECKPOINT_AVG_METRIC_CHOICES),
         default=_cfg_str(config, "best_metric", "eval_reward_mean"),
+        help="Validation metric used to track the best checkpoint during training.",
     )
-    early_stop_group = parser.add_mutually_exclusive_group()
+    early_stop_group = eval_group.add_mutually_exclusive_group()
     early_stop_group.add_argument(
         "--early-stop",
         dest="early_stop",
         action="store_true",
-        help="Enable periodic eval-based early termination rules.",
+        help="Enable eval-based early stopping.",
     )
     early_stop_group.add_argument(
         "--no-early-stop",
         dest="early_stop",
         action="store_false",
-        help="Disable eval-based early termination rules.",
+        help="Disable eval-based early stopping.",
     )
     parser.set_defaults(early_stop=_cfg_bool(config, "early_stop", False))
-    parser.add_argument(
+    eval_group.add_argument(
         "--early-stop-mode",
         choices=list(EARLY_STOP_MODES),
         default=_cfg_str(config, "early_stop_mode", "balanced"),
-        help="Threshold profile for early-stop collapse/plateau checks.",
+        help="Threshold profile for early-stop collapse and plateau checks.",
     )
-    skip_final_eval_group = parser.add_mutually_exclusive_group()
+    skip_final_eval_group = eval_group.add_mutually_exclusive_group()
     skip_final_eval_group.add_argument(
         "--skip-final-eval",
         dest="skip_final_eval",
         action="store_true",
-        help="Skip final post-training split evals (useful for sweep screening).",
+        help="Skip the final post-training eval pass.",
     )
     skip_final_eval_group.add_argument(
         "--no-skip-final-eval",
         dest="skip_final_eval",
         action="store_false",
-        help="Run final post-training split evals.",
+        help="Run the final post-training eval pass.",
     )
     parser.set_defaults(skip_final_eval=_cfg_bool(config, "skip_final_eval", False))
-    auto_bench_group = parser.add_mutually_exclusive_group()
+    auto_bench_group = eval_group.add_mutually_exclusive_group()
     auto_bench_group.add_argument(
         "--auto-benchmark-best-checkpoint",
         dest="auto_benchmark_best_checkpoint",
         action="store_true",
-        help="After training, benchmark the best checkpoint automatically.",
+        help="Run the benchmark script against the best checkpoint after training.",
     )
     auto_bench_group.add_argument(
         "--no-auto-benchmark-best-checkpoint",
         dest="auto_benchmark_best_checkpoint",
         action="store_false",
-        help="Disable automatic post-training benchmark execution.",
+        help="Disable post-training benchmark execution.",
     )
     parser.set_defaults(
         auto_benchmark_best_checkpoint=_cfg_bool(config, "auto_benchmark_best_checkpoint", False)
     )
-    parser.add_argument(
+    eval_group.add_argument(
         "--auto-benchmark-config",
         default=_cfg_str(config, "auto_benchmark_config", str(DEFAULT_BENCHMARK_CONFIG_PATH)),
         help="Benchmark config file used for automatic post-training benchmark.",
     )
-    parser.add_argument(
+    eval_group.add_argument(
         "--auto-benchmark-output-json",
         default=_cfg_str(config, "auto_benchmark_output_json", ""),
-        help="Optional metrics path override for automatic post-training benchmark.",
+        help="Optional metrics JSON path override for the automatic benchmark.",
     )
-    parser.add_argument(
+    eval_group.add_argument(
         "--auto-benchmark-predictions-jsonl",
         default=_cfg_str(config, "auto_benchmark_predictions_jsonl", ""),
-        help="Optional predictions path override for automatic post-training benchmark.",
+        help="Optional predictions JSONL path override for the automatic benchmark.",
     )
 
-    parser.add_argument("--wandb-project", default=_cfg_str(config, "wandb_project", "moondream-chess-query-rl"))
-    parser.add_argument("--wandb-run-name", default=_cfg_str(config, "wandb_run_name", ""))
-    parser.add_argument(
+    logging_group = parser.add_argument_group("Logging")
+    logging_group.add_argument(
+        "--wandb-project",
+        default=_cfg_str(config, "wandb_project", "moondream-chess-query-rl"),
+        help="Weights & Biases project name.",
+    )
+    logging_group.add_argument(
+        "--wandb-run-name",
+        default=_cfg_str(config, "wandb_run_name", ""),
+        help="Optional Weights & Biases run name override.",
+    )
+    logging_group.add_argument(
         "--wandb-log-profile",
         choices=list(WANDB_LOG_PROFILES),
         default=_cfg_str(config, "wandb_log_profile", "legacy"),
-        help="legacy keeps all prefixed eval streams; lean keeps only core streams.",
+        help="legacy keeps prefixed per-split streams; lean keeps only core streams.",
     )
-    parser.add_argument(
+    logging_group.add_argument(
         "--no-progress",
         action="store_true",
         default=_cfg_bool(config, "no_progress", False),
@@ -1156,43 +1341,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 
 def _resolve_env_file(env_file: str) -> str:
-    path = Path(env_file).expanduser()
-    if path.is_absolute():
-        return str(path)
-
-    from_cwd = (Path.cwd() / path).resolve()
-    if from_cwd.exists():
-        return str(from_cwd)
-
-    from_repo = (REPO_ROOT / path).resolve()
-    if from_repo.exists():
-        return str(from_repo)
-
-    from_script = (_repo_relative(path.as_posix())).resolve()
-    if from_script.exists():
-        return str(from_script)
-
-    return str(from_cwd)
+    return str(_resolve_from_search_roots(env_file))
 
 
 def _resolve_dataset_dir(dataset_dir: str) -> Path:
-    path = Path(str(dataset_dir or "").strip()).expanduser()
-    if path.is_absolute():
-        return path.resolve()
-
-    from_cwd = (Path.cwd() / path).resolve()
-    if from_cwd.exists():
-        return from_cwd
-
-    from_repo = (REPO_ROOT / path).resolve()
-    if from_repo.exists():
-        return from_repo
-
-    from_script = (_repo_relative(path.as_posix())).resolve()
-    if from_script.exists():
-        return from_script
-
-    return from_cwd
+    return _resolve_from_search_roots(str(dataset_dir or "").strip())
 
 
 def _resolve_output_path(raw_path: str, *, fallback_name: str) -> Path:
@@ -2648,6 +2801,171 @@ def _evaluate_split(
     return metrics
 
 
+def _run_eval(
+    *,
+    finetune: Any,
+    examples: list[QAExample],
+    split_name: str,
+    seed: int,
+    runtime: EvalRuntimeConfig,
+    fixed_indices: Optional[list[int]] = None,
+    step_for_log: int = -1,
+    stage_label: str = "eval",
+) -> dict[str, float]:
+    return _evaluate_split(
+        finetune=finetune,
+        examples=examples,
+        split_name=split_name,
+        seed=seed,
+        batch_size=runtime.batch_size,
+        max_workers=runtime.max_workers,
+        max_samples=runtime.max_samples,
+        rollout_retries=runtime.rollout_retries,
+        rollout_retry_backoff_s=runtime.rollout_retry_backoff_s,
+        temperature=runtime.temperature,
+        top_p=runtime.top_p,
+        max_tokens=runtime.max_tokens,
+        max_tokens_by_task=runtime.max_tokens_by_task,
+        reasoning=runtime.reasoning,
+        image_jpeg_quality=runtime.image_jpeg_quality,
+        show_progress=runtime.show_progress,
+        list_piece_reward_mode=runtime.list_piece_reward_mode,
+        list_piece_reward_weights=runtime.list_piece_reward_weights,
+        fixed_indices=fixed_indices,
+        save_predictions=runtime.save_predictions,
+        predictions_output_dir=runtime.predictions_output_dir,
+        step_for_log=step_for_log,
+        stage_label=stage_label,
+    )
+
+
+def _log_prefixed_eval_metrics(
+    *,
+    metrics: dict[str, float],
+    step_for_log: int,
+    prefix: str,
+    wandb_log_profile: str,
+) -> None:
+    if not _should_log_prefixed_eval_streams(wandb_log_profile=wandb_log_profile):
+        return
+    payload = _select_eval_wandb_metrics(metrics)
+    wandb.log({f"{prefix}{key}": value for key, value in payload.items()}, step=step_for_log)
+
+
+def _print_eval_snapshot(
+    *,
+    label: str,
+    split_name: str,
+    step_for_log: int,
+    metrics: dict[str, float],
+) -> None:
+    print(
+        f"{label} step={step_for_log} split={split_name} "
+        f"reward={float(metrics.get('eval_reward_mean', 0.0)):.4f} "
+        f"obj_parse={float(metrics.get('eval_json_object_rate', 0.0)):.4f} "
+        f"parse={float(metrics.get('eval_json_parse_rate', 0.0)):.4f} "
+        f"exact={float(metrics.get('eval_exact_accuracy', 0.0)):.4f}"
+    )
+
+
+def _build_wandb_config(
+    *,
+    args: argparse.Namespace,
+    dataset_dir: Optional[Path],
+    final_eval_splits: list[str],
+    checkpoint_avg_splits: list[str],
+    train_examples: list[QAExample],
+    val_examples: list[QAExample],
+    finetune: Any,
+    eval_temperature: float,
+    eval_top_p: float,
+    eval_reasoning: bool,
+    eval_fixed_subset_size: int,
+    eval_fixed_subset_seed: int,
+    eval_predictions_output_dir: Optional[Path],
+) -> dict[str, Any]:
+    return {
+        "config": args.config,
+        "env_file": args.env_file,
+        "api_key_env_var": args.api_key_env_var,
+        "base_url": args.base_url,
+        "dataset_source": args.dataset_source,
+        "dataset_variant_tag": args.dataset_variant_tag,
+        "dataset_dir": str(dataset_dir) if dataset_dir is not None else "",
+        "hf_dataset_repo_id": args.hf_dataset_repo_id,
+        "hf_dataset_revision": args.hf_dataset_revision,
+        "hf_cache_dir": args.hf_cache_dir,
+        "train_split": args.train_split,
+        "val_split": args.val_split,
+        "final_eval_splits": final_eval_splits,
+        "checkpoint_avg_splits": checkpoint_avg_splits,
+        "checkpoint_avg_metric": args.checkpoint_avg_metric,
+        "train_rows": len(train_examples),
+        "val_rows": len(val_examples),
+        "finetune_id": finetune.finetune_id,
+        "finetune_name": finetune.name,
+        "rank": args.rank,
+        "seed": args.seed,
+        "num_steps": args.num_steps,
+        "resume_step": args.resume_step,
+        "batch_size": args.batch_size,
+        "group_size": args.group_size,
+        "lr": args.lr,
+        "max_workers": args.max_workers,
+        "rollout_retries": args.rollout_retries,
+        "rollout_retry_backoff_s": args.rollout_retry_backoff_s,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "eval_temperature": eval_temperature,
+        "eval_top_p": eval_top_p,
+        "eval_reasoning": eval_reasoning,
+        "eval_temperature_override": args.eval_temperature,
+        "eval_top_p_override": args.eval_top_p,
+        "eval_reasoning_override": args.eval_reasoning,
+        "max_tokens": args.max_tokens,
+        "image_jpeg_quality": args.image_jpeg_quality,
+        "off_policy": args.off_policy,
+        "off_policy_mix_ratio": args.off_policy_mix_ratio,
+        "off_policy_buffer_size": args.off_policy_buffer_size,
+        "off_policy_warmup_steps": args.off_policy_warmup_steps,
+        "off_policy_min_buffer_groups": args.off_policy_min_buffer_groups,
+        "list_piece_reward_mode": args.list_piece_reward_mode,
+        "list_piece_reward_weights": dict(args.list_piece_reward_weights),
+        "max_tokens_by_task": args.max_tokens_by_task,
+        "reasoning": args.reasoning,
+        "task_sampling_weights": {
+            task: float(args.task_sampling_weights.get(task, 1.0))
+            for task in sorted(args.task_sampling_weights.keys())
+        },
+        "eval_every": args.eval_every,
+        "save_every": args.save_every,
+        "save_on_eval": args.save_on_eval,
+        "save_eval_predictions": bool(args.save_eval_predictions),
+        "eval_predictions_output_dir": (
+            str(eval_predictions_output_dir) if eval_predictions_output_dir is not None else ""
+        ),
+        "eval_batch_size": args.eval_batch_size,
+        "eval_max_samples": args.eval_max_samples,
+        "eval_fixed_subset_size": eval_fixed_subset_size,
+        "eval_fixed_subset_seed": eval_fixed_subset_seed,
+        "early_stop": args.early_stop,
+        "early_stop_mode": args.early_stop_mode,
+        "skip_final_eval": args.skip_final_eval,
+        "best_metric": args.best_metric,
+        "checkpoint_ranking_output": args.checkpoint_ranking_output,
+        "auto_benchmark_best_checkpoint": bool(args.auto_benchmark_best_checkpoint),
+        "auto_benchmark_config": str(args.auto_benchmark_config),
+        "auto_benchmark_output_json": str(args.auto_benchmark_output_json or ""),
+        "auto_benchmark_predictions_jsonl": str(args.auto_benchmark_predictions_jsonl or ""),
+        "wandb_log_profile": str(args.wandb_log_profile),
+    }
+
+
+def _update_run_summary(run: Any, payload: dict[str, Any]) -> None:
+    for key, value in payload.items():
+        run.summary[key] = value
+
+
 def _metric_prefix_for_split(split_name: str) -> str:
     sanitized = "".join(ch if ch.isalnum() else "_" for ch in split_name.strip())
     return f"final_{sanitized}_"
@@ -3351,85 +3669,43 @@ def main(argv: Optional[list[str]] = None) -> None:
         if bool(args.save_eval_predictions)
         else None
     )
+    eval_runtime = EvalRuntimeConfig(
+        batch_size=int(args.eval_batch_size),
+        max_workers=int(args.max_workers),
+        max_samples=args.eval_max_samples,
+        rollout_retries=int(args.rollout_retries),
+        rollout_retry_backoff_s=float(args.rollout_retry_backoff_s),
+        temperature=float(eval_temperature),
+        top_p=float(eval_top_p),
+        max_tokens=int(args.max_tokens),
+        max_tokens_by_task=dict(args.max_tokens_by_task),
+        reasoning=bool(eval_reasoning),
+        image_jpeg_quality=int(args.image_jpeg_quality),
+        show_progress=bool(show_progress),
+        list_piece_reward_mode=str(args.list_piece_reward_mode),
+        list_piece_reward_weights=dict(args.list_piece_reward_weights),
+        save_predictions=bool(args.save_eval_predictions),
+        predictions_output_dir=eval_predictions_output_dir,
+    )
 
     run = wandb.init(
         project=args.wandb_project,
         name=args.wandb_run_name or None,
-        config={
-            "config": args.config,
-            "env_file": args.env_file,
-            "api_key_env_var": args.api_key_env_var,
-            "base_url": args.base_url,
-            "dataset_source": args.dataset_source,
-            "dataset_variant_tag": args.dataset_variant_tag,
-            "dataset_dir": str(dataset_dir) if dataset_dir is not None else "",
-            "hf_dataset_repo_id": args.hf_dataset_repo_id,
-            "hf_dataset_revision": args.hf_dataset_revision,
-            "hf_cache_dir": args.hf_cache_dir,
-            "train_split": args.train_split,
-            "val_split": args.val_split,
-            "final_eval_splits": final_eval_splits,
-            "checkpoint_avg_splits": checkpoint_avg_splits,
-            "checkpoint_avg_metric": args.checkpoint_avg_metric,
-            "train_rows": len(train_examples),
-            "val_rows": len(val_examples),
-            "finetune_id": finetune.finetune_id,
-            "finetune_name": finetune.name,
-            "rank": args.rank,
-            "seed": args.seed,
-            "num_steps": args.num_steps,
-            "resume_step": args.resume_step,
-            "batch_size": args.batch_size,
-            "group_size": args.group_size,
-            "lr": args.lr,
-            "max_workers": args.max_workers,
-            "rollout_retries": args.rollout_retries,
-            "rollout_retry_backoff_s": args.rollout_retry_backoff_s,
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "eval_temperature": eval_temperature,
-            "eval_top_p": eval_top_p,
-            "eval_reasoning": eval_reasoning,
-            "eval_temperature_override": args.eval_temperature,
-            "eval_top_p_override": args.eval_top_p,
-            "eval_reasoning_override": args.eval_reasoning,
-            "max_tokens": args.max_tokens,
-            "image_jpeg_quality": args.image_jpeg_quality,
-            "off_policy": args.off_policy,
-            "off_policy_mix_ratio": args.off_policy_mix_ratio,
-            "off_policy_buffer_size": args.off_policy_buffer_size,
-            "off_policy_warmup_steps": args.off_policy_warmup_steps,
-            "off_policy_min_buffer_groups": args.off_policy_min_buffer_groups,
-            "list_piece_reward_mode": args.list_piece_reward_mode,
-            "list_piece_reward_weights": dict(args.list_piece_reward_weights),
-            "max_tokens_by_task": args.max_tokens_by_task,
-            "reasoning": args.reasoning,
-            "task_sampling_weights": {
-                task: float(args.task_sampling_weights.get(task, 1.0))
-                for task in sorted(args.task_sampling_weights.keys())
-            },
-            "eval_every": args.eval_every,
-            "save_every": args.save_every,
-            "save_on_eval": args.save_on_eval,
-            "save_eval_predictions": bool(args.save_eval_predictions),
-            "eval_predictions_output_dir": (
-                str(eval_predictions_output_dir) if eval_predictions_output_dir is not None else ""
-            ),
-            "eval_batch_size": args.eval_batch_size,
-            "eval_max_samples": args.eval_max_samples,
-            "eval_fixed_subset_size": eval_fixed_subset_size,
-            "eval_fixed_subset_seed": eval_fixed_subset_seed,
-            "early_stop": args.early_stop,
-            "early_stop_mode": args.early_stop_mode,
-            "skip_final_eval": args.skip_final_eval,
-            "best_metric": args.best_metric,
-            "checkpoint_ranking_output": args.checkpoint_ranking_output,
-            "auto_benchmark_best_checkpoint": bool(args.auto_benchmark_best_checkpoint),
-            "auto_benchmark_config": str(args.auto_benchmark_config),
-            "auto_benchmark_output_json": str(args.auto_benchmark_output_json or ""),
-            "auto_benchmark_predictions_jsonl": str(args.auto_benchmark_predictions_jsonl or ""),
-            "wandb_log_profile": str(args.wandb_log_profile),
-        },
+        config=_build_wandb_config(
+            args=args,
+            dataset_dir=dataset_dir,
+            final_eval_splits=final_eval_splits,
+            checkpoint_avg_splits=checkpoint_avg_splits,
+            train_examples=train_examples,
+            val_examples=val_examples,
+            finetune=finetune,
+            eval_temperature=eval_temperature,
+            eval_top_p=eval_top_p,
+            eval_reasoning=eval_reasoning,
+            eval_fixed_subset_size=eval_fixed_subset_size,
+            eval_fixed_subset_seed=eval_fixed_subset_seed,
+            eval_predictions_output_dir=eval_predictions_output_dir,
+        ),
     )
     run.summary["finetune_id"] = finetune.finetune_id
 
@@ -3455,41 +3731,28 @@ def main(argv: Optional[list[str]] = None) -> None:
     ) -> dict[str, dict[str, float]]:
         by_split: dict[str, dict[str, float]] = {}
         for split_idx, split_name in enumerate(checkpoint_avg_splits):
-            split_metrics = _evaluate_split(
+            split_metrics = _run_eval(
                 finetune=finetune,
                 examples=checkpoint_avg_examples[split_name],
                 split_name=split_name,
                 seed=seed_base + split_idx,
-                batch_size=args.eval_batch_size,
-                max_workers=args.max_workers,
-                max_samples=args.eval_max_samples,
-                rollout_retries=args.rollout_retries,
-                rollout_retry_backoff_s=args.rollout_retry_backoff_s,
-                temperature=eval_temperature,
-                top_p=eval_top_p,
-                max_tokens=args.max_tokens,
-                max_tokens_by_task=args.max_tokens_by_task,
-                reasoning=eval_reasoning,
-                image_jpeg_quality=args.image_jpeg_quality,
-                list_piece_reward_mode=args.list_piece_reward_mode,
-                list_piece_reward_weights=args.list_piece_reward_weights,
-                show_progress=show_progress,
+                runtime=eval_runtime,
                 fixed_indices=fixed_eval_indices_by_split.get(split_name),
-                save_predictions=bool(args.save_eval_predictions),
-                predictions_output_dir=eval_predictions_output_dir,
                 step_for_log=step_for_log,
                 stage_label=stage_label,
             )
             by_split[split_name] = split_metrics
-            if _should_log_prefixed_eval_streams(wandb_log_profile=args.wandb_log_profile):
-                prefix = f"checkpoint_{_sanitize_split_name(split_name)}_"
-                split_wandb_metrics = _select_eval_wandb_metrics(split_metrics)
-                wandb.log({f"{prefix}{k}": v for k, v in split_wandb_metrics.items()}, step=step_for_log)
-            print(
-                f"{stage_label} eval step={step_for_log} split={split_name} "
-                f"reward={split_metrics['eval_reward_mean']:.4f} "
-                f"obj_parse={split_metrics['eval_json_object_rate']:.4f} "
-                f"parse={split_metrics['eval_json_parse_rate']:.4f}"
+            _log_prefixed_eval_metrics(
+                metrics=split_metrics,
+                step_for_log=step_for_log,
+                prefix=f"checkpoint_{_sanitize_split_name(split_name)}_",
+                wandb_log_profile=args.wandb_log_profile,
+            )
+            _print_eval_snapshot(
+                label=f"{stage_label} eval",
+                split_name=split_name,
+                step_for_log=step_for_log,
+                metrics=split_metrics,
             )
 
         avg_checkpoint_metric = float(
@@ -3534,44 +3797,32 @@ def main(argv: Optional[list[str]] = None) -> None:
         )
         baseline_metrics = baseline_by_split.get(args.val_split)
         if baseline_metrics is None:
-            baseline_metrics = _evaluate_split(
+            baseline_metrics = _run_eval(
                 finetune=finetune,
                 examples=val_examples,
                 split_name=args.val_split,
                 seed=args.seed + 151,
-                batch_size=args.eval_batch_size,
-                max_workers=args.max_workers,
-                max_samples=args.eval_max_samples,
-                rollout_retries=args.rollout_retries,
-                rollout_retry_backoff_s=args.rollout_retry_backoff_s,
-                temperature=eval_temperature,
-                top_p=eval_top_p,
-                max_tokens=args.max_tokens,
-                max_tokens_by_task=args.max_tokens_by_task,
-                reasoning=eval_reasoning,
-                image_jpeg_quality=args.image_jpeg_quality,
-                list_piece_reward_mode=args.list_piece_reward_mode,
-                list_piece_reward_weights=args.list_piece_reward_weights,
-                show_progress=show_progress,
+                runtime=eval_runtime,
                 fixed_indices=fixed_eval_indices_by_split.get(args.val_split),
-                save_predictions=bool(args.save_eval_predictions),
-                predictions_output_dir=eval_predictions_output_dir,
                 step_for_log=args.resume_step,
                 stage_label="baseline_val",
             )
-        baseline_wandb_metrics = _select_eval_wandb_metrics(baseline_metrics)
-        if _should_log_prefixed_eval_streams(wandb_log_profile=args.wandb_log_profile):
-            wandb.log({f"baseline_{k}": v for k, v in baseline_wandb_metrics.items()}, step=args.resume_step)
+        _log_prefixed_eval_metrics(
+            metrics=baseline_metrics,
+            step_for_log=args.resume_step,
+            prefix="baseline_",
+            wandb_log_profile=args.wandb_log_profile,
+        )
 
         baseline_metric = float(baseline_metrics.get(args.best_metric, 0.0))
         best_metric_value = baseline_metric
         best_step = args.resume_step
         best_eval_reward_seen = float(baseline_metrics.get("eval_reward_mean", 0.0))
-        print(
-            f"baseline eval step={args.resume_step} reward={baseline_metrics['eval_reward_mean']:.4f} "
-            f"obj_parse={baseline_metrics['eval_json_object_rate']:.4f} "
-            f"parse={baseline_metrics['eval_json_parse_rate']:.4f} "
-            f"exact={baseline_metrics['eval_exact_accuracy']:.4f}"
+        _print_eval_snapshot(
+            label="baseline eval",
+            split_name=args.val_split,
+            step_for_log=args.resume_step,
+            metrics=baseline_metrics,
         )
         if args.save_on_eval:
             baseline_saved = _try_save_checkpoint(
@@ -3742,38 +3993,23 @@ def main(argv: Optional[list[str]] = None) -> None:
             )
             eval_metrics = eval_by_split.get(args.val_split)
             if eval_metrics is None:
-                eval_metrics = _evaluate_split(
+                eval_metrics = _run_eval(
                     finetune=finetune,
                     examples=val_examples,
                     split_name=args.val_split,
                     seed=args.seed + 1000 + global_step,
-                    batch_size=args.eval_batch_size,
-                    max_workers=args.max_workers,
-                    max_samples=args.eval_max_samples,
-                    rollout_retries=args.rollout_retries,
-                    rollout_retry_backoff_s=args.rollout_retry_backoff_s,
-                    temperature=eval_temperature,
-                    top_p=eval_top_p,
-                    max_tokens=args.max_tokens,
-                    max_tokens_by_task=args.max_tokens_by_task,
-                    reasoning=eval_reasoning,
-                    image_jpeg_quality=args.image_jpeg_quality,
-                    list_piece_reward_mode=args.list_piece_reward_mode,
-                    list_piece_reward_weights=args.list_piece_reward_weights,
-                    show_progress=show_progress,
+                    runtime=eval_runtime,
                     fixed_indices=fixed_eval_indices_by_split.get(args.val_split),
-                    save_predictions=bool(args.save_eval_predictions),
-                    predictions_output_dir=eval_predictions_output_dir,
                     step_for_log=global_step,
                     stage_label="checkpoint_val",
                 )
             wandb.log(_select_eval_wandb_metrics(eval_metrics), step=global_step)
             metric_value = float(eval_metrics.get(args.best_metric, 0.0))
-            print(
-                f"eval step {global_step} reward={eval_metrics['eval_reward_mean']:.4f} "
-                f"obj_parse={eval_metrics['eval_json_object_rate']:.4f} "
-                f"parse={eval_metrics['eval_json_parse_rate']:.4f} "
-                f"exact={eval_metrics['eval_exact_accuracy']:.4f}"
+            _print_eval_snapshot(
+                label="eval",
+                split_name=args.val_split,
+                step_for_log=global_step,
+                metrics=eval_metrics,
             )
 
             if best_metric_value is None or metric_value > best_metric_value:
@@ -3869,41 +4105,27 @@ def main(argv: Optional[list[str]] = None) -> None:
         print("skip_final_eval=true; skipping final split eval pass.")
     else:
         for idx, (split_name, split_examples) in enumerate(final_eval_examples.items()):
-            eval_metrics = _evaluate_split(
+            eval_metrics = _run_eval(
                 finetune=finetune,
                 examples=split_examples,
                 split_name=split_name,
                 seed=args.seed + 5000 + idx,
-                batch_size=args.eval_batch_size,
-                max_workers=args.max_workers,
-                max_samples=args.eval_max_samples,
-                rollout_retries=args.rollout_retries,
-                rollout_retry_backoff_s=args.rollout_retry_backoff_s,
-                temperature=eval_temperature,
-                top_p=eval_top_p,
-                max_tokens=args.max_tokens,
-                max_tokens_by_task=args.max_tokens_by_task,
-                reasoning=eval_reasoning,
-                image_jpeg_quality=args.image_jpeg_quality,
-                list_piece_reward_mode=args.list_piece_reward_mode,
-                list_piece_reward_weights=args.list_piece_reward_weights,
-                show_progress=show_progress,
+                runtime=eval_runtime,
                 fixed_indices=fixed_eval_indices_by_split.get(split_name),
-                save_predictions=bool(args.save_eval_predictions),
-                predictions_output_dir=eval_predictions_output_dir,
                 step_for_log=final_eval_step,
                 stage_label="final",
             )
-            prefix = _metric_prefix_for_split(split_name)
-            final_eval_wandb_metrics = _select_eval_wandb_metrics(eval_metrics)
-            if _should_log_prefixed_eval_streams(wandb_log_profile=args.wandb_log_profile):
-                wandb.log({f"{prefix}{k}": v for k, v in final_eval_wandb_metrics.items()}, step=final_eval_step)
-
-            print(
-                f"final eval split={split_name} reward={eval_metrics['eval_reward_mean']:.4f} "
-                f"obj_parse={eval_metrics['eval_json_object_rate']:.4f} "
-                f"parse={eval_metrics['eval_json_parse_rate']:.4f} "
-                f"exact={eval_metrics['eval_exact_accuracy']:.4f}"
+            _log_prefixed_eval_metrics(
+                metrics=eval_metrics,
+                step_for_log=final_eval_step,
+                prefix=_metric_prefix_for_split(split_name),
+                wandb_log_profile=args.wandb_log_profile,
+            )
+            _print_eval_snapshot(
+                label="final eval",
+                split_name=split_name,
+                step_for_log=final_eval_step,
+                metrics=eval_metrics,
             )
 
     ranking_payload = _build_checkpoint_ranking_payload(
@@ -3981,48 +4203,53 @@ def main(argv: Optional[list[str]] = None) -> None:
     else:
         print("auto benchmark disabled (auto_benchmark_best_checkpoint=false).")
 
-    run.summary["best_metric_name"] = args.best_metric
-    run.summary["best_metric_value"] = float(best_metric_value or 0.0)
-    run.summary["best_metric_step"] = int(best_step if best_step is not None else -1)
-    run.summary["wandb_log_profile"] = str(args.wandb_log_profile)
-    run.summary["dataset_variant_tag"] = str(args.dataset_variant_tag)
-    run.summary["list_piece_reward_mode"] = str(args.list_piece_reward_mode)
-    run.summary["list_piece_reward_weights"] = json.dumps(
-        args.list_piece_reward_weights,
-        sort_keys=True,
-    )
-    run.summary["finetune_id"] = finetune.finetune_id
-    run.summary["train_rows"] = len(train_examples)
-    run.summary["val_rows"] = len(val_examples)
-    run.summary["checkpoint_avg_metric_name"] = args.checkpoint_avg_metric
-    run.summary["best_avg_checkpoint_metric"] = float(best_avg_checkpoint_metric)
-    run.summary["best_avg_checkpoint_metric_step"] = int(best_avg_checkpoint_metric_step)
-    run.summary["best_avg_checkpoint_metric_eval_step"] = int(best_avg_checkpoint_metric_eval_step)
-    run.summary["best_avg_eval_reward"] = float(best_avg_eval_reward)
-    run.summary["best_avg_eval_reward_step"] = int(best_avg_eval_reward_step)
-    run.summary["best_avg_eval_reward_eval_step"] = int(best_avg_eval_reward_eval_step)
-    run.summary["best_avg_eval_reward_splits"] = ",".join(checkpoint_avg_splits)
-    run.summary["checkpoint_ranking_output"] = str(ranking_output_path)
-    run.summary["stopped_early"] = bool(training_status.get("stopped_early"))
-    run.summary["early_stop_reason"] = str(training_status.get("stop_reason", ""))
-    run.summary["completed_steps"] = int(training_status.get("completed_steps", completed_steps))
-    run.summary["target_steps"] = int(training_status.get("target_steps", args.num_steps))
-    run.summary["collapse_detected"] = bool(training_status.get("collapse_detected"))
-    run.summary["save_eval_predictions"] = bool(args.save_eval_predictions)
-    run.summary["eval_predictions_output_dir"] = (
-        str(eval_predictions_output_dir) if eval_predictions_output_dir is not None else ""
-    )
-    run.summary["auto_benchmark_enabled"] = bool(args.auto_benchmark_best_checkpoint)
-    run.summary["auto_benchmark_ran"] = bool(auto_benchmark_ran)
-    run.summary["auto_benchmark_success"] = bool(auto_benchmark_success)
-    run.summary["auto_benchmark_checkpoint_step"] = int(
-        auto_benchmark_checkpoint_step if auto_benchmark_checkpoint_step is not None else -1
-    )
-    run.summary["auto_benchmark_output_json"] = (
-        str(auto_benchmark_metrics_path) if auto_benchmark_metrics_path is not None else ""
-    )
-    run.summary["auto_benchmark_predictions_jsonl"] = (
-        str(auto_benchmark_predictions_path) if auto_benchmark_predictions_path is not None else ""
+    _update_run_summary(
+        run,
+        {
+            "best_metric_name": args.best_metric,
+            "best_metric_value": float(best_metric_value or 0.0),
+            "best_metric_step": int(best_step if best_step is not None else -1),
+            "wandb_log_profile": str(args.wandb_log_profile),
+            "dataset_variant_tag": str(args.dataset_variant_tag),
+            "list_piece_reward_mode": str(args.list_piece_reward_mode),
+            "list_piece_reward_weights": json.dumps(
+                args.list_piece_reward_weights,
+                sort_keys=True,
+            ),
+            "finetune_id": finetune.finetune_id,
+            "train_rows": len(train_examples),
+            "val_rows": len(val_examples),
+            "checkpoint_avg_metric_name": args.checkpoint_avg_metric,
+            "best_avg_checkpoint_metric": float(best_avg_checkpoint_metric),
+            "best_avg_checkpoint_metric_step": int(best_avg_checkpoint_metric_step),
+            "best_avg_checkpoint_metric_eval_step": int(best_avg_checkpoint_metric_eval_step),
+            "best_avg_eval_reward": float(best_avg_eval_reward),
+            "best_avg_eval_reward_step": int(best_avg_eval_reward_step),
+            "best_avg_eval_reward_eval_step": int(best_avg_eval_reward_eval_step),
+            "best_avg_eval_reward_splits": ",".join(checkpoint_avg_splits),
+            "checkpoint_ranking_output": str(ranking_output_path),
+            "stopped_early": bool(training_status.get("stopped_early")),
+            "early_stop_reason": str(training_status.get("stop_reason", "")),
+            "completed_steps": int(training_status.get("completed_steps", completed_steps)),
+            "target_steps": int(training_status.get("target_steps", args.num_steps)),
+            "collapse_detected": bool(training_status.get("collapse_detected")),
+            "save_eval_predictions": bool(args.save_eval_predictions),
+            "eval_predictions_output_dir": (
+                str(eval_predictions_output_dir) if eval_predictions_output_dir is not None else ""
+            ),
+            "auto_benchmark_enabled": bool(args.auto_benchmark_best_checkpoint),
+            "auto_benchmark_ran": bool(auto_benchmark_ran),
+            "auto_benchmark_success": bool(auto_benchmark_success),
+            "auto_benchmark_checkpoint_step": int(
+                auto_benchmark_checkpoint_step if auto_benchmark_checkpoint_step is not None else -1
+            ),
+            "auto_benchmark_output_json": (
+                str(auto_benchmark_metrics_path) if auto_benchmark_metrics_path is not None else ""
+            ),
+            "auto_benchmark_predictions_jsonl": (
+                str(auto_benchmark_predictions_path) if auto_benchmark_predictions_path is not None else ""
+            ),
+        },
     )
     if auto_benchmark_metrics is not None:
         for key in (

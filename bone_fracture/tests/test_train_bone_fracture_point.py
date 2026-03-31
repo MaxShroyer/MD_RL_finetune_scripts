@@ -79,7 +79,7 @@ class BoneFracturePointConfigTests(unittest.TestCase):
         self.assertEqual(args.skill, "point")
         self.assertEqual(args.point_prompt_style, "class_name")
         self.assertEqual(args.reward_metric, "f1")
-        self.assertEqual(args.api_key_env_var, "MOONDREAM_API_KEY_1")
+        self.assertEqual(args.api_key_env_var, "CICID_GPUB_MOONDREAM_API_KEY_1")
         self.assertEqual(args.wandb_project, DEFAULT_POINT_WANDB_PROJECT)
 
     def test_cicd_configs_parse_with_expected_overrides(self) -> None:
@@ -99,7 +99,7 @@ class BoneFracturePointConfigTests(unittest.TestCase):
                 0.0,
                 0.0,
                 1,
-                "MOONDREAM_API_KEY_1",
+                "CICID_GPUB_MOONDREAM_API_KEY_1",
                 "bone-fracture-point-control",
             ),
             "cicd_train_bone_fracture_point_recall_primary.json": (
@@ -116,7 +116,7 @@ class BoneFracturePointConfigTests(unittest.TestCase):
                 0.0,
                 0.0,
                 1,
-                "MOONDREAM_API_KEY_2",
+                "CICID_GPUB_MOONDREAM_API_KEY_2",
                 "bone-fracture-point-recall-primary",
             ),
             "cicd_train_bone_fracture_point_recall_offpolicy.json": (
@@ -133,7 +133,7 @@ class BoneFracturePointConfigTests(unittest.TestCase):
                 0.0,
                 0.0,
                 1,
-                "MOONDREAM_API_KEY_3",
+                "CICID_GPUB_MOONDREAM_API_KEY_3",
                 "bone-fracture-point-recall-offpolicy",
             ),
             "cicd_train_bone_fracture_point_control_short_klguard.json": (
@@ -150,7 +150,7 @@ class BoneFracturePointConfigTests(unittest.TestCase):
                 0.0,
                 0.0,
                 1,
-                "MOONDREAM_API_KEY_1",
+                "CICID_GPUB_MOONDREAM_API_KEY_1",
                 "bone-fracture-point-control-short-klguard",
             ),
             "cicd_train_bone_fracture_point_recall_primary_short_klguard.json": (
@@ -167,7 +167,7 @@ class BoneFracturePointConfigTests(unittest.TestCase):
                 0.0,
                 0.0,
                 1,
-                "MOONDREAM_API_KEY_2",
+                "CICID_GPUB_MOONDREAM_API_KEY_2",
                 "bone-fracture-point-angle-only-break-point-recall-primary-short-klguard",
             ),
             "cicd_train_bone_fracture_point_recall_offpolicy_lite_klguard.json": (
@@ -184,7 +184,7 @@ class BoneFracturePointConfigTests(unittest.TestCase):
                 0.0,
                 0.0,
                 1,
-                "MOONDREAM_API_KEY_3",
+                "CICID_GPUB_MOONDREAM_API_KEY_3",
                 "bone-fracture-point-recall-offpolicy-lite-klguard",
             ),
         }
@@ -246,7 +246,7 @@ class BoneFracturePointConfigTests(unittest.TestCase):
                 True,
                 0.0005,
                 60,
-                "MOONDREAM_API_KEY_1",
+                "CICID_GPUB_MOONDREAM_API_KEY_1",
                 "bone-fracture-point-angle-only-recall-primary-anchor",
             ),
             "cicd_train_bone_fracture_point_angle_only_recall_offpolicy_anchor.json": (
@@ -256,7 +256,7 @@ class BoneFracturePointConfigTests(unittest.TestCase):
                 True,
                 0.0005,
                 60,
-                "MOONDREAM_API_KEY_2",
+                "CICID_GPUB_MOONDREAM_API_KEY_2",
                 "bone-fracture-point-angle-only-recall-offpolicy-anchor",
             ),
             "cicd_train_bone_fracture_point_angle_only_recall_offpolicy_lite.json": (
@@ -266,7 +266,7 @@ class BoneFracturePointConfigTests(unittest.TestCase):
                 False,
                 0.00025,
                 60,
-                "MOONDREAM_API_KEY_3",
+                "CICID_GPUB_MOONDREAM_API_KEY_3",
                 "bone-fracture-point-angle-only-recall-offpolicy-lite",
             ),
             "cicd_train_bone_fracture_point_full_recall_offpolicy_lite.json": (
@@ -276,7 +276,7 @@ class BoneFracturePointConfigTests(unittest.TestCase):
                 False,
                 0.00025,
                 60,
-                "MOONDREAM_API_KEY_4",
+                "CICID_GPUB_MOONDREAM_API_KEY_4",
                 "bone-fracture-point-full-recall-offpolicy-lite",
             ),
         }

@@ -16,7 +16,7 @@ DEFAULT_TEST_IMAGE_DATA_URL = (
 
 
 def _default_env_file(repo_root: Path) -> str | None:
-    for candidate in ("MDBallHolder/.env", "MDpi_and_d/.env", ".env"):
+    for candidate in ("MDBallHolder/.env.staging", "MDpi_and_d/.env.staging", ".env.staging"):
         if (repo_root / candidate).exists():
             return candidate
     return None
@@ -65,7 +65,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--base-url",
-        default=os.environ.get("MOONDREAM_BASE_URL", "https://api.moondream.ai/v1"),
+        default=os.environ.get("MOONDREAM_BASE_URL", "https://api-staging.moondream.ai/v1"),
         help="Moondream API base URL.",
     )
     parser.add_argument(
@@ -101,10 +101,10 @@ def main() -> int:
 
     _load_dotenv(repo_root, args.env_file)
 
-    api_key = os.environ.get("MOONDREAM_API_KEY")
+    api_key = os.environ.get("CICID_GPUB_MOONDREAM_API_KEY_1")
     if not api_key:
         print(
-            "Missing MOONDREAM_API_KEY. Export it in your shell or put it in a dotenv file and pass --env-file.",
+            "Missing CICID_GPUB_MOONDREAM_API_KEY. Export it in your shell or put it in a dotenv file and pass --env-file.",
             file=sys.stderr,
         )
         return 2

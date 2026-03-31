@@ -1,0 +1,181 @@
+Run the builder once first, then train whichever track you want.
+
+If your keys are in `.env.staging`, pass that explicitly because the new configs default to `construction_site/.env`.
+
+```bash
+python construction_site/build_construction_site_hf_dataset.py \
+  --config construction_site/configs/build_construction_site_hf_dataset_default.json \
+  --env-file .env.staging
+```
+
+For the strongest first runs, I’d do detect and rule-VQA first:
+
+```bash
+python construction_site/train_construction_site_detect.py \
+  --config construction_site/configs/cicd/cicd_train_construction_site_detect_offpolicy.json \
+  --env-file .env.staging
+```
+
+```bash
+python construction_site/train_construction_site_query_rule_vqa.py \
+  --config construction_site/configs/cicd/cicd_train_construction_site_query_rule_vqa_offpolicy.json \
+  --env-file .env.staging
+```
+
+For caption query, start with the control config first:
+
+```bash
+python construction_site/train_construction_site_query_caption.py \
+  --config construction_site/configs/cicd/cicd_train_construction_site_query_caption_control.json \
+  --env-file .env.staging
+```
+
+After training, benchmark with the `finetune_id` you get back. For example:
+
+```bash
+python construction_site/benchmark_construction_site_detect.py \
+  --config construction_site/configs/benchmark_construction_site_detect_default.json \
+  --env-file .env.staging \
+  --finetune-id YOUR_FINETUNE_ID
+```
+
+```bash
+python construction_site/benchmark_construction_site_query_rule_vqa.py \
+  --config construction_site/configs/benchmark_construction_site_query_rule_vqa_default.json \
+  --env-file .env.staging \
+  --finetune-id YOUR_FINETUNE_ID
+```
+
+```bash
+python construction_site/benchmark_construction_site_query_caption.py \
+  --config construction_site/configs/benchmark_construction_site_query_caption_default.json \
+  --env-file .env.staging \
+  --finetune-id YOUR_FINETUNE_ID
+```
+
+Recommended full sweep order:
+
+1. Build the local derived datasets:
+
+```bash
+python construction_site/build_construction_site_hf_dataset.py \
+  --config construction_site/configs/build_construction_site_hf_dataset_default.json \
+  --env-file .env.staging
+```
+
+2. Train detect control first to establish a stable baseline:
+
+```bash
+python construction_site/train_construction_site_detect.py \
+  --config construction_site/configs/cicd/cicd_train_construction_site_detect_control.json \
+  --env-file .env.staging
+```
+
+3. Benchmark the detect control run and note the best checkpoint:
+
+```bash
+python construction_site/benchmark_construction_site_detect.py \
+  --config construction_site/configs/benchmark_construction_site_detect_default.json \
+  --env-file .env.staging \
+  --finetune-id <DETECT_CONTROL_FINETUNE_ID>
+```
+
+4. Train the stronger detect off-policy run:
+
+```bash
+python construction_site/train_construction_site_detect.py \
+  --config construction_site/configs/cicd/cicd_train_construction_site_detect_offpolicy.json \
+  --env-file .env.staging
+```
+
+5. Benchmark the detect off-policy run and keep the better of the two detect runs:
+
+```bash
+python construction_site/benchmark_construction_site_detect.py \
+  --config construction_site/configs/benchmark_construction_site_detect_default.json \
+  --env-file .env.staging \
+  --finetune-id <DETECT_OFFPOLICY_FINETUNE_ID>
+```
+
+6. Train rule-VQA control first:
+
+```bash
+python construction_site/train_construction_site_query_rule_vqa.py \
+  --config construction_site/configs/cicd/cicd_train_construction_site_query_rule_vqa_control.json \
+  --env-file .env.staging
+```
+
+7. Benchmark the rule-VQA control run:
+
+```bash
+python construction_site/benchmark_construction_site_query_rule_vqa.py \
+  --config construction_site/configs/benchmark_construction_site_query_rule_vqa_default.json \
+  --env-file .env.staging \
+  --finetune-id <RULE_VQA_CONTROL_FINETUNE_ID>
+```
+
+8. Train the stronger rule-VQA off-policy run:
+
+```bash
+python construction_site/train_construction_site_query_rule_vqa.py \
+  --config construction_site/configs/cicd/cicd_train_construction_site_query_rule_vqa_offpolicy.json \
+  --env-file .env.staging
+```
+
+9. Benchmark the rule-VQA off-policy run and keep the better of the two rule-VQA runs:
+
+```bash
+python construction_site/benchmark_construction_site_query_rule_vqa.py \
+  --config construction_site/configs/benchmark_construction_site_query_rule_vqa_default.json \
+  --env-file .env.staging \
+  --finetune-id <RULE_VQA_OFFPOLICY_FINETUNE_ID>
+```
+
+10. Train caption control first:
+
+```bash
+python construction_site/train_construction_site_query_caption.py \
+  --config construction_site/configs/cicd/cicd_train_construction_site_query_caption_control.json \
+  --env-file .env.staging
+```
+
+11. Benchmark the caption control run:
+
+```bash
+python construction_site/benchmark_construction_site_query_caption.py \
+  --config construction_site/configs/benchmark_construction_site_query_caption_default.json \
+  --env-file .env.staging \
+  --finetune-id <CAPTION_CONTROL_FINETUNE_ID>
+```
+
+12. If the caption control run is stable, train the caption off-policy variant:
+
+```bash
+python construction_site/train_construction_site_query_caption.py \
+  --config construction_site/configs/cicd/cicd_train_construction_site_query_caption_offpolicy.json \
+  --env-file .env.staging
+```
+
+13. Benchmark the caption off-policy run and keep whichever caption run is better:
+
+```bash
+python construction_site/benchmark_construction_site_query_caption.py \
+  --config construction_site/configs/benchmark_construction_site_query_caption_default.json \
+  --env-file .env.staging \
+  --finetune-id <CAPTION_OFFPOLICY_FINETUNE_ID>
+```
+
+Recommended priority if you want to stop early:
+
+1. detect off-policy
+2. rule-VQA off-policy
+3. caption control
+
+Keep a short run log as you go:
+
+- detect control finetune id + benchmark json path
+- detect off-policy finetune id + benchmark json path
+- rule-VQA control finetune id + benchmark json path
+- rule-VQA off-policy finetune id + benchmark json path
+- caption control finetune id + benchmark json path
+- caption off-policy finetune id + benchmark json path

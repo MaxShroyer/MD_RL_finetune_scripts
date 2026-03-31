@@ -25,13 +25,16 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 import numpy as np
 from datasets import Dataset, DatasetDict, get_dataset_split_names, load_dataset, load_from_disk
 from dotenv import load_dotenv
 from PIL import Image, ImageEnhance
 from scipy.optimize import linear_sum_assignment
+
+os.environ.setdefault("WANDB_START_METHOD", "thread")
+os.environ.setdefault("WANDB__SERVICE_WAIT", "300")
 
 try:
     import wandb  # type: ignore
@@ -72,6 +75,19 @@ from tuna_sdk import (
 )
 from tuna_sdk import PointAnnotation, PointOutput, PointRequest, PointSettings
 from tuna_sdk.errors import TunaAPIError, TunaNetworkError
+
+from aerial_airport.runtime_tiling import (
+    Box2D as RuntimeBox,
+    Point2D as RuntimePoint,
+    TileWindow,
+    build_tile_windows,
+    clip_box_to_window,
+    crop_image_to_tiles,
+    merge_boxes as merge_runtime_boxes,
+    merge_points as merge_runtime_points,
+    map_box_from_tile,
+    map_point_from_tile,
+)
 
 
 def _repo_relative(*parts: str) -> Path:
@@ -275,6 +291,8 @@ class UsageStats:
 
 
 VAL_SPLIT_CANDIDATES = ("validation", "val", "dev", "test", "post_val")
+TEST_SPLIT_CANDIDATES = ("test", "post_val")
+SELECTION_METRIC_CHOICES = ("f1", "f1_macro", "miou")
 
 
 def _extract_class_catalog(payload: Any) -> list[tuple[str, str]]:
@@ -1044,6 +1062,251 @@ def _micro_f1_from_counts(tp: int, fp: int, fn: int) -> float:
     return (2.0 * float(tp)) / float(denom)
 
 
+def _selection_metric_key(selection_metric: str, *, prefix: str = "eval") -> str:
+    metric = str(selection_metric or "").strip()
+    if metric not in SELECTION_METRIC_CHOICES:
+        raise ValueError(f"unknown selection metric: {selection_metric}")
+    return f"{prefix}_{metric}"
+
+
+def _selection_metric_value(metrics: Mapping[str, Any], selection_metric: str, *, prefix: str = "eval") -> float:
+    return float(metrics.get(_selection_metric_key(selection_metric, prefix=prefix), 0.0))
+
+
+def _prefix_eval_metrics(metrics: Mapping[str, Any], *, prefix: str) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in metrics.items():
+        if key.startswith("eval_"):
+            out[f"{prefix}{key[len('eval_'):]}"] = value
+        else:
+            out[f"{prefix}{key}"] = value
+    return out
+
+
+def _resolve_test_split(
+    available_splits: list[str],
+    *,
+    train_split: str,
+    val_split: str,
+    test_split: str,
+) -> str:
+    if not available_splits:
+        raise ValueError("Dataset exposes no splits.")
+
+    train_base_split = train_split.split("[", 1)[0]
+    val_base_split = val_split.split("[", 1)[0]
+    blocked = {train_base_split, val_base_split}
+
+    if test_split:
+        if test_split in available_splits:
+            resolved = test_split
+        elif "[" in test_split and "]" in test_split:
+            base_split = test_split.split("[", 1)[0]
+            if base_split not in available_splits:
+                raise ValueError(f"test split '{test_split}' not found. Available splits: {available_splits}")
+            resolved = test_split
+        else:
+            raise ValueError(f"test split '{test_split}' not found. Available splits: {available_splits}")
+        if resolved.split("[", 1)[0] in blocked:
+            raise ValueError("test split must differ from both train and validation splits")
+        return resolved
+
+    for candidate in TEST_SPLIT_CANDIDATES:
+        if candidate in available_splits and candidate not in blocked:
+            return candidate
+    raise ValueError(
+        f"Dataset must already contain a held-out test split. Available splits: {available_splits}"
+    )
+
+
+def _empty_rollout(*, skill: str) -> Rollout:
+    effective_skill = (skill or "detect").strip().lower()
+    if effective_skill == "point":
+        output: PointOutput | DetectOutput = PointOutput(points=[])
+    else:
+        output = DetectOutput(objects=[])
+    return Rollout(
+        skill=effective_skill,
+        finish_reason="stop",
+        output=output,
+        answer_tokens=[],
+        thinking_tokens=[],
+        coords=[],
+        sizes=[],
+    )
+
+
+def _request_from_task(
+    task: TaskSample,
+    *,
+    skill: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    max_objects: int,
+    reasoning: bool,
+) -> DetectRequest | PointRequest:
+    effective_skill = (skill or "detect").strip().lower()
+    if effective_skill == "point":
+        return _ReasoningPointRequest(
+            object_name=task.prompt,
+            image_url=_to_data_url(task.image, quality=92),
+            settings=PointSettings(
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+            ),
+            reasoning=bool(reasoning),
+        )
+    return _ReasoningDetectRequest(
+        object_name=task.prompt,
+        image_url=_to_data_url(task.image, quality=92),
+        settings=DetectSettings(
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            max_objects=max_objects,
+        ),
+        reasoning=bool(reasoning),
+    )
+
+
+def _tile_requests_for_task(
+    task: TaskSample,
+    *,
+    skill: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    max_objects: int,
+    reasoning: bool,
+    runtime_tiling: bool,
+    tile_grid_size: int,
+    tile_overlap: float,
+) -> tuple[list[TileWindow], list[DetectRequest | PointRequest]]:
+    if not runtime_tiling:
+        return [], [
+            _request_from_task(
+                task,
+                skill=skill,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                max_objects=max_objects,
+                reasoning=reasoning,
+            )
+        ]
+
+    tiled_images = crop_image_to_tiles(task.image, grid_size=tile_grid_size, overlap=tile_overlap)
+    windows: list[TileWindow] = []
+    requests: list[DetectRequest | PointRequest] = []
+    for window, image in tiled_images:
+        windows.append(window)
+        tiled_task = TaskSample(
+            image=image,
+            prompt=task.prompt,
+            gt_boxes=task.gt_boxes,
+            class_name=task.class_name,
+            is_positive=task.is_positive,
+            source=task.source,
+        )
+        requests.append(
+            _request_from_task(
+                tiled_task,
+                skill=skill,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                max_objects=max_objects,
+                reasoning=reasoning,
+            )
+        )
+    return windows, requests
+
+
+def _runtime_point(point: PointAnnotation) -> RuntimePoint:
+    return RuntimePoint(x=float(point.x), y=float(point.y))
+
+
+def _runtime_box(box: DetectAnnotation) -> RuntimeBox:
+    return RuntimeBox(
+        x_min=float(box.x_min),
+        y_min=float(box.y_min),
+        x_max=float(box.x_max),
+        y_max=float(box.y_max),
+    )
+
+
+def _detect_from_runtime_box(box: RuntimeBox) -> DetectAnnotation:
+    return DetectAnnotation(
+        x_min=float(box.x_min),
+        y_min=float(box.y_min),
+        x_max=float(box.x_max),
+        y_max=float(box.y_max),
+    )
+
+
+def _point_from_runtime_point(point: RuntimePoint) -> PointAnnotation:
+    return PointAnnotation(x=float(point.x), y=float(point.y))
+
+
+def _merge_rollouts_across_tiles(
+    *,
+    tile_results: list[Any],
+    tile_windows: list[TileWindow],
+    skill: str,
+    expected_rollouts: int,
+    point_merge_radius: float,
+    box_merge_iou: float,
+) -> list[Rollout]:
+    effective_skill = (skill or "detect").strip().lower()
+    merged_rollouts: list[Rollout] = []
+
+    for rollout_index in range(expected_rollouts):
+        template_rollout: Optional[Rollout] = None
+        merged_points: list[RuntimePoint] = []
+        merged_boxes: list[RuntimeBox] = []
+        for tile_idx, result in enumerate(tile_results):
+            if result is None or rollout_index >= len(getattr(result, "rollouts", [])):
+                continue
+            rollout = result.rollouts[rollout_index]
+            if template_rollout is None:
+                template_rollout = rollout
+            output = rollout.output
+            window = tile_windows[tile_idx]
+            if effective_skill == "point":
+                points = output.points if isinstance(output, PointOutput) else []
+                for point in points:
+                    merged_points.append(map_point_from_tile(_runtime_point(point), window))
+            else:
+                boxes = output.objects if isinstance(output, DetectOutput) else []
+                for box in boxes:
+                    mapped = map_box_from_tile(_runtime_box(box), window)
+                    if mapped is not None:
+                        merged_boxes.append(mapped)
+
+        if effective_skill == "point":
+            output = PointOutput(points=[_point_from_runtime_point(point) for point in merge_runtime_points(merged_points, radius=point_merge_radius)])
+        else:
+            output = DetectOutput(objects=[_detect_from_runtime_box(box) for box in merge_runtime_boxes(merged_boxes, iou_threshold=box_merge_iou)])
+
+        if template_rollout is None:
+            merged_rollouts.append(_empty_rollout(skill=effective_skill))
+        else:
+            merged_rollouts.append(
+                Rollout(
+                    skill=str(getattr(template_rollout, "skill", effective_skill)),
+                    finish_reason=str(getattr(template_rollout, "finish_reason", "stop")),
+                    output=output,
+                    answer_tokens=list(getattr(template_rollout, "answer_tokens", [])),
+                    thinking_tokens=list(getattr(template_rollout, "thinking_tokens", [])),
+                    coords=list(getattr(template_rollout, "coords", [])),
+                    sizes=list(getattr(template_rollout, "sizes", [])),
+                )
+            )
+    return merged_rollouts
+
+
 def _update_kl_guard(
     *,
     kl_value: float,
@@ -1210,6 +1473,11 @@ def _evaluate(
     skill: str,
     point_prompt_style: str,
     reasoning: bool,
+    runtime_tiling: bool,
+    tile_grid_size: int,
+    tile_overlap: float,
+    tile_point_merge_radius: float,
+    tile_box_merge_iou: float,
 ) -> dict[str, float]:
     tasks: list[TaskSample] = []
     total = 0
@@ -1241,41 +1509,31 @@ def _evaluate(
         chunk_size = max(1, min(max_workers, len(batch)))
         for offset in range(0, len(batch), chunk_size):
             chunk = batch[offset : offset + chunk_size]
-            if effective_skill == "point":
-                requests = [
-                    _ReasoningPointRequest(
-                        object_name=item.prompt,
-                        image_url=_to_data_url(item.image, quality=92),
-                        settings=PointSettings(
-                            temperature=temperature,
-                            top_p=top_p,
-                            max_tokens=max_tokens,
-                        ),
-                        reasoning=bool(reasoning),
-                    )
-                    for item in chunk
-                ]
-            else:
-                requests = [
-                    _ReasoningDetectRequest(
-                        object_name=item.prompt,
-                        image_url=_to_data_url(item.image, quality=92),
-                        settings=DetectSettings(
-                            temperature=temperature,
-                            top_p=top_p,
-                            max_tokens=max_tokens,
-                            max_objects=max_objects,
-                        ),
-                        reasoning=bool(reasoning),
-                    )
-                    for item in chunk
-                ]
+            flat_requests: list[DetectRequest | PointRequest] = []
+            tile_windows_per_task: list[list[TileWindow]] = []
+            request_counts: list[int] = []
+            for item in chunk:
+                tile_windows, requests = _tile_requests_for_task(
+                    item,
+                    skill=effective_skill,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    max_objects=max_objects,
+                    reasoning=reasoning,
+                    runtime_tiling=runtime_tiling,
+                    tile_grid_size=tile_grid_size,
+                    tile_overlap=tile_overlap,
+                )
+                tile_windows_per_task.append(tile_windows)
+                request_counts.append(len(requests))
+                flat_requests.extend(requests)
             try:
                 results = _rollouts_batch_with_retry(
                     finetune=finetune,
-                    requests=requests,
+                    requests=flat_requests,
                     num_rollouts=1,
-                    max_workers=min(max_workers, len(chunk)),
+                    max_workers=min(max_workers, len(flat_requests)),
                     retries=rollout_retries,
                     backoff_s=rollout_retry_backoff_s,
                     context="eval",
@@ -1295,14 +1553,34 @@ def _evaluate(
                     reasoning_failure_hint_emitted = True
                 continue
 
-            if len(results) != len(chunk):
+            if len(results) != len(flat_requests):
                 print(
-                    f"warning: eval returned {len(results)} results for {len(chunk)} requests; "
+                    f"warning: eval returned {len(results)} results for {len(flat_requests)} requests; "
                     "only aligned results are scored."
                 )
 
-            for item, result in zip(chunk, results):
-                if not result.rollouts:
+            result_index = 0
+            for item, tile_windows, request_count in zip(chunk, tile_windows_per_task, request_counts):
+                task_results = list(results[result_index : result_index + request_count])
+                result_index += request_count
+
+                if runtime_tiling:
+                    merged_rollouts = _merge_rollouts_across_tiles(
+                        tile_results=task_results,
+                        tile_windows=tile_windows,
+                        skill=effective_skill,
+                        expected_rollouts=1,
+                        point_merge_radius=tile_point_merge_radius,
+                        box_merge_iou=tile_box_merge_iou,
+                    )
+                    rollout0 = merged_rollouts[0] if merged_rollouts else _empty_rollout(skill=effective_skill)
+                else:
+                    if not task_results or not task_results[0].rollouts:
+                        rollout0 = _empty_rollout(skill=effective_skill)
+                    else:
+                        rollout0 = task_results[0].rollouts[0]
+
+                if not task_results or not rollout0:
                     if effective_skill == "point":
                         pred_points: list[PointAnnotation] = []
                         f1_value = _reward_f1_points(pred_points, item.gt_boxes)
@@ -1332,7 +1610,6 @@ def _evaluate(
                     total += 1
                     continue
 
-                rollout0 = result.rollouts[0]
                 if effective_skill == "point":
                     output = rollout0.output
                     pred_points = output.points if isinstance(output, PointOutput) else []
@@ -1549,6 +1826,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default="",
         help="Validation split name. If omitted, uses dataset validation/val/dev/test/post_val when present; otherwise auto-splits.",
     )
+    parser.add_argument(
+        "--test-split",
+        default="",
+        help="Held-out test split name. If omitted, uses test/post_val when available.",
+    )
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--class-names-file", default="")
     parser.add_argument(
@@ -1594,11 +1876,26 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Training reward metric for rollouts. Use 'f1' to focus optimization on detection F1.",
     )
     parser.add_argument(
+        "--selection-metric",
+        choices=SELECTION_METRIC_CHOICES,
+        default="",
+        help="Validation metric used to select the best checkpoint. Defaults to F1 for point and reward-aligned for detect.",
+    )
+    parser.add_argument(
         "--point-prompt-style",
         choices=["detect_phrase", "class_name"],
         default="detect_phrase",
         help="Prompt style for class-conditional point training/eval tasks.",
     )
+    parser.add_argument(
+        "--runtime-tiling",
+        action="store_true",
+        help="Run training and eval on runtime-generated tiles instead of the full image in one request.",
+    )
+    parser.add_argument("--tile-grid-size", type=int, default=3)
+    parser.add_argument("--tile-overlap", type=float, default=0.10)
+    parser.add_argument("--tile-point-merge-radius", type=float, default=0.015)
+    parser.add_argument("--tile-box-merge-iou", type=float, default=0.50)
 
     reasoning_group = parser.add_mutually_exclusive_group()
     reasoning_group.add_argument(
@@ -1728,6 +2025,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=50)
     parser.add_argument("--eval-max-samples", type=int, default=200)
     parser.add_argument("--eval-batch-size", type=int, default=20)
+    parser.add_argument(
+        "--run-final-test",
+        action="store_true",
+        help="Evaluate the best validation checkpoint on a held-out test split after training.",
+    )
 
     parser.add_argument("--save-every", type=int, default=20)
     parser.add_argument(
@@ -1781,6 +2083,8 @@ def run(args: argparse.Namespace) -> None:
     args = _resolve_runtime_env(args)
     if not args.api_key:
         raise ValueError("MOONDREAM_API_KEY is required")
+    if args.finetune_id and args.finetune_name:
+        raise ValueError("Provide either --finetune-id or --finetune-name, not both")
     if args.neg_prompts_per_empty < 0 or args.neg_prompts_per_nonempty < 0:
         raise ValueError("negative prompt counts must be >= 0")
     if not (0.0 <= args.pos_task_prob <= 1.0):
@@ -1820,15 +2124,42 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--kl-stop-threshold must be >= 0")
     if args.kl_stop_consecutive <= 0:
         raise ValueError("--kl-stop-consecutive must be > 0")
+    if args.tile_grid_size <= 0:
+        raise ValueError("--tile-grid-size must be > 0")
+    if not (0.0 <= args.tile_overlap < 1.0):
+        raise ValueError("--tile-overlap must be in [0, 1)")
+    if args.tile_point_merge_radius < 0.0:
+        raise ValueError("--tile-point-merge-radius must be >= 0")
+    if not (0.0 <= args.tile_box_merge_iou <= 1.0):
+        raise ValueError("--tile-box-merge-iou must be in [0, 1]")
+    if args.run_final_test and args.eval_every <= 0:
+        raise ValueError("--run-final-test requires --eval-every > 0 so a best validation checkpoint can be selected")
 
     eval_reasoning = bool(args.reasoning) if args.eval_reasoning is None else bool(args.eval_reasoning)
+    selection_metric = str(args.selection_metric or "").strip()
+    if not selection_metric:
+        if args.skill == "point":
+            selection_metric = "f1"
+        else:
+            selection_metric = "miou" if args.reward_metric == "miou" else "f1"
+    if selection_metric not in SELECTION_METRIC_CHOICES:
+        raise ValueError(f"--selection-metric must be one of {SELECTION_METRIC_CHOICES}")
+    if args.skill == "point" and selection_metric == "miou":
+        print("warning: --selection-metric=miou is not meaningful for point runs; using f1.")
+        selection_metric = "f1"
+    args.selection_metric = selection_metric
     off_policy_injection_allowed = bool(
-        args.off_policy and (not args.reasoning or args.allow_off_policy_with_reasoning)
+        args.off_policy and (not args.reasoning or args.allow_off_policy_with_reasoning) and not args.runtime_tiling
     )
     if args.off_policy and args.reasoning and not args.allow_off_policy_with_reasoning:
         print(
             "warning: off-policy injection is disabled while --reasoning is enabled. "
             "Set --allow-off-policy-with-reasoning to override."
+        )
+    if args.off_policy and args.runtime_tiling:
+        print(
+            "warning: off-policy injection is disabled while --runtime-tiling is enabled. "
+            "Merged rewards are still used for runtime-tiled training."
         )
 
     dataset_path = args.dataset_path.strip()
@@ -1853,9 +2184,13 @@ def run(args: argparse.Namespace) -> None:
 
     eval_rows_factory: Callable[[], Iterable[dict]] = lambda: iter(())
     has_eval_rows = False
+    test_rows_factory: Callable[[], Iterable[dict]] = lambda: iter(())
+    has_test_rows = False
     train_split = args.split
     requested_val_split = args.val_split.strip()
+    requested_test_split = args.test_split.strip()
     val_split: Optional[str] = requested_val_split or None
+    test_split: Optional[str] = requested_test_split or None
     auto_val_split = False
     eval_dataset: Optional[Dataset] = None
 
@@ -1871,6 +2206,21 @@ def run(args: argparse.Namespace) -> None:
                 val_split = requested_val_split
             else:
                 val_split = "val" if "val" in dataset_obj else ("validation" if "validation" in dataset_obj else None)
+            if args.run_final_test or requested_test_split:
+                if not val_split:
+                    raise ValueError("--run-final-test requires an explicit validation split when using a local Dataset")
+                test_split = _resolve_test_split(
+                    list(dataset_obj.keys()),
+                    train_split=train_split,
+                    val_split=val_split,
+                    test_split=requested_test_split,
+                )
+                has_test_rows = True
+
+                def _local_test_rows() -> Iterable[dict]:
+                    return _iter_local_rows_once(dataset_obj, test_split)
+
+                test_rows_factory = _local_test_rows
         else:
             train_split = args.split
             val_split = requested_val_split or None
@@ -1912,6 +2262,10 @@ def run(args: argparse.Namespace) -> None:
             requested_train_split=args.split,
             requested_val_split=requested_val_split,
         )
+        try:
+            available_hf_splits = list(get_dataset_split_names(dataset_name, token=args.hf_token))
+        except Exception:
+            available_hf_splits = []
         if resolved_val is None:
             full_ds = load_dataset(dataset_name, split=train_split, token=args.hf_token, streaming=False)
             split_ds = full_ds.train_test_split(test_size=args.val_fraction, seed=args.seed, shuffle=True)
@@ -1937,6 +2291,21 @@ def run(args: argparse.Namespace) -> None:
                 return _iter_hf_rows_once(dataset_name, val_split, args.hf_token)
 
             eval_rows_factory = _hf_eval_rows
+        if args.run_final_test or requested_test_split:
+            if not val_split:
+                raise ValueError("--run-final-test requires a validation split.")
+            test_split = _resolve_test_split(
+                available_hf_splits,
+                train_split=train_split,
+                val_split=val_split,
+                test_split=requested_test_split,
+            )
+            has_test_rows = True
+
+            def _hf_test_rows() -> Iterable[dict]:
+                return _iter_hf_rows_once(dataset_name, test_split, args.hf_token)
+
+            test_rows_factory = _hf_test_rows
 
     if not all_class_names:
         # Fallback: scan eval rows first, then train stream as needed.
@@ -2015,7 +2384,9 @@ def run(args: argparse.Namespace) -> None:
         f"num_steps={args.num_steps} resume_step={args.resume_step} "
         f"eval_every={args.eval_every} save_every={args.save_every} "
         f"off_policy={args.off_policy} off_policy_injection_allowed={off_policy_injection_allowed} "
-        f"reasoning_train={bool(args.reasoning)} reasoning_eval={eval_reasoning}"
+        f"reasoning_train={bool(args.reasoning)} reasoning_eval={eval_reasoning} "
+        f"runtime_tiling={bool(args.runtime_tiling)} selection_metric={args.selection_metric} "
+        f"run_final_test={bool(args.run_final_test)}"
     )
     effective_point_prompt_style = args.point_prompt_style if args.skill == "point" else "detect_phrase"
     if args.skill != "point" and args.point_prompt_style != "detect_phrase":
@@ -2037,6 +2408,7 @@ def run(args: argparse.Namespace) -> None:
             "dataset_name": dataset_name or None,
             "train_split": train_split,
             "val_split": val_split,
+            "test_split": test_split,
             "auto_val_split": auto_val_split,
             "auto_val_fraction": args.val_fraction if auto_val_split else None,
             "train_rows_total": total_train_rows,
@@ -2068,6 +2440,7 @@ def run(args: argparse.Namespace) -> None:
             "point_prompt_style": args.point_prompt_style,
             "effective_point_prompt_style": effective_point_prompt_style,
             "reward_metric": args.reward_metric,
+            "selection_metric": args.selection_metric,
             "seed": args.seed,
             "off_policy": args.off_policy,
             "allow_off_policy_with_reasoning": args.allow_off_policy_with_reasoning,
@@ -2090,6 +2463,12 @@ def run(args: argparse.Namespace) -> None:
             "numeric_class_name_count": len(numeric_class_names),
             "usage_report_every": args.usage_report_every,
             "usage_top_k": args.usage_top_k,
+            "runtime_tiling": bool(args.runtime_tiling),
+            "tile_grid_size": int(args.tile_grid_size),
+            "tile_overlap": float(args.tile_overlap),
+            "tile_point_merge_radius": float(args.tile_point_merge_radius),
+            "tile_box_merge_iou": float(args.tile_box_merge_iou),
+            "run_final_test": bool(args.run_final_test),
         },
     )
 
@@ -2193,6 +2572,11 @@ def run(args: argparse.Namespace) -> None:
                 skill=args.skill,
                 point_prompt_style=effective_point_prompt_style,
                 reasoning=eval_reasoning,
+                runtime_tiling=bool(args.runtime_tiling),
+                tile_grid_size=int(args.tile_grid_size),
+                tile_overlap=float(args.tile_overlap),
+                tile_point_merge_radius=float(args.tile_point_merge_radius),
+                tile_box_merge_iou=float(args.tile_box_merge_iou),
             )
             event_payload.update(eval_metrics)
             event_payload["eval_event_success"] = 1
@@ -2212,8 +2596,8 @@ def run(args: argparse.Namespace) -> None:
         print("running baseline eval before training...")
         baseline_metrics = _run_and_log_eval(trigger="baseline", step_for_log=baseline_step)
         if baseline_metrics is not None:
-            metric_key = "eval_miou" if args.skill == "detect" else "eval_f1"
-            baseline_eval_metric = float(baseline_metrics.get(metric_key, 0.0))
+            metric_key = _selection_metric_key(args.selection_metric)
+            baseline_eval_metric = _selection_metric_value(baseline_metrics, args.selection_metric)
             baseline_eval_tp = float(baseline_metrics.get("eval_tp", 0.0))
             run.summary[f"baseline_{metric_key}"] = baseline_eval_metric
             run.summary["baseline_eval_tp"] = baseline_eval_tp
@@ -2231,44 +2615,45 @@ def run(args: argparse.Namespace) -> None:
         step_start = time.monotonic()
 
         batch = [_next_task() for _ in range(args.batch_size)]
-
-        if args.skill == "point":
-            requests = [
-                _ReasoningPointRequest(
-                    object_name=item.prompt,
-                    image_url=_to_data_url(item.image, quality=92),
-                    settings=PointSettings(
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        max_tokens=args.max_tokens,
-                    ),
+        logical_requests: list[DetectRequest | PointRequest] = []
+        task_requests_per_item: list[list[DetectRequest | PointRequest]] = []
+        tile_windows_per_item: list[list[TileWindow]] = []
+        flat_requests: list[DetectRequest | PointRequest] = []
+        for item in batch:
+            logical_requests.append(
+                _request_from_task(
+                    item,
+                    skill=args.skill,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    max_tokens=args.max_tokens,
+                    max_objects=args.max_objects,
                     reasoning=bool(args.reasoning),
                 )
-                for item in batch
-            ]
-        else:
-            requests = [
-                _ReasoningDetectRequest(
-                    object_name=item.prompt,
-                    image_url=_to_data_url(item.image, quality=92),
-                    settings=DetectSettings(
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        max_tokens=args.max_tokens,
-                        max_objects=args.max_objects,
-                    ),
-                    reasoning=bool(args.reasoning),
-                )
-                for item in batch
-            ]
+            )
+            tile_windows, task_requests = _tile_requests_for_task(
+                item,
+                skill=args.skill,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                max_tokens=args.max_tokens,
+                max_objects=args.max_objects,
+                reasoning=bool(args.reasoning),
+                runtime_tiling=bool(args.runtime_tiling),
+                tile_grid_size=int(args.tile_grid_size),
+                tile_overlap=float(args.tile_overlap),
+            )
+            task_requests_per_item.append(task_requests)
+            tile_windows_per_item.append(tile_windows)
+            flat_requests.extend(task_requests)
 
         try:
             rollout_start = time.monotonic()
             results = _rollouts_batch_with_retry(
                 finetune=finetune,
-                requests=requests,
+                requests=flat_requests,
                 num_rollouts=args.group_size,
-                max_workers=min(args.max_workers, args.batch_size),
+                max_workers=min(args.max_workers, len(flat_requests)),
                 retries=args.rollout_retries,
                 backoff_s=args.rollout_retry_backoff_s,
                 context=f"train step {global_step}",
@@ -2282,6 +2667,11 @@ def run(args: argparse.Namespace) -> None:
                 ) from exc
             print(f"rollouts_batch failed at step {global_step}: {_format_tuna_error(exc)}. skipping step")
             continue
+        if len(results) != len(flat_requests):
+            print(
+                f"warning: train step {global_step} returned {len(results)} results for "
+                f"{len(flat_requests)} requests; only aligned results are used."
+            )
 
         groups: list[TrainStepGroup] = []
         all_rewards: list[float] = []
@@ -2297,8 +2687,65 @@ def run(args: argparse.Namespace) -> None:
         train_tp = 0
         train_fp = 0
         train_fn = 0
-        for idx, (item, result) in enumerate(zip(batch, results)):
-            rollouts = list(result.rollouts)
+        result_index = 0
+        for idx, item in enumerate(batch):
+            task_requests = task_requests_per_item[idx]
+            tile_windows = tile_windows_per_item[idx]
+            task_results = list(results[result_index : result_index + len(task_requests)])
+            result_index += len(task_requests)
+
+            if args.runtime_tiling:
+                merged_rollouts = _merge_rollouts_across_tiles(
+                    tile_results=task_results,
+                    tile_windows=tile_windows,
+                    skill=args.skill,
+                    expected_rollouts=args.group_size,
+                    point_merge_radius=float(args.tile_point_merge_radius),
+                    box_merge_iou=float(args.tile_box_merge_iou),
+                )
+                rewards = _rewards_for_rollouts(
+                    merged_rollouts,
+                    item.gt_boxes,
+                    skill=args.skill,
+                    reward_metric=args.reward_metric,
+                    fn_penalty_exponent=args.fn_penalty_exponent,
+                    fp_penalty_exponent=args.fp_penalty_exponent,
+                    neg_reward_weight=args.neg_reward_weight,
+                )
+                if args.skill == "point":
+                    for rollout in merged_rollouts:
+                        output = rollout.output
+                        pred_points = output.points if isinstance(output, PointOutput) else []
+                        tp, fp, fn = _count_tp_fp_fn_points(pred_points, item.gt_boxes)
+                        train_tp += tp
+                        train_fp += fp
+                        train_fn += fn
+                else:
+                    for rollout in merged_rollouts:
+                        output = rollout.output
+                        pred_boxes = output.objects if isinstance(output, DetectOutput) else []
+                        tp, fp, fn = _count_tp_fp_fn(pred_boxes, item.gt_boxes)
+                        train_tp += tp
+                        train_fp += fp
+                        train_fn += fn
+
+                for tile_request, tile_result in zip(task_requests, task_results):
+                    rollouts = list(tile_result.rollouts)
+                    if not rollouts:
+                        continue
+                    group_request = RolloutsRequest(
+                        finetune_id=finetune.finetune_id,
+                        num_rollouts=len(rollouts),
+                        request=tile_request,
+                        ground_truth=getattr(tile_result.request, "ground_truth", None),
+                        org_id=getattr(tile_result.request, "org_id", None),
+                    )
+                    groups.append(TrainStepGroup(request=group_request, rollouts=rollouts, rewards=list(rewards[: len(rollouts)])))
+                all_rewards.extend(rewards)
+                continue
+
+            result = task_results[0] if task_results else None
+            rollouts = list(result.rollouts) if result is not None else []
             rewards = _rewards_for_rollouts(
                 rollouts,
                 item.gt_boxes,
@@ -2384,17 +2831,20 @@ def run(args: argparse.Namespace) -> None:
                     train_fp += fp
                     train_fn += fn
 
-            group_request = result.request
-            if idx < len(requests):
-                group_request = RolloutsRequest(
-                    finetune_id=result.request.finetune_id,
-                    num_rollouts=result.request.num_rollouts,
-                    request=requests[idx],
-                    ground_truth=result.request.ground_truth,
-                    org_id=result.request.org_id,
-                )
+            request_obj = logical_requests[idx]
+            group_request = RolloutsRequest(
+                finetune_id=finetune.finetune_id,
+                num_rollouts=len(rollouts),
+                request=request_obj,
+                ground_truth=getattr(result.request, "ground_truth", None) if result is not None else None,
+                org_id=getattr(result.request, "org_id", None) if result is not None else None,
+            )
             groups.append(TrainStepGroup(request=group_request, rollouts=rollouts, rewards=rewards))
             all_rewards.extend(rewards)
+
+        if not groups:
+            print(f"train step {global_step}: no valid rollout groups after alignment; skipping step")
+            continue
 
         try:
             train_start = time.monotonic()
@@ -2499,7 +2949,7 @@ def run(args: argparse.Namespace) -> None:
             eval_metrics = _run_and_log_eval(trigger="periodic", step_for_log=global_step)
             if eval_metrics is None:
                 continue
-            metric_key = "eval_miou" if args.skill == "detect" else "eval_f1"
+            metric_key = _selection_metric_key(args.selection_metric)
             if baseline_eval_metric is not None:
                 delta_key = f"{metric_key}_delta_vs_baseline"
                 eval_metrics[delta_key] = float(eval_metrics.get(metric_key, 0.0)) - baseline_eval_metric
@@ -2537,7 +2987,7 @@ def run(args: argparse.Namespace) -> None:
                 f"updates={successful_updates}"
             )
 
-            metric = float(eval_metrics.get(metric_key, 0.0))
+            metric = _selection_metric_value(eval_metrics, args.selection_metric)
             if best_metric is None or metric > best_metric:
                 best_metric = metric
                 best_step = global_step
@@ -2547,14 +2997,14 @@ def run(args: argparse.Namespace) -> None:
             finetune.save_checkpoint()
 
     finetune.save_checkpoint()
-    metric_key = "eval_miou" if args.skill == "detect" else "eval_f1"
+    metric_key = _selection_metric_key(args.selection_metric)
     f1_target_value: Optional[float] = None
     f1_target_pass: Optional[bool] = None
     if best_step is not None:
         run.summary["best_step"] = best_step
         run.summary[f"best_{metric_key}"] = best_metric
         run.summary["best_metric_key"] = metric_key
-    if metric_key == "eval_f1" and baseline_eval_metric is not None and best_metric is not None:
+    if args.skill == "point" and baseline_eval_metric is not None and best_metric is not None:
         f1_target_value = float(baseline_eval_metric) + float(args.f1_improvement_target)
         f1_target_pass = bool(float(best_metric) >= f1_target_value)
         run.summary["f1_target_value"] = f1_target_value
@@ -2586,6 +3036,45 @@ def run(args: argparse.Namespace) -> None:
     run.summary["usage_class_tasks_consumed_top_json"] = json.dumps(final_usage["class_tasks_consumed_top"])
     run.summary["eval_events_logged"] = int(eval_events_logged)
     run.summary["finetune_id"] = finetune.finetune_id
+    if args.run_final_test and has_test_rows:
+        print("running final test eval after training...")
+        try:
+            test_metrics = _evaluate(
+                finetune=finetune,
+                eval_rows=test_rows_factory(),
+                all_class_names=all_class_names,
+                rng=random.Random(args.seed + 54321),
+                neg_prompts_per_empty=args.neg_prompts_per_empty,
+                neg_prompts_per_nonempty=args.neg_prompts_per_nonempty,
+                max_samples=args.eval_max_samples,
+                batch_size=args.eval_batch_size,
+                max_workers=args.max_workers,
+                rollout_retries=args.rollout_retries,
+                rollout_retry_backoff_s=args.rollout_retry_backoff_s,
+                temperature=args.eval_temperature,
+                top_p=args.eval_top_p,
+                max_tokens=args.max_tokens,
+                max_objects=args.max_objects,
+                skill=args.skill,
+                point_prompt_style=effective_point_prompt_style,
+                reasoning=eval_reasoning,
+                runtime_tiling=bool(args.runtime_tiling),
+                tile_grid_size=int(args.tile_grid_size),
+                tile_overlap=float(args.tile_overlap),
+                tile_point_merge_radius=float(args.tile_point_merge_radius),
+                tile_box_merge_iou=float(args.tile_box_merge_iou),
+            )
+            prefixed_test_metrics = _prefix_eval_metrics(test_metrics, prefix="test_")
+            wandb.log(prefixed_test_metrics, step=max(best_step or 0, args.resume_step))
+            for key, value in prefixed_test_metrics.items():
+                run.summary[key] = value
+            run.summary["test_evaluated"] = 1
+        except Exception as exc:
+            run.summary["test_evaluated"] = 0
+            run.summary["test_eval_error"] = f"{type(exc).__name__}: {exc}"
+            print(f"final test eval failed: {type(exc).__name__}: {exc}")
+    else:
+        run.summary["test_evaluated"] = 0
     run.finish()
     client.close()
 

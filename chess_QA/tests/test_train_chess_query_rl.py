@@ -786,10 +786,10 @@ class ConfigPrecedenceTests(unittest.TestCase):
     def test_cicd_piece_position_configs_parse_with_staging_settings(self) -> None:
         config_root = _repo_root() / "chess_QA" / "configs" / "cicd"
         expectations = {
-            "cicd_query_rl_chess_all_baseline_no_reasoning_rewardfix.json": (False, False, "MOONDREAM_API_KEY_1"),
-            "cicd_query_rl_chess_all_baseline_reasoning_rewardfix_group4.json": (False, True, "MOONDREAM_API_KEY_2"),
-            "cicd_query_rl_chess_all_offpolicy_no_reasoning_safe_mix.json": (True, False, "MOONDREAM_API_KEY_3"),
-            "cicd_query_rl_chess_all_offpolicy_reasoning_rank24_safe_mix.json": (True, True, "MOONDREAM_API_KEY_4"),
+            "cicd_query_rl_chess_all_baseline_no_reasoning_rewardfix.json": (False, False, "CICID_GPUB_MOONDREAM_API_KEY_1"),
+            "cicd_query_rl_chess_all_baseline_reasoning_rewardfix_group4.json": (False, True, "CICID_GPUB_MOONDREAM_API_KEY_2"),
+            "cicd_query_rl_chess_all_offpolicy_no_reasoning_safe_mix.json": (True, False, "CICID_GPUB_MOONDREAM_API_KEY_3"),
+            "cicd_query_rl_chess_all_offpolicy_reasoning_rank24_safe_mix.json": (True, True, "CICID_GPUB_MOONDREAM_API_KEY_4"),
         }
 
         for filename, (off_policy, reasoning, api_key_env_var) in expectations.items():
@@ -1134,7 +1134,7 @@ class TrainingSmokeTests(unittest.TestCase):
 
             env_path = Path(tmp) / ".env-staging"
             env_path.write_text(
-                "MOONDREAM_API_KEY_3=file_key_from_named_env_var\n",
+                "CICID_GPUB_MOONDREAM_API_KEY_3=file_key_from_named_env_var\n",
                 encoding="utf-8",
             )
 
@@ -1143,7 +1143,7 @@ class TrainingSmokeTests(unittest.TestCase):
                 json.dumps(
                     {
                         "env_file": str(env_path),
-                        "api_key_env_var": "MOONDREAM_API_KEY_3",
+                        "api_key_env_var": "CICID_GPUB_MOONDREAM_API_KEY_3",
                         "dataset_source": "local_jsonl",
                         "dataset_dir": str(root),
                         "dataset_variant_tag": "mixed_tasks_v1",

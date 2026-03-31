@@ -57,8 +57,8 @@ Key behavior:
 
 API key rotation:
 
-- `control` -> `MOONDREAM_API_KEY_1`
-- `recall_primary` -> `MOONDREAM_API_KEY_2`
-- `recall_offpolicy` -> `MOONDREAM_API_KEY_3`
+- `control` -> `CICID_GPUB_MOONDREAM_API_KEY_1`
+- `recall_primary` -> `CICID_GPUB_MOONDREAM_API_KEY_2`
+- `recall_offpolicy` -> `CICID_GPUB_MOONDREAM_API_KEY_3`
 
 Legacy detect assets are still present in this module, but the default workflow, docs, and notebook now target the point pipeline.

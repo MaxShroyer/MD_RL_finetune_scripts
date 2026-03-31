@@ -418,11 +418,15 @@ class DryRunBenchmarkTests(unittest.TestCase):
             self.assertEqual(metrics["evaluated_rows"], 3)
             self.assertIn("eval_reward_mean", metrics)
             self.assertIn("eval_json_parse_rate", metrics)
+            self.assertEqual(metrics["eval_best_move_valid_prediction_count"], 1.0)
+            self.assertEqual(metrics["eval_best_move_valid_prediction_rate"], 1.0)
             self.assertIn("by_task", metrics)
             self.assertIn("best_move", metrics["by_task"])
             self.assertTrue(predictions_path.exists())
             lines = predictions_path.read_text(encoding="utf-8").strip().splitlines()
             self.assertEqual(len(lines), 3)
+            first_record = json.loads(lines[0])
+            self.assertTrue(first_record["best_move_valid_prediction"])
 
     def test_benchmark_model_emits_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -502,6 +506,8 @@ class DryRunBenchmarkTests(unittest.TestCase):
             self.assertEqual(metrics["diagnostics"]["turn_player_confusion"]["X->O"], 1)
             self.assertIn("available_moves_count_delta_hist", metrics["diagnostics"])
             self.assertEqual(metrics["diagnostics"]["available_moves_count_delta_hist"]["-1"], 1)
+            self.assertEqual(metrics["eval_best_move_valid_prediction_count"], 1.0)
+            self.assertEqual(metrics["eval_best_move_valid_prediction_rate"], 1.0)
 
 
 class CompletionStatusTests(unittest.TestCase):

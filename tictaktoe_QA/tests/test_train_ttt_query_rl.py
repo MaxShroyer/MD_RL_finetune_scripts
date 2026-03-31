@@ -77,6 +77,52 @@ class RewardPolicyTests(unittest.TestCase):
         self.assertFalse(out.best_move_set_correct)
         self.assertFalse(out.best_move_canonical_correct)
 
+    def test_best_move_valid_prediction_true_for_legal_non_optimal_move(self) -> None:
+        example = self._best_move_example()
+        out = mod._score_payload_for_example(
+            example,
+            {"row": 3, "col": 3},
+            best_move_optimal_reward=0.7,
+        )
+        self.assertTrue(out.best_move_valid_prediction)
+        self.assertFalse(out.best_move_set_correct)
+
+    def test_best_move_valid_prediction_false_for_occupied_square(self) -> None:
+        example = self._best_move_example()
+        out = mod._score_payload_for_example(
+            example,
+            {"row": 2, "col": 1},
+            best_move_optimal_reward=0.7,
+        )
+        self.assertEqual(out.reward, 0.0)
+        self.assertFalse(out.best_move_valid_prediction)
+        self.assertFalse(out.best_move_set_correct)
+
+    def test_best_move_invalid_prediction_always_gets_zero_reward(self) -> None:
+        example = mod.QAExample(
+            row_id="r0_invalid_guard",
+            split="train",
+            task_type="best_move",
+            question="q",
+            image_path=Path("/tmp/unused.png"),
+            expected_answer={"row": 1, "col": 1},
+            best_move_canonical=4,
+            best_move_optimal_set=frozenset({4}),
+            best_move_scores=((1, 0, 4), (4, 1, 2)),
+            best_move_legal_moves=frozenset({1, 5, 9}),
+        )
+        out = mod._score_payload_for_example(
+            example,
+            {"row": 2, "col": 1},
+            best_move_optimal_reward=0.7,
+        )
+        self.assertEqual(out.reward, 0.0)
+        self.assertTrue(out.parse_success)
+        self.assertFalse(out.task_correct)
+        self.assertFalse(out.best_move_valid_prediction)
+        self.assertFalse(out.best_move_set_correct)
+        self.assertFalse(out.best_move_canonical_correct)
+
     def test_best_move_ranked_tied_best_moves_get_full_reward(self) -> None:
         example = mod.QAExample(
             row_id="r0_tied",
@@ -350,6 +396,34 @@ class PathResolutionTests(unittest.TestCase):
             assert example is not None
             self.assertEqual(example.task_type, "available_moves_count")
 
+    def test_build_example_parses_best_move_legal_moves(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_dir = Path(tmp)
+            image_path = dataset_dir / "img.png"
+            Image.new("RGB", (8, 8), color=(255, 255, 255)).save(image_path)
+
+            row = {
+                "row_id": "r_best",
+                "split": "train",
+                "task_type": "best_move",
+                "question": "q",
+                "final_answer_json": "{\"row\":1,\"col\":1}",
+                "best_move_canonical_json": "{\"row\":1,\"col\":1}",
+                "best_move_optimal_set_json": "[{\"row\":1,\"col\":1}]",
+                "legal_moves_json": "[{\"row\":1,\"col\":1},{\"row\":2,\"col\":2},{\"row\":3,\"col\":3}]",
+                "scores_by_move_json": "{\"1\":{\"value\":1,\"depth\":2},\"5\":{\"value\":0,\"depth\":4},\"9\":{\"value\":-1,\"depth\":6}}",
+                "image_path": str(image_path),
+            }
+            example = mod._build_example(
+                row,
+                split_name="train",
+                dataset_dir=dataset_dir,
+                line_number=1,
+            )
+            self.assertIsNotNone(example)
+            assert example is not None
+            self.assertEqual(example.best_move_legal_moves, frozenset({1, 5, 9}))
+
     def test_resolve_config_path_supports_repo_prefixed_path_from_nested_cwd(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
         nested_cwd = repo_root / "tictaktoe_QA"
@@ -435,6 +509,22 @@ class ConfigPrecedenceTests(unittest.TestCase):
             self.assertEqual(args.task_sampling_weights["winner"], 1.0)
             self.assertEqual(args.max_tokens_by_task["available_moves_list"], 512)
             self.assertEqual(args.max_tokens_by_task["best_move"], 196)
+
+    def test_api_key_env_var_config_parses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text(
+                json.dumps(
+                    {
+                        "dataset_dir": "synth_dataset/outputs/smoke_full_jsonl",
+                        "api_key_env_var": "CICID_GPUB_MOONDREAM_API_KEY_1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            args = mod.parse_args(["--config", str(cfg_path)])
+            self.assertEqual(args.api_key_env_var, "CICID_GPUB_MOONDREAM_API_KEY_1")
 
     def test_off_policy_config_and_cli_override_precedence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -522,6 +612,18 @@ class ConfigPrecedenceTests(unittest.TestCase):
             self.assertEqual(args.hf_dataset_revision, "main")
             self.assertEqual(args.checkpoint_avg_splits, ["val", "test"])
 
+    def test_train_subset_overrides_parsing(self) -> None:
+        args = mod.parse_args(
+            [
+                "--train-max-samples",
+                "24",
+                "--train-subset-seed",
+                "9",
+            ]
+        )
+        self.assertEqual(args.train_max_samples, 24)
+        self.assertEqual(args.train_subset_seed, 9)
+
     def test_eval_and_skip_final_eval_overrides_parsing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = Path(tmp) / "cfg.json"
@@ -580,6 +682,37 @@ class ConfigPrecedenceTests(unittest.TestCase):
         args = mod.parse_args(["--eval-temperature", "2.5"])
         with self.assertRaisesRegex(ValueError, "--eval-temperature must be in \\[0,2\\]"):
             mod._validate_args(args)
+
+    def test_resolve_api_key_prefers_explicit_then_named_env_then_default_env(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "CUSTOM_TTT_KEY": "named-key",
+                "MOONDREAM_API_KEY": "default-key",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                mod._resolve_api_key(
+                    explicit_api_key="explicit-key",
+                    api_key_env_var="CUSTOM_TTT_KEY",
+                ),
+                "explicit-key",
+            )
+            self.assertEqual(
+                mod._resolve_api_key(
+                    explicit_api_key="",
+                    api_key_env_var="CUSTOM_TTT_KEY",
+                ),
+                "named-key",
+            )
+            self.assertEqual(
+                mod._resolve_api_key(
+                    explicit_api_key="",
+                    api_key_env_var="MISSING_KEY",
+                ),
+                "default-key",
+            )
 
 
 class CheckpointRankingTests(unittest.TestCase):
@@ -794,6 +927,32 @@ class CheckpointSaveTests(unittest.TestCase):
         )
         ok = mod._try_save_checkpoint(finetune=finetune, context="test")
         self.assertFalse(ok)
+
+
+class RolloutRetryTests(unittest.TestCase):
+    def test_rollouts_batch_retries_upstream_timeout_and_reduces_workers(self) -> None:
+        worker_counts: list[int] = []
+
+        def fake_rollouts_batch(*, requests, num_rollouts, max_workers):
+            worker_counts.append(int(max_workers))
+            if len(worker_counts) == 1:
+                raise TunaAPIError("error code: 524", status_code=524, response_body="error code: 524")
+            return ["ok"]
+
+        finetune = SimpleNamespace(rollouts_batch=fake_rollouts_batch)
+        with patch("time.sleep") as mock_sleep:
+            results = mod._rollouts_batch_with_retry(
+                finetune=finetune,
+                requests=["r1", "r2", "r3", "r4"],
+                num_rollouts=2,
+                max_workers=4,
+                retries=2,
+                backoff_s=1.0,
+                context="test",
+            )
+        self.assertEqual(results, ["ok"])
+        self.assertEqual(worker_counts, [4, 2])
+        mock_sleep.assert_called_once()
 
 
 class SamplingConfigTests(unittest.TestCase):
@@ -1167,6 +1326,30 @@ class EvalSubsetAndEarlyStopTests(unittest.TestCase):
             best_move_canonical=5,
             best_move_optimal_set=frozenset({5}),
         )
+
+    def test_train_subset_selection_is_reproducible(self) -> None:
+        examples = [self._example(i) for i in range(20)]
+        first = mod._subset_examples_deterministically(
+            examples,
+            split_name="train",
+            max_samples=6,
+            subset_seed=1337,
+        )
+        second = mod._subset_examples_deterministically(
+            examples,
+            split_name="train",
+            max_samples=6,
+            subset_seed=1337,
+        )
+        third = mod._subset_examples_deterministically(
+            examples,
+            split_name="train",
+            max_samples=6,
+            subset_seed=99,
+        )
+        self.assertEqual([item.row_id for item in first], [item.row_id for item in second])
+        self.assertEqual(len(first), 6)
+        self.assertNotEqual([item.row_id for item in first], [item.row_id for item in third])
 
     def test_fixed_eval_indices_reproducible(self) -> None:
         split_examples = {

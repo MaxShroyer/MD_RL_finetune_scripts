@@ -4,8 +4,10 @@ This folder contains query-skill RL finetuning and benchmarking for the syntheti
 
 ## Files
 - `train_ttt_query_rl.py`: query RL training loop using `QueryRequest` rollouts + `train_step`.
+- `train_ttt_query_rl_compact.py`: standalone smaller trainer that keeps the core training path and drops ranking/gating/auto-benchmark orchestration.
 - `benchmark_ttt_query.py`: split benchmark runner against `/query`.
 - `configs/query_rl_default.json`: default training config.
+- `configs/query_rl_compact.json`: recommended config for the compact trainer.
 - `configs/query_rl_quick.json`: quick training config.
 - `configs/query_rl_off_policy.json`: off-policy replay config.
 - `configs/benchmark_default.json`: default benchmark config.
@@ -13,7 +15,7 @@ This folder contains query-skill RL finetuning and benchmarking for the syntheti
 
 ## Setup
 ```bash
-cd /Users/maxs/Documents/Repos/MD/MD_RL_Pipe/RL_amazon_logo
+# from repo root
 cp tictaktoe_QA/.env.example tictaktoe_QA/.env
 # edit tictaktoe_QA/.env with your keys
 # optional for private HF access:
@@ -25,6 +27,22 @@ cp tictaktoe_QA/.env.example tictaktoe_QA/.env
 python tictaktoe_QA/train_ttt_query_rl.py \
   --config tictaktoe_QA/configs/query_rl_default.json
 ```
+
+Compact trainer:
+```bash
+python tictaktoe_QA/train_ttt_query_rl_compact.py \
+  --hf-token "$HF_TOKEN"
+```
+
+Optional config-driven compact run:
+```bash
+python tictaktoe_QA/train_ttt_query_rl_compact.py \
+  --config tictaktoe_QA/configs/query_rl_compact.json
+```
+
+This path is standalone from `train_ttt_query_rl.py`, keeps the core
+train/eval/checkpoint flow, and omits checkpoint ranking, center-bias and
+early-stop gates, and the automatic post-train benchmark runner.
 
 HF-only override example:
 ```bash
@@ -54,10 +72,8 @@ Hyperparameter sweep (staged Optuna TPE):
 pip install optuna
 ```
 
-Run paths in this section assume you are in repo root:
-`/Users/maxs/Documents/Repos/MD/MD_RL_Pipe/RL_amazon_logo`
-
-If you run from inside `tictaktoe_QA/`, drop the `tictaktoe_QA/` prefix from script/config paths.
+Run commands in this section from repo root. If you run from inside `tictaktoe_QA/`,
+drop the `tictaktoe_QA/` prefix from script/config paths.
 
 Dry-run (generates planned trial configs/artifacts only):
 ```bash
@@ -105,6 +121,10 @@ python tictaktoe_QA/train_ttt_query_rl.py \
 ```
 
 ## Training config keys
+- `env_file`: dotenv file loaded before resolving API credentials and base URL.
+- `api_key`: literal API key override.
+- `api_key_env_var`: optional env-var name to read from `env_file` or the process environment before falling back to `MOONDREAM_API_KEY`.
+- `base_url`: API base URL override, for example staging.
 - `dataset_source` (`hf_hub` or `local_jsonl`, default `hf_hub`).
 - `hf_dataset_repo_id` / `hf_dataset_revision` / `hf_token` / `hf_cache_dir`: HF loader controls.
 - `reasoning` (bool): toggles query reasoning mode (default `false`).
@@ -127,6 +147,7 @@ Config precedence:
 
 ## Reward and parse semantics
 - `best_move`:
+  - invalid or occupied predictions are treated as parsed-but-invalid and always receive reward `0.0`
   - if `scores_by_move_json` is present, reward is ranked: `1.0 - (# available moves strictly better than predicted)/(n-1)` (top-tier move gets `1.0`)
   - if `scores_by_move_json` is missing/invalid, fallback to legacy behavior:
     - reward `1.0` for canonical move

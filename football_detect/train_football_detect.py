@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Class-conditional RL finetuning for football detection."""
+"""Train a Moondream detect finetune for football concepts.
+
+This example converts a pre-split football dataset into class-conditional
+detect tasks, then optimizes a detect finetune with rollout rewards. It can
+read a local `DatasetDict` produced by `generate_football_splits.py` or a
+matching dataset hosted on Hugging Face.
+
+Requires:
+  pip install datasets pillow numpy scipy wandb tuna-sdk
+
+Optional:
+  pip install python-dotenv
+"""
 
 from __future__ import annotations
 
@@ -21,9 +33,13 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 
 import numpy as np
 from datasets import Dataset, DatasetDict, get_dataset_split_names, load_dataset, load_from_disk
-from dotenv import load_dotenv
 from PIL import Image, ImageEnhance
 from scipy.optimize import linear_sum_assignment
+
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:  # pragma: no cover
+    load_dotenv = None  # type: ignore[assignment]
 
 try:
     import wandb  # type: ignore
@@ -48,23 +64,35 @@ except ModuleNotFoundError:  # pragma: no cover
     wandb = _WandbShim()
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parents[0]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
-from football_detect.common import (  # noqa: E402
-    NormalizedBox,
-    clamp,
-    config_to_cli_args,
-    discover_class_names,
-    default_prompt_for_class,
-    load_json_config,
-    normalize_class_name,
-    parse_box_element_annotations,
-    repo_relative,
-    resolve_config_path,
-)
-from tuna_sdk import (  # noqa: E402
+try:
+    from football_detect.common import (
+        NormalizedBox,
+        clamp,
+        config_to_cli_args,
+        discover_class_names,
+        default_prompt_for_class,
+        load_json_config,
+        normalize_class_name,
+        parse_box_element_annotations,
+        repo_relative,
+        resolve_config_path,
+    )
+except ModuleNotFoundError:  # pragma: no cover
+    from common import (  # type: ignore[no-redef]
+        NormalizedBox,
+        clamp,
+        config_to_cli_args,
+        discover_class_names,
+        default_prompt_for_class,
+        load_json_config,
+        normalize_class_name,
+        parse_box_element_annotations,
+        repo_relative,
+        resolve_config_path,
+    )
+
+from tuna_sdk import (
     DetectAnnotation,
     DetectOutput,
     DetectRequest,
@@ -74,9 +102,11 @@ from tuna_sdk import (  # noqa: E402
     TrainStepGroup,
     TunaClient,
 )
-from tuna_sdk.errors import TunaAPIError, TunaNetworkError  # noqa: E402
+from tuna_sdk.errors import TunaAPIError, TunaNetworkError
 
 DEFAULT_CONFIG_PATH = repo_relative("configs", "train_football_detect_default.json")
+DEFAULT_SPLIT_DATASET_NAME = "maxs-m87/football_detect_v2"
+DEFAULT_WANDB_PROJECT = "moondream-football-detect-rl"
 DEFAULT_BASE_URL = "https://api.moondream.ai/v1"
 VAL_SPLIT_CANDIDATES = ("validation", "val", "dev", "test", "post_val")
 TEST_SPLIT_CANDIDATES = ("test", "post_val")
@@ -1475,6 +1505,9 @@ def _print_usage_snapshot(snapshot: Mapping[str, Any], *, prefix: str) -> None:
 
 
 def _resolve_env_file(env_file: str) -> str:
+    if not str(env_file or "").strip():
+        return ""
+
     path = Path(env_file).expanduser()
     if path.is_absolute():
         return str(path)
@@ -1483,21 +1516,35 @@ def _resolve_env_file(env_file: str) -> str:
     if from_cwd.exists():
         return str(from_cwd)
 
-    from_repo = (REPO_ROOT / path).resolve()
+    from_repo = (SCRIPT_DIR.parent / path).resolve()
     if from_repo.exists():
         return str(from_repo)
 
-    from_script = (repo_relative(path.as_posix())).resolve()
+    from_script = (SCRIPT_DIR / path).resolve()
     if from_script.exists():
         return str(from_script)
 
     return str(from_cwd)
 
 
+def _load_optional_env_file(env_file: str, *, override: bool = False) -> None:
+    if not env_file:
+        return
+    env_path = Path(env_file)
+    if not env_path.exists():
+        return
+    if load_dotenv is None:
+        raise ModuleNotFoundError(
+            "python-dotenv is required to use --env-file. "
+            "Install it with `pip install python-dotenv`, or unset --env-file."
+        )
+    load_dotenv(env_path, override=override)
+
+
 def _resolve_runtime_env(args: argparse.Namespace) -> argparse.Namespace:
     args.env_file = _resolve_env_file(str(args.env_file))
     args.api_key_env_var = str(getattr(args, "api_key_env_var", "") or "").strip() or "MOONDREAM_API_KEY"
-    load_dotenv(args.env_file, override=True)
+    _load_optional_env_file(args.env_file, override=False)
     if not args.api_key:
         args.api_key = os.environ.get(args.api_key_env_var, "")
     if not args.api_key and args.api_key_env_var != "MOONDREAM_API_KEY":
@@ -1509,6 +1556,265 @@ def _resolve_runtime_env(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 
+def _build_arg_parser(config_path: Path) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train a class-conditional Moondream detect finetune on football labels. "
+            "Inputs can come from a local split DatasetDict or a matching dataset on Hugging Face."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--config",
+        default=str(config_path),
+        help="Optional JSON config file. CLI flags override config values.",
+    )
+
+    auth_group = parser.add_argument_group("Auth And Environment")
+    auth_group.add_argument(
+        "--env-file",
+        default="",
+        help="Optional dotenv file to load before resolving API and HF credentials.",
+    )
+    auth_group.add_argument("--api-key", default="", help="Moondream API key. Defaults to environment lookup.")
+    auth_group.add_argument(
+        "--api-key-env-var",
+        default="MOONDREAM_API_KEY",
+        help="Environment variable used when --api-key is omitted.",
+    )
+    auth_group.add_argument(
+        "--hf-token",
+        default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN"),
+        help="Hugging Face token used for gated datasets.",
+    )
+    auth_group.add_argument(
+        "--base-url",
+        default="",
+        help="Moondream API base URL. Falls back to TUNA_BASE_URL or the public default.",
+    )
+
+    data_group = parser.add_argument_group("Dataset")
+    data_group.add_argument(
+        "--dataset-path",
+        default="",
+        help="Local DatasetDict path with train/validation/test-style splits.",
+    )
+    data_group.add_argument(
+        "--dataset-name",
+        default=DEFAULT_SPLIT_DATASET_NAME,
+        help="Hugging Face dataset name for a pre-split football detect dataset.",
+    )
+    data_group.add_argument("--split", default="train", help="Training split name.")
+    data_group.add_argument(
+        "--val-split",
+        default="",
+        help="Validation split name. If omitted, tries validation/val/dev/test/post_val.",
+    )
+    data_group.add_argument(
+        "--test-split",
+        default="",
+        help="Held-out test split name. If omitted, tries test/post_val when available.",
+    )
+    data_group.add_argument(
+        "--class-names-file",
+        default="",
+        help="Optional JSON file containing the class catalog to prompt against.",
+    )
+    data_group.add_argument(
+        "--include-classes",
+        nargs="*",
+        default=None,
+        help="Restrict training to this subset of class names.",
+    )
+    data_group.add_argument(
+        "--exclude-classes",
+        nargs="*",
+        default=None,
+        help="Remove these classes after class discovery or include filtering.",
+    )
+    data_group.add_argument(
+        "--prompt-overrides-json",
+        default="{}",
+        help="JSON object mapping class names to custom detect prompts.",
+    )
+
+    finetune_group = parser.add_argument_group("Finetune")
+    finetune_group.add_argument("--finetune-id", default="", help="Resume an existing finetune by ID.")
+    finetune_group.add_argument("--finetune-name", default="", help="Name for a newly created finetune.")
+    finetune_group.add_argument("--rank", type=int, default=16, help="LoRA rank for a new finetune.")
+
+    train_group = parser.add_argument_group("Training")
+    train_group.add_argument("--seed", type=int, default=42)
+    train_group.add_argument(
+        "--buffer-size",
+        type=int,
+        default=100,
+        help="Shuffle buffer for streamed Hugging Face datasets.",
+    )
+    train_group.add_argument("--num-steps", type=int, default=100)
+    train_group.add_argument("--resume-step", type=int, default=0)
+    train_group.add_argument("--batch-size", type=int, default=32)
+    train_group.add_argument("--group-size", type=int, default=6, help="Rollouts per sampled task.")
+    train_group.add_argument("--lr", type=float, default=2e-3, help="Learning rate passed to train_step.")
+    train_group.add_argument("--max-workers", type=int, default=4, help="Parallel workers for rollout batches.")
+    train_group.add_argument(
+        "--rollout-retries",
+        type=int,
+        default=2,
+        help="How many times to retry rollout batches on rate-limit or network failures.",
+    )
+    train_group.add_argument(
+        "--rollout-retry-backoff-s",
+        type=float,
+        default=1.0,
+        help="Base exponential backoff used for rollout retries.",
+    )
+    train_group.add_argument("--temperature", type=float, default=1.0)
+    train_group.add_argument("--top-p", type=float, default=0.9)
+    train_group.add_argument("--max-tokens", type=int, default=256)
+    train_group.add_argument("--max-objects", type=int, default=50)
+    train_group.add_argument(
+        "--reward-metric",
+        choices=["f1", "miou"],
+        default="f1",
+        help="Reward used for training rollouts.",
+    )
+    train_group.add_argument(
+        "--selection-metric",
+        choices=SELECTION_METRIC_CHOICES,
+        default="",
+        help="Validation metric used to pick the best checkpoint. Defaults to --reward-metric.",
+    )
+
+    reasoning_group = train_group.add_mutually_exclusive_group()
+    reasoning_group.add_argument(
+        "--reasoning",
+        dest="reasoning",
+        action="store_true",
+        help="Enable reasoning on training rollout requests.",
+    )
+    reasoning_group.add_argument(
+        "--no-reasoning",
+        dest="reasoning",
+        action="store_false",
+        help="Disable reasoning on training rollout requests.",
+    )
+    parser.set_defaults(reasoning=False)
+
+    eval_reasoning_group = train_group.add_mutually_exclusive_group()
+    eval_reasoning_group.add_argument(
+        "--eval-reasoning",
+        dest="eval_reasoning",
+        action="store_true",
+        help="Force reasoning=true during validation and test evaluation.",
+    )
+    eval_reasoning_group.add_argument(
+        "--no-eval-reasoning",
+        dest="eval_reasoning",
+        action="store_false",
+        help="Force reasoning=false during validation and test evaluation.",
+    )
+    eval_reasoning_group.add_argument(
+        "--eval-reasoning-inherit",
+        dest="eval_reasoning",
+        action="store_const",
+        const=None,
+        help="Inherit evaluation reasoning from --reasoning.",
+    )
+    parser.set_defaults(eval_reasoning=None)
+
+    reward_group = parser.add_argument_group("Task Sampling And Rewards")
+    reward_group.add_argument(
+        "--off-policy",
+        action="store_true",
+        help="Inject off-policy ground-truth groups when rollout quality is low.",
+    )
+    reward_group.add_argument(
+        "--allow-off-policy-with-reasoning",
+        action="store_true",
+        help="Allow off-policy GT injection even when --reasoning is enabled.",
+    )
+    reward_group.add_argument("--off-policy-std-thresh", type=float, default=0.02)
+    reward_group.add_argument("--off-policy-max-reward", type=float, default=0.15)
+    reward_group.add_argument("--off-policy-min-reward", type=float, default=0.15)
+    reward_group.add_argument("--off-policy-reward-scale", type=float, default=2.0)
+    reward_group.add_argument(
+        "--fn-penalty-exponent",
+        type=float,
+        default=1.0,
+        help="Exponent used for false negatives in weighted reward calculations.",
+    )
+    reward_group.add_argument(
+        "--fp-penalty-exponent",
+        type=float,
+        default=1.0,
+        help="Exponent used for false positives in weighted reward calculations.",
+    )
+    reward_group.add_argument("--neg-prompts-per-empty", type=int, default=0)
+    reward_group.add_argument("--neg-prompts-per-nonempty", type=int, default=1)
+    reward_group.add_argument(
+        "--pos-task-prob",
+        type=float,
+        default=0.95,
+        help="Probability of selecting a positive task when both positive and negative tasks exist.",
+    )
+    reward_group.add_argument(
+        "--neg-reward-weight",
+        type=float,
+        default=0.5,
+        help="Scale factor applied to negative-task rewards.",
+    )
+    reward_group.add_argument("--augment-prob", type=float, default=0.5, help="Per-task augmentation probability.")
+
+    eval_group = parser.add_argument_group("Evaluation")
+    eval_group.add_argument("--eval-temperature", type=float, default=0.0)
+    eval_group.add_argument("--eval-top-p", type=float, default=1.0)
+    eval_group.add_argument("--eval-every", type=int, default=50, help="Run validation every N successful updates.")
+    eval_group.add_argument("--eval-max-samples", type=int, default=200)
+    eval_group.add_argument("--eval-batch-size", type=int, default=20)
+    eval_group.add_argument(
+        "--kl-warning-threshold",
+        type=float,
+        default=0.0,
+        help="Warn when train-step KL reaches this threshold. <=0 disables warnings.",
+    )
+    eval_group.add_argument(
+        "--kl-stop-threshold",
+        type=float,
+        default=0.0,
+        help="Stop early when train-step KL exceeds this threshold for consecutive updates. <=0 disables stopping.",
+    )
+    eval_group.add_argument(
+        "--kl-stop-consecutive",
+        type=int,
+        default=1,
+        help="How many consecutive KL threshold hits trigger early stopping.",
+    )
+    eval_group.add_argument(
+        "--run-final-test",
+        action="store_true",
+        help="Evaluate the best validation checkpoint once on a held-out test split after training.",
+    )
+
+    logging_group = parser.add_argument_group("Checkpointing And Logging")
+    logging_group.add_argument("--save-every", type=int, default=20)
+    logging_group.add_argument(
+        "--usage-report-every",
+        type=int,
+        default=30,
+        help="Print dataset/task usage stats every N steps. <=0 disables periodic usage logs.",
+    )
+    logging_group.add_argument(
+        "--usage-top-k",
+        type=int,
+        default=30,
+        help="How many sources and classes to include in usage summaries.",
+    )
+    logging_group.add_argument("--wandb-project", default=DEFAULT_WANDB_PROJECT)
+    logging_group.add_argument("--wandb-run-name", default="")
+    return parser
+
+
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
     pre_parser = argparse.ArgumentParser(add_help=False)
@@ -1516,187 +1822,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     pre_args, _ = pre_parser.parse_known_args(raw_argv)
     config_path = resolve_config_path(pre_args.config, script_dir=SCRIPT_DIR)
     config = load_json_config(config_path, default_path=DEFAULT_CONFIG_PATH)
-
-    parser = argparse.ArgumentParser(description="RL finetune Moondream for football detection.")
-    parser.add_argument("--config", default=str(config_path))
-    parser.add_argument("--env-file", default=str(repo_relative(".env")))
-    parser.add_argument("--api-key", default="")
-    parser.add_argument("--api-key-env-var", default="MOONDREAM_API_KEY")
-    parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN"))
-    parser.add_argument("--base-url", default="")
-
-    parser.add_argument(
-        "--dataset-path",
-        default=str(repo_relative("outputs", "maxs-m87_football_detect_no_split_splits")),
-    )
-    parser.add_argument("--dataset-name", default="")
-    parser.add_argument("--split", default="train")
-    parser.add_argument(
-        "--val-split",
-        default="",
-        help="Validation split name. If omitted, uses validation/val/dev/test/post_val when present.",
-    )
-    parser.add_argument(
-        "--test-split",
-        default="",
-        help="Held-out test split name. If omitted, uses test/post_val when present.",
-    )
-    parser.add_argument("--class-names-file", default="")
-    parser.add_argument("--include-classes", nargs="*", default=None)
-    parser.add_argument("--exclude-classes", nargs="*", default=None)
-    parser.add_argument("--prompt-overrides-json", default="{}")
-
-    parser.add_argument("--finetune-id", default="")
-    parser.add_argument("--finetune-name", default="")
-    parser.add_argument("--rank", type=int, default=16)
-
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--buffer-size", type=int, default=100)
-    parser.add_argument("--num-steps", type=int, default=100)
-    parser.add_argument("--resume-step", type=int, default=0)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--group-size", type=int, default=6)
-    parser.add_argument("--lr", type=float, default=2e-3)
-    parser.add_argument("--max-workers", type=int, default=4)
-    parser.add_argument("--rollout-retries", type=int, default=2)
-    parser.add_argument("--rollout-retry-backoff-s", type=float, default=1.0)
-
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top-p", type=float, default=0.9)
-    parser.add_argument("--max-tokens", type=int, default=256)
-    parser.add_argument("--max-objects", type=int, default=50)
-    parser.add_argument(
-        "--reward-metric",
-        choices=["f1", "miou"],
-        default="f1",
-        help="Training reward metric for detect rollouts.",
-    )
-    parser.add_argument(
-        "--selection-metric",
-        choices=SELECTION_METRIC_CHOICES,
-        default="",
-        help="Validation metric used to select the best checkpoint. Defaults to --reward-metric.",
-    )
-
-    reasoning_group = parser.add_mutually_exclusive_group()
-    reasoning_group.add_argument(
-        "--reasoning",
-        dest="reasoning",
-        action="store_true",
-        help="Enable Moondream reasoning for training rollout requests.",
-    )
-    reasoning_group.add_argument(
-        "--no-reasoning",
-        dest="reasoning",
-        action="store_false",
-        help="Disable Moondream reasoning for training rollout requests.",
-    )
-    parser.set_defaults(reasoning=False)
-
-    eval_reasoning_group = parser.add_mutually_exclusive_group()
-    eval_reasoning_group.add_argument(
-        "--eval-reasoning",
-        dest="eval_reasoning",
-        action="store_true",
-        help="Force reasoning=true for eval requests.",
-    )
-    eval_reasoning_group.add_argument(
-        "--no-eval-reasoning",
-        dest="eval_reasoning",
-        action="store_false",
-        help="Force reasoning=false for eval requests.",
-    )
-    eval_reasoning_group.add_argument(
-        "--eval-reasoning-inherit",
-        dest="eval_reasoning",
-        action="store_const",
-        const=None,
-        help="Inherit eval reasoning from --reasoning.",
-    )
-    parser.set_defaults(eval_reasoning=None)
-
-    parser.add_argument("--off-policy", action="store_true")
-    parser.add_argument(
-        "--allow-off-policy-with-reasoning",
-        action="store_true",
-        help="Allow off-policy GT injection even when --reasoning is enabled.",
-    )
-    parser.add_argument("--off-policy-std-thresh", type=float, default=0.02)
-    parser.add_argument("--off-policy-max-reward", type=float, default=0.15)
-    parser.add_argument("--off-policy-min-reward", type=float, default=0.15)
-    parser.add_argument("--off-policy-reward-scale", type=float, default=2.0)
-    parser.add_argument(
-        "--fn-penalty-exponent",
-        type=float,
-        default=1.0,
-        help="Exponent for false negatives in reward denominator via FN^exp.",
-    )
-    parser.add_argument(
-        "--fp-penalty-exponent",
-        type=float,
-        default=1.0,
-        help="Exponent for false positives in reward denominator via FP^exp.",
-    )
-
-    parser.add_argument("--neg-prompts-per-empty", type=int, default=0)
-    parser.add_argument("--neg-prompts-per-nonempty", type=int, default=1)
-    parser.add_argument(
-        "--pos-task-prob",
-        type=float,
-        default=0.95,
-        help="When an image has positive tasks, choose a positive task with this probability.",
-    )
-    parser.add_argument(
-        "--neg-reward-weight",
-        type=float,
-        default=0.5,
-        help="Scale factor applied to rewards for negative tasks (no GT boxes).",
-    )
-    parser.add_argument("--augment-prob", type=float, default=0.5)
-    parser.add_argument("--eval-temperature", type=float, default=0.0)
-    parser.add_argument("--eval-top-p", type=float, default=1.0)
-    parser.add_argument("--eval-every", type=int, default=50)
-    parser.add_argument("--eval-max-samples", type=int, default=200)
-    parser.add_argument("--eval-batch-size", type=int, default=20)
-    parser.add_argument(
-        "--kl-warning-threshold",
-        type=float,
-        default=0.0,
-        help="Log a warning when a train step KL reaches this threshold. <=0 disables warnings.",
-    )
-    parser.add_argument(
-        "--kl-stop-threshold",
-        type=float,
-        default=0.0,
-        help="Stop training early when train-step KL reaches this threshold for N consecutive updates. <=0 disables stopping.",
-    )
-    parser.add_argument(
-        "--kl-stop-consecutive",
-        type=int,
-        default=1,
-        help="How many consecutive KL threshold hits are required before early stop.",
-    )
-    parser.add_argument(
-        "--run-final-test",
-        action="store_true",
-        help="Evaluate the best validation checkpoint once on the held-out test split after training.",
-    )
-
-    parser.add_argument("--save-every", type=int, default=20)
-    parser.add_argument(
-        "--usage-report-every",
-        type=int,
-        default=30,
-        help="Print running dataset/task usage stats every N steps (<=0 disables periodic usage logs).",
-    )
-    parser.add_argument(
-        "--usage-top-k",
-        type=int,
-        default=30,
-        help="How many sources/classes to include in usage summaries.",
-    )
-    parser.add_argument("--wandb-project", default="moondream-football-detect-rl")
-    parser.add_argument("--wandb-run-name", default="")
+    parser = _build_arg_parser(config_path)
 
     option_to_dest: dict[str, str] = {}
     for action in parser._actions:
@@ -1719,12 +1845,25 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return args
 
 
-def main(argv: Optional[list[str]] = None) -> None:
-    args = parse_args(argv)
-    args = _resolve_runtime_env(args)
-
+def _validate_args(args: argparse.Namespace) -> argparse.Namespace:
     if not args.api_key:
         raise ValueError("MOONDREAM_API_KEY is required")
+    if args.finetune_id and args.finetune_name:
+        raise ValueError("Provide either --finetune-id or --finetune-name, not both")
+    if args.num_steps <= 0:
+        raise ValueError("--num-steps must be > 0")
+    if args.resume_step < 0:
+        raise ValueError("--resume-step must be >= 0")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be > 0")
+    if args.group_size <= 0:
+        raise ValueError("--group-size must be > 0")
+    if args.max_workers <= 0:
+        raise ValueError("--max-workers must be > 0")
+    if args.eval_batch_size <= 0:
+        raise ValueError("--eval-batch-size must be > 0")
+    if args.save_every < 0:
+        raise ValueError("--save-every must be >= 0")
     if args.neg_prompts_per_empty < 0 or args.neg_prompts_per_nonempty < 0:
         raise ValueError("negative prompt counts must be >= 0")
     if not (0.0 <= args.pos_task_prob <= 1.0):
@@ -1758,6 +1897,13 @@ def main(argv: Optional[list[str]] = None) -> None:
         raise ValueError("--kl-stop-consecutive must be > 0")
     if args.run_final_test and args.eval_every <= 0:
         raise ValueError("--run-final-test requires --eval-every > 0 so a best validation checkpoint can be selected")
+    return args
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    args = parse_args(argv)
+    args = _resolve_runtime_env(args)
+    args = _validate_args(args)
 
     selection_metric = str(args.selection_metric or "").strip()
     if not selection_metric:
@@ -1984,6 +2130,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             "usage_top_k": args.usage_top_k,
         },
     )
+    run.summary["finetune_id"] = finetune.finetune_id
+    run.summary["finetune_name"] = getattr(finetune, "name", "") or ""
 
     def _next_task() -> TaskSample:
         while True:
@@ -2477,6 +2625,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     run.summary["tasks_generated"] = int(final_usage["tasks_generated"])
     run.summary["tasks_consumed"] = int(final_usage["tasks_consumed"])
     run.finish()
+    close_client = getattr(client, "close", None)
+    if callable(close_client):
+        close_client()
 
 
 if __name__ == "__main__":

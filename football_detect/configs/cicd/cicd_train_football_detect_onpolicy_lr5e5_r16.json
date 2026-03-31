@@ -1,7 +1,7 @@
 {
   "env_file": ".env.staging",
   "api_key": "",
-  "api_key_env_var": "MOONDREAM_API_KEY_1",
+  "api_key_env_var": "CICID_GPUB_MOONDREAM_API_KEY_1",
   "hf_token": "",
   "base_url": "https://api-staging.moondream.ai/v1",
   "dataset_path": "",

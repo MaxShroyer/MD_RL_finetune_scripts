@@ -44,7 +44,7 @@ class BoneFractureConfigTests(unittest.TestCase):
                 0.0,
                 0.0,
                 1,
-                "MOONDREAM_API_KEY_1",
+                "CICID_GPUB_MOONDREAM_API_KEY_1",
                 "bone-fracture-staging-repaired-offpolicy-lr5e4-r8-g2-f1",
             ),
             "cicd_train_bone_fracture_detect_repaired_offpolicy_lr5e4_r8_g2_miou.json": (
@@ -63,7 +63,7 @@ class BoneFractureConfigTests(unittest.TestCase):
                 0.0,
                 0.0,
                 1,
-                "MOONDREAM_API_KEY_2",
+                "CICID_GPUB_MOONDREAM_API_KEY_2",
                 "bone-fracture-staging-repaired-offpolicy-lr5e4-r8-g2-miou",
             ),
             "cicd_train_bone_fracture_detect_repaired_offpolicy_lr1e4_r16_g2_f1.json": (
@@ -82,7 +82,7 @@ class BoneFractureConfigTests(unittest.TestCase):
                 0.0,
                 0.0,
                 1,
-                "MOONDREAM_API_KEY_3",
+                "CICID_GPUB_MOONDREAM_API_KEY_3",
                 "bone-fracture-staging-repaired-offpolicy-lr1e4-r16-g2-f1",
             ),
             "cicd_train_bone_fracture_detect_repaired_offpolicy_lr1e4_r16_g2_miou.json": (
@@ -101,7 +101,7 @@ class BoneFractureConfigTests(unittest.TestCase):
                 0.0,
                 0.0,
                 1,
-                "MOONDREAM_API_KEY_4",
+                "CICID_GPUB_MOONDREAM_API_KEY_4",
                 "bone-fracture-staging-repaired-offpolicy-lr1e4-r16-g2-miou",
             ),
             "cicd_train_bone_fracture_detect_fracture_only_f1_klguard.json": (
@@ -120,7 +120,7 @@ class BoneFractureConfigTests(unittest.TestCase):
                 0.0,
                 0.0,
                 1,
-                "MOONDREAM_API_KEY_4",
+                "CICID_GPUB_MOONDREAM_API_KEY_4",
                 "bone-fracture-detect-fracture-only-f1-klguard",
             ),
         }
@@ -179,20 +179,42 @@ class BoneFractureConfigTests(unittest.TestCase):
         config_root = REPO_ROOT / "bone_fracture" / "configs" / "cicd"
         expectations = {
             "cicd_train_bone_fracture_detect_fracture_promptmix_primary_anchor.json": (
-                False,
+                True,
                 "f1",
                 "f1",
-                16,
-                0.0001,
-                8,
+                32,
+                0.00001,
+                64,
                 4,
-                120,
+                500,
                 5,
                 5,
+                1.0,
+                1.0,
                 0,
                 1,
-                "MOONDREAM_API_KEY_1",
+                0.5,
+                "CICID_GPUB_MOONDREAM_API_KEY_1",
                 "bone-fracture-detect-fracture-promptmix-primary-anchor",
+            ),
+            "cicd_train_bone_fracture_detect_fracture_promptmix_primary_anchor_fn_harsh.json": (
+                True,
+                "f1",
+                "f1",
+                32,
+                0.00001,
+                64,
+                4,
+                500,
+                5,
+                5,
+                2.0,
+                1.0,
+                0,
+                1,
+                0.15,
+                "CICID_GPUB_MOONDREAM_API_KEY_1",
+                "bone-fracture-detect-fracture-promptmix-primary-anchor-fn-harsh",
             ),
             "cicd_train_bone_fracture_detect_fracture_promptmix_offpolicy_anchor_f1.json": (
                 True,
@@ -205,9 +227,12 @@ class BoneFractureConfigTests(unittest.TestCase):
                 120,
                 5,
                 5,
+                1.0,
+                1.0,
                 0,
                 1,
-                "MOONDREAM_API_KEY_2",
+                0.5,
+                "CICID_GPUB_MOONDREAM_API_KEY_2",
                 "bone-fracture-detect-fracture-promptmix-offpolicy-anchor-f1",
             ),
             "cicd_train_bone_fracture_detect_fracture_promptmix_offpolicy_anchor_miou.json": (
@@ -221,9 +246,12 @@ class BoneFractureConfigTests(unittest.TestCase):
                 120,
                 5,
                 5,
+                1.0,
+                1.0,
                 0,
                 1,
-                "MOONDREAM_API_KEY_3",
+                0.5,
+                "CICID_GPUB_MOONDREAM_API_KEY_3",
                 "bone-fracture-detect-fracture-promptmix-offpolicy-anchor-miou",
             ),
             "cicd_train_bone_fracture_detect_fracture_promptmix_offpolicy_aggressive_f1.json": (
@@ -237,9 +265,12 @@ class BoneFractureConfigTests(unittest.TestCase):
                 80,
                 5,
                 5,
+                1.0,
+                1.0,
                 1,
                 1,
-                "MOONDREAM_API_KEY_4",
+                0.5,
+                "CICID_GPUB_MOONDREAM_API_KEY_4",
                 "bone-fracture-detect-fracture-promptmix-offpolicy-aggressive-f1",
             ),
         }
@@ -255,8 +286,11 @@ class BoneFractureConfigTests(unittest.TestCase):
             num_steps,
             eval_every,
             save_every,
+            fn_penalty_exponent,
+            fp_penalty_exponent,
             neg_prompts_per_empty,
             neg_prompts_per_nonempty,
+            neg_reward_weight,
             api_key_env_var,
             wandb_run_name,
         ) in expectations.items():
@@ -280,8 +314,11 @@ class BoneFractureConfigTests(unittest.TestCase):
                 self.assertEqual(args.num_steps, num_steps)
                 self.assertEqual(args.eval_every, eval_every)
                 self.assertEqual(args.save_every, save_every)
+                self.assertEqual(args.fn_penalty_exponent, fn_penalty_exponent)
+                self.assertEqual(args.fp_penalty_exponent, fp_penalty_exponent)
                 self.assertEqual(args.neg_prompts_per_empty, neg_prompts_per_empty)
                 self.assertEqual(args.neg_prompts_per_nonempty, neg_prompts_per_nonempty)
+                self.assertEqual(args.neg_reward_weight, neg_reward_weight)
                 self.assertEqual(args.api_key_env_var, api_key_env_var)
                 self.assertEqual(args.wandb_run_name, wandb_run_name)
 
@@ -289,7 +326,7 @@ class BoneFractureConfigTests(unittest.TestCase):
         config_path = REPO_ROOT / "bone_fracture" / "configs" / "train_bone_fracture_detect_default.json"
         args = mod.parse_args(["--config", str(config_path)])
         self.assertEqual(args.env_file, ".env.staging")
-        self.assertEqual(args.api_key_env_var, "MOONDREAM_API_KEY_1")
+        self.assertEqual(args.api_key_env_var, "CICID_GPUB_MOONDREAM_API_KEY_1")
         self.assertEqual(args.base_url, "https://api-staging.moondream.ai/v1")
         self.assertEqual(args.kl_warning_threshold, 0.0)
         self.assertEqual(args.kl_stop_threshold, 0.0)

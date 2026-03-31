@@ -1,0 +1,154 @@
+Run this from the repo root.
+
+If your keys are in `pokemon_cards/.env.staging`, pass that explicitly to the teacher, train, and benchmark scripts.
+The builder does not accept `--env-file`. If you need Hugging Face auth for the build step, either load the env file into your shell first or pass `--hf-token "$HF_TOKEN"` directly.
+
+Optional shell setup if you want the current shell to see `OPENROUTER_API_KEY`, `MOONDREAM_API_KEY`, or `HF_TOKEN`:
+
+```bash
+set -a
+source pokemon_cards/.env.staging
+set +a
+```
+
+Recommended full sweep order:
+
+1. Build the local derived dataset once:
+
+```bash
+python pokemon_cards/build_pokemon_cards_dataset.py \
+  --output-dir pokemon_cards/outputs/thefusion21_pokemoncards_v1
+```
+
+Check the build audit here after it finishes:
+
+- `pokemon_cards/outputs/thefusion21_pokemoncards_v1/metadata/build_summary.json`
+
+2. Generate teacher rationale labels across `train`, `val`, and `test`:
+
+```bash
+python pokemon_cards/generate_pokemon_teacher_reasoning_openrouter.py \
+  --config pokemon_cards/configs/teacher_openrouter_default.json \
+  --env-file pokemon_cards/.env.staging \
+  --teacher-model-id <OPENROUTER_MODEL_ID> \
+  --request-overrides-json '{"reasoning":{"effort":"high"}}'
+```
+
+Teacher-labeled dataset output:
+
+- `pokemon_cards/outputs/thefusion21_pokemoncards_v1_teacher`
+
+3. Benchmark the base model on `val` before any finetuning so you have a real baseline for answer quality:
+
+```bash
+python pokemon_cards/benchmark_pokemon_query.py \
+  --config pokemon_cards/configs/benchmark_default.json \
+  --env-file pokemon_cards/.env.staging \
+  --dataset-dir pokemon_cards/outputs/thefusion21_pokemoncards_v1_teacher \
+  --split val \
+  --no-reasoning \
+  --output-json pokemon_cards/outputs/benchmark_base_val_no_reasoning.json \
+  --predictions-jsonl pokemon_cards/outputs/benchmark_base_val_no_reasoning_predictions.jsonl
+```
+
+4. Train Stage 1 answer-only RL on the non-teacher dataset:
+
+```bash
+python pokemon_cards/train_pokemon_query_rl.py \
+  --config pokemon_cards/configs/stage1_no_reasoning_cicd.json \
+  --env-file pokemon_cards/.env.staging
+```
+
+5. Benchmark the latest Stage 1 finetune on `val`:
+
+```bash
+python pokemon_cards/benchmark_pokemon_query.py \
+  --config pokemon_cards/configs/benchmark_default.json \
+  --env-file pokemon_cards/.env.staging \
+  --dataset-dir pokemon_cards/outputs/thefusion21_pokemoncards_v1_teacher \
+  --split val \
+  --no-reasoning \
+  --finetune-id <STAGE1_FINETUNE_ID> \
+  --output-json pokemon_cards/outputs/benchmark_stage1_val_no_reasoning.json \
+  --predictions-jsonl pokemon_cards/outputs/benchmark_stage1_val_no_reasoning_predictions.jsonl
+```
+
+6. Inspect the Stage 1 checkpoint ranking and note the best step:
+
+- `pokemon_cards/outputs/checkpoint_ranking_stage1_no_reasoning.json`
+
+7. Benchmark the exact best Stage 1 checkpoint on `test`:
+
+```bash
+python pokemon_cards/benchmark_pokemon_query.py \
+  --config pokemon_cards/configs/benchmark_default.json \
+  --env-file pokemon_cards/.env.staging \
+  --dataset-dir pokemon_cards/outputs/thefusion21_pokemoncards_v1_teacher \
+  --split test \
+  --no-reasoning \
+  --finetune-id <STAGE1_FINETUNE_ID> \
+  --checkpoint-step <STAGE1_BEST_STEP> \
+  --output-json pokemon_cards/outputs/benchmark_stage1_best_test_no_reasoning.json \
+  --predictions-jsonl pokemon_cards/outputs/benchmark_stage1_best_test_no_reasoning_predictions.jsonl
+```
+
+8. Continue into Stage 2 reasoning distillation using the same finetune id from Stage 1:
+
+```bash
+python pokemon_cards/train_pokemon_query_rl.py \
+  --config pokemon_cards/configs/stage2_reasoning_distill_cicd.json \
+  --env-file pokemon_cards/.env.staging \
+  --finetune-id <STAGE1_FINETUNE_ID>
+```
+
+Important: Stage 2 currently continues the existing finetune. It does not restore a specific older Stage 1 checkpoint step.
+
+9. Benchmark the latest continued finetune on `val` with reasoning enabled:
+
+```bash
+python pokemon_cards/benchmark_pokemon_query.py \
+  --config pokemon_cards/configs/benchmark_default.json \
+  --env-file pokemon_cards/.env.staging \
+  --dataset-dir pokemon_cards/outputs/thefusion21_pokemoncards_v1_teacher \
+  --split val \
+  --finetune-id <STAGE1_FINETUNE_ID> \
+  --output-json pokemon_cards/outputs/benchmark_stage2_val_reasoning.json \
+  --predictions-jsonl pokemon_cards/outputs/benchmark_stage2_val_reasoning_predictions.jsonl
+```
+
+10. Inspect the Stage 2 checkpoint ranking and note the best step:
+
+- `pokemon_cards/outputs/checkpoint_ranking_stage2_reasoning_distill.json`
+
+11. Benchmark the exact best Stage 2 checkpoint on `test`:
+
+```bash
+python pokemon_cards/benchmark_pokemon_query.py \
+  --config pokemon_cards/configs/benchmark_default.json \
+  --env-file pokemon_cards/.env.staging \
+  --dataset-dir pokemon_cards/outputs/thefusion21_pokemoncards_v1_teacher \
+  --split test \
+  --finetune-id <STAGE1_FINETUNE_ID> \
+  --checkpoint-step <STAGE2_BEST_STEP> \
+  --output-json pokemon_cards/outputs/benchmark_stage2_best_test_reasoning.json \
+  --predictions-jsonl pokemon_cards/outputs/benchmark_stage2_best_test_reasoning_predictions.jsonl
+```
+
+Optional extra baseline if you want a pre-finetune reasoning benchmark for comparison against Stage 2:
+
+```bash
+python pokemon_cards/benchmark_pokemon_query.py \
+  --config pokemon_cards/configs/benchmark_default.json \
+  --env-file pokemon_cards/.env.staging \
+  --dataset-dir pokemon_cards/outputs/thefusion21_pokemoncards_v1_teacher \
+  --split val \
+  --output-json pokemon_cards/outputs/benchmark_base_val_reasoning.json \
+  --predictions-jsonl pokemon_cards/outputs/benchmark_base_val_reasoning_predictions.jsonl
+```
+
+Keep a short run log as you go:
+
+- teacher model id + teacher output dir
+- Stage 1 finetune id + Stage 1 best step + Stage 1 benchmark JSON path
+- Stage 2 continued finetune id + Stage 2 best step + Stage 2 benchmark JSON path
+- any benchmark run that materially beats the previous best

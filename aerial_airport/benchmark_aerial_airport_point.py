@@ -18,6 +18,7 @@ from aerial_airport.common import DEFAULT_STAGING_API_BASE, repo_relative
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = repo_relative("configs", "benchmark_aerial_airport_point_default.json")
+_call_point_api = _base._call_point_api
 
 
 def parse_args(argv: Optional[list[str]] = None):
@@ -31,6 +32,7 @@ def parse_args(argv: Optional[list[str]] = None):
 
 
 def main(argv: Optional[list[str]] = None) -> None:
+    _base._call_point_api = _call_point_api
     _base.run(parse_args(argv))
 
 

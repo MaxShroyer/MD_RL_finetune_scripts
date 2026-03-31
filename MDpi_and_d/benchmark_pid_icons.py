@@ -31,6 +31,20 @@ from dotenv import load_dotenv
 from PIL import Image, ImageDraw
 from scipy.optimize import linear_sum_assignment
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from aerial_airport.runtime_tiling import (
+    Box2D as RuntimeBox,
+    Point2D as RuntimePoint,
+    crop_image_to_tiles,
+    map_box_from_tile,
+    map_point_from_tile,
+    merge_boxes as merge_runtime_boxes,
+    merge_points as merge_runtime_points,
+)
+
 
 def _repo_relative(*parts: str) -> Path:
     return Path(__file__).resolve().parent.joinpath(*parts)
@@ -464,6 +478,32 @@ class TaskSample:
     sample_id: str
 
 
+def _runtime_point(point: Point) -> RuntimePoint:
+    return RuntimePoint(x=float(point.x), y=float(point.y))
+
+
+def _runtime_box(box: Box) -> RuntimeBox:
+    return RuntimeBox(
+        x_min=float(box.x_min),
+        y_min=float(box.y_min),
+        x_max=float(box.x_max),
+        y_max=float(box.y_max),
+    )
+
+
+def _point_from_runtime(point: RuntimePoint) -> Point:
+    return Point(x=float(point.x), y=float(point.y))
+
+
+def _box_from_runtime(box: RuntimeBox) -> Box:
+    return Box(
+        x_min=float(box.x_min),
+        y_min=float(box.y_min),
+        x_max=float(box.x_max),
+        y_max=float(box.y_max),
+    )
+
+
 def _load_class_names(class_names_file: str, dataset_path: Optional[str]) -> list[str]:
     if class_names_file:
         raw = Path(class_names_file).expanduser().read_text(encoding="utf-8")
@@ -596,6 +636,15 @@ def _coerce_float(value: Any) -> Optional[float]:
         return None
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return None
 
@@ -1116,7 +1165,70 @@ def _reward_f1_points(points: list[Point], ground_truth: list[Box]) -> float:
     return (2.0 * float(tp)) / denom
 
 
-def _evaluate_model(label: str, model: str, args: argparse.Namespace, all_class_names: list[str]) -> dict[str, Any]:
+def _parse_model_finetune_checkpoint(model_name: Any) -> tuple[Optional[str], Optional[int]]:
+    text = str(model_name or "").strip()
+    if "/" not in text or "@" not in text:
+        return (None, None)
+    _, tail = text.split("/", 1)
+    finetune_id, _, step_text = tail.partition("@")
+    return (finetune_id or None, _coerce_int(step_text))
+
+
+def _task_record(
+    *,
+    label: str,
+    skill: str,
+    model: str,
+    run_id: str,
+    dataset_name: Optional[str],
+    dataset_path: Optional[str],
+    split: str,
+    task: TaskSample,
+    pred_count: Optional[int],
+    tp: Optional[int],
+    fp: Optional[int],
+    fn: Optional[int],
+    f1: Optional[float],
+    miou: Optional[float],
+    latency_sec: Optional[float],
+    failed: bool,
+    error: Optional[str],
+) -> dict[str, Any]:
+    finetune_id, checkpoint_step = _parse_model_finetune_checkpoint(model)
+    return {
+        "label": label,
+        "skill": skill,
+        "model": model,
+        "run_id": str(run_id or "").strip() or None,
+        "finetune_id": finetune_id,
+        "checkpoint_step": checkpoint_step,
+        "dataset_name": dataset_name,
+        "dataset_path": dataset_path,
+        "split": split,
+        "sample_id": task.sample_id,
+        "task_key": f"{task.sample_id}::{task.class_name}::{task.prompt}",
+        "class_name": task.class_name,
+        "prompt": task.prompt,
+        "is_positive": bool(task.gt_boxes),
+        "gt_count": len(task.gt_boxes),
+        "pred_count": pred_count,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "task_f1": f1,
+        "task_miou": miou,
+        "latency_sec": latency_sec,
+        "failed": failed,
+        "error": error,
+    }
+
+
+def _evaluate_model(
+    label: str,
+    model: str,
+    args: argparse.Namespace,
+    all_class_names: list[str],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     rng = random.Random(args.seed)
     effective_skill = (args.skill or "detect").strip().lower()
     last_request_end: Optional[float] = None
@@ -1138,11 +1250,136 @@ def _evaluate_model(label: str, model: str, args: argparse.Namespace, all_class_
     failed_tasks = 0
 
     per_class: dict[str, dict[str, Any]] = {}
+    task_records: list[dict[str, Any]] = []
 
     def _class_stats(name: str) -> dict[str, Any]:
         if name not in per_class:
             per_class[name] = {"tasks": 0, "tp": 0, "fp": 0, "fn": 0, "f1_sum": 0.0, "miou_sum": 0.0}
         return per_class[name]
+
+    def _predict_task(task: TaskSample) -> tuple[list[Point], list[Box], float]:
+        nonlocal last_request_end
+        if not args.runtime_tiling:
+            if args.min_request_interval_s > 0.0 and last_request_end is not None:
+                wait_s = float(args.min_request_interval_s) - (time.monotonic() - last_request_end)
+                if wait_s > 0.0:
+                    time.sleep(wait_s)
+            start = time.monotonic()
+            if effective_skill == "point":
+                pred_points = _call_point_api(
+                    api_base=args.api_base,
+                    api_key=args.api_key,
+                    model=model,
+                    image=task.image,
+                    prompt=task.prompt,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    max_tokens=args.max_tokens,
+                    timeout=args.timeout,
+                    retry_429_max_retries=args.retry_429_max_retries,
+                    retry_429_backoff_s=args.retry_429_backoff_s,
+                    retry_429_max_backoff_s=args.retry_429_max_backoff_s,
+                    retry_timeout_max_retries=args.retry_timeout_max_retries,
+                    retry_timeout_backoff_s=args.retry_timeout_backoff_s,
+                    retry_timeout_max_backoff_s=args.retry_timeout_max_backoff_s,
+                    reasoning=args.reasoning,
+                )
+                pred_boxes: list[Box] = []
+            else:
+                pred_boxes = _call_detect_api(
+                    api_base=args.api_base,
+                    api_key=args.api_key,
+                    model=model,
+                    image=task.image,
+                    prompt=task.prompt,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    max_tokens=args.max_tokens,
+                    max_objects=args.max_objects,
+                    timeout=args.timeout,
+                    retry_429_max_retries=args.retry_429_max_retries,
+                    retry_429_backoff_s=args.retry_429_backoff_s,
+                    retry_429_max_backoff_s=args.retry_429_max_backoff_s,
+                    retry_timeout_max_retries=args.retry_timeout_max_retries,
+                    retry_timeout_backoff_s=args.retry_timeout_backoff_s,
+                    retry_timeout_max_backoff_s=args.retry_timeout_max_backoff_s,
+                    reasoning=args.reasoning,
+                )
+                pred_points = []
+            latency = time.monotonic() - start
+            last_request_end = time.monotonic()
+            return pred_points, pred_boxes, latency
+
+        merged_points: list[RuntimePoint] = []
+        merged_boxes: list[RuntimeBox] = []
+        total_latency = 0.0
+        for tile_window, tile_image in crop_image_to_tiles(
+            task.image,
+            grid_size=int(args.tile_grid_size),
+            overlap=float(args.tile_overlap),
+        ):
+            if args.min_request_interval_s > 0.0 and last_request_end is not None:
+                wait_s = float(args.min_request_interval_s) - (time.monotonic() - last_request_end)
+                if wait_s > 0.0:
+                    time.sleep(wait_s)
+            start = time.monotonic()
+            if effective_skill == "point":
+                pred_tile_points = _call_point_api(
+                    api_base=args.api_base,
+                    api_key=args.api_key,
+                    model=model,
+                    image=tile_image,
+                    prompt=task.prompt,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    max_tokens=args.max_tokens,
+                    timeout=args.timeout,
+                    retry_429_max_retries=args.retry_429_max_retries,
+                    retry_429_backoff_s=args.retry_429_backoff_s,
+                    retry_429_max_backoff_s=args.retry_429_max_backoff_s,
+                    retry_timeout_max_retries=args.retry_timeout_max_retries,
+                    retry_timeout_backoff_s=args.retry_timeout_backoff_s,
+                    retry_timeout_max_backoff_s=args.retry_timeout_max_backoff_s,
+                    reasoning=args.reasoning,
+                )
+                for point in pred_tile_points:
+                    merged_points.append(map_point_from_tile(_runtime_point(point), tile_window))
+            else:
+                pred_tile_boxes = _call_detect_api(
+                    api_base=args.api_base,
+                    api_key=args.api_key,
+                    model=model,
+                    image=tile_image,
+                    prompt=task.prompt,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    max_tokens=args.max_tokens,
+                    max_objects=args.max_objects,
+                    timeout=args.timeout,
+                    retry_429_max_retries=args.retry_429_max_retries,
+                    retry_429_backoff_s=args.retry_429_backoff_s,
+                    retry_429_max_backoff_s=args.retry_429_max_backoff_s,
+                    retry_timeout_max_retries=args.retry_timeout_max_retries,
+                    retry_timeout_backoff_s=args.retry_timeout_backoff_s,
+                    retry_timeout_max_backoff_s=args.retry_timeout_max_backoff_s,
+                    reasoning=args.reasoning,
+                )
+                for box in pred_tile_boxes:
+                    mapped = map_box_from_tile(_runtime_box(box), tile_window)
+                    if mapped is not None:
+                        merged_boxes.append(mapped)
+            total_latency += time.monotonic() - start
+            last_request_end = time.monotonic()
+
+        if effective_skill == "point":
+            return [
+                _point_from_runtime(point)
+                for point in merge_runtime_points(merged_points, radius=float(args.tile_point_merge_radius))
+            ], [], total_latency
+        return [], [
+            _box_from_runtime(box)
+            for box in merge_runtime_boxes(merged_boxes, iou_threshold=float(args.tile_box_merge_iou))
+        ], total_latency
 
     row_iter = _iter_rows(
         dataset_path=args.dataset_path.strip(),
@@ -1179,69 +1416,45 @@ def _evaluate_model(label: str, model: str, args: argparse.Namespace, all_class_
                 positive_tasks += 1
             else:
                 negative_tasks += 1
-            if args.min_request_interval_s > 0.0 and last_request_end is not None:
-                wait_s = float(args.min_request_interval_s) - (time.monotonic() - last_request_end)
-                if wait_s > 0.0:
-                    time.sleep(wait_s)
-            start = time.monotonic()
             try:
-                if effective_skill == "point":
-                    pred_points = _call_point_api(
-                        api_base=args.api_base,
-                        api_key=args.api_key,
-                        model=model,
-                        image=task.image,
-                        prompt=task.prompt,
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        max_tokens=args.max_tokens,
-                        timeout=args.timeout,
-                        retry_429_max_retries=args.retry_429_max_retries,
-                        retry_429_backoff_s=args.retry_429_backoff_s,
-                        retry_429_max_backoff_s=args.retry_429_max_backoff_s,
-                        retry_timeout_max_retries=args.retry_timeout_max_retries,
-                        retry_timeout_backoff_s=args.retry_timeout_backoff_s,
-                        retry_timeout_max_backoff_s=args.retry_timeout_max_backoff_s,
-                        reasoning=args.reasoning,
-                    )
-                    pred_boxes: list[Box] = []
-                else:
-                    pred_boxes = _call_detect_api(
-                        api_base=args.api_base,
-                        api_key=args.api_key,
-                        model=model,
-                        image=task.image,
-                        prompt=task.prompt,
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        max_tokens=args.max_tokens,
-                        max_objects=args.max_objects,
-                        timeout=args.timeout,
-                        retry_429_max_retries=args.retry_429_max_retries,
-                        retry_429_backoff_s=args.retry_429_backoff_s,
-                        retry_429_max_backoff_s=args.retry_429_max_backoff_s,
-                        retry_timeout_max_retries=args.retry_timeout_max_retries,
-                        retry_timeout_backoff_s=args.retry_timeout_backoff_s,
-                        retry_timeout_max_backoff_s=args.retry_timeout_max_backoff_s,
-                        reasoning=args.reasoning,
-                    )
-                    pred_points = []
+                pred_points, pred_boxes, latency = _predict_task(task)
             except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
                 print(f"{label}: {effective_skill} failed for sample={task.sample_id} class={task.class_name}: {exc}")
                 failed_tasks += 1
                 last_request_end = time.monotonic()
+                task_records.append(
+                    _task_record(
+                        label=label,
+                        skill=effective_skill,
+                        model=model,
+                        run_id=getattr(args, "run_id", ""),
+                        dataset_name=args.dataset_name or None,
+                        dataset_path=args.dataset_path.strip() or None,
+                        split=args.split,
+                        task=task,
+                        pred_count=None,
+                        tp=None,
+                        fp=None,
+                        fn=None,
+                        f1=None,
+                        miou=None,
+                        latency_sec=None,
+                        failed=True,
+                        error=str(exc),
+                    )
+                )
                 continue
-            latency = time.monotonic() - start
-            last_request_end = time.monotonic()
 
             if effective_skill == "point":
                 f1 = _reward_f1_points(pred_points, task.gt_boxes)
                 miou = 0.0
                 tp, fp, fn = _count_tp_fp_fn_points(pred_points, task.gt_boxes)
+                pred_count = len(pred_points)
             else:
                 f1 = _reward_f1(pred_boxes, task.gt_boxes)
                 miou = _reward_miou(pred_boxes, task.gt_boxes)
                 tp, fp, fn = _count_tp_fp_fn(pred_boxes, task.gt_boxes, iou_threshold=args.iou_threshold)
+                pred_count = len(pred_boxes)
 
             total_tasks += 1
             total_f1 += f1
@@ -1258,6 +1471,27 @@ def _evaluate_model(label: str, model: str, args: argparse.Namespace, all_class_
             stats["fn"] += fn
             stats["f1_sum"] += f1
             stats["miou_sum"] += miou
+            task_records.append(
+                _task_record(
+                    label=label,
+                    skill=effective_skill,
+                    model=model,
+                    run_id=getattr(args, "run_id", ""),
+                    dataset_name=args.dataset_name or None,
+                    dataset_path=args.dataset_path.strip() or None,
+                    split=args.split,
+                    task=task,
+                    pred_count=pred_count,
+                    tp=tp,
+                    fp=fp,
+                    fn=fn,
+                    f1=f1,
+                    miou=miou,
+                    latency_sec=latency,
+                    failed=False,
+                    error=None,
+                )
+            )
 
             if args.viz_samples > 0 and viz_saved < args.viz_samples and viz_out_dir is not None:
                 out_path = _save_task_visualization(
@@ -1283,22 +1517,25 @@ def _evaluate_model(label: str, model: str, args: argparse.Namespace, all_class_
                 print(f"{label}: progress tasks={total_tasks}")
 
     if total_tasks == 0:
-        return {
-            "label": label,
-            "skill": effective_skill,
-            "model": model,
-            "reasoning": bool(args.reasoning),
-            "error": "No tasks evaluated",
-            "base_samples": total_base_samples,
-            "tasks": 0,
-            "failed_tasks": failed_tasks,
-            "attempted_tasks": failed_tasks,
-            "total_gt_boxes": total_gt_boxes,
-            "positive_tasks": positive_tasks,
-            "negative_tasks": negative_tasks,
-            "visualizations_saved": viz_saved,
-            "visualization_paths": viz_paths,
-        }
+        return (
+            {
+                "label": label,
+                "skill": effective_skill,
+                "model": model,
+                "reasoning": bool(args.reasoning),
+                "error": "No tasks evaluated",
+                "base_samples": total_base_samples,
+                "tasks": 0,
+                "failed_tasks": failed_tasks,
+                "attempted_tasks": failed_tasks,
+                "total_gt_boxes": total_gt_boxes,
+                "positive_tasks": positive_tasks,
+                "negative_tasks": negative_tasks,
+                "visualizations_saved": viz_saved,
+                "visualization_paths": viz_paths,
+            },
+            task_records,
+        )
 
     micro_denom = 2 * total_tp + total_fp + total_fn
     micro_f1 = 1.0 if micro_denom == 0 else (2 * total_tp) / micro_denom
@@ -1318,32 +1555,35 @@ def _evaluate_model(label: str, model: str, args: argparse.Namespace, all_class_
             "miou": (float(stats["miou_sum"]) / tasks) if tasks else 0.0,
         }
 
-    return {
-        "label": label,
-        "skill": effective_skill,
-        "model": model,
-        "reasoning": bool(args.reasoning),
-        "dataset_name": args.dataset_name or None,
-        "dataset_path": args.dataset_path.strip() or None,
-        "split": args.split,
-        "base_samples": total_base_samples,
-        "tasks": total_tasks,
-        "failed_tasks": failed_tasks,
-        "attempted_tasks": total_tasks + failed_tasks,
-        "total_gt_boxes": total_gt_boxes,
-        "positive_tasks": positive_tasks,
-        "negative_tasks": negative_tasks,
-        "eval_f1": micro_f1,
-        "eval_f1_macro": total_f1 / total_tasks,
-        "eval_miou": total_miou / total_tasks,
-        "tp": total_tp,
-        "fp": total_fp,
-        "fn": total_fn,
-        "avg_latency_sec": total_latency / total_tasks,
-        "visualizations_saved": viz_saved,
-        "visualization_paths": viz_paths,
-        "per_class": per_class_payload,
-    }
+    return (
+        {
+            "label": label,
+            "skill": effective_skill,
+            "model": model,
+            "reasoning": bool(args.reasoning),
+            "dataset_name": args.dataset_name or None,
+            "dataset_path": args.dataset_path.strip() or None,
+            "split": args.split,
+            "base_samples": total_base_samples,
+            "tasks": total_tasks,
+            "failed_tasks": failed_tasks,
+            "attempted_tasks": total_tasks + failed_tasks,
+            "total_gt_boxes": total_gt_boxes,
+            "positive_tasks": positive_tasks,
+            "negative_tasks": negative_tasks,
+            "eval_f1": micro_f1,
+            "eval_f1_macro": total_f1 / total_tasks,
+            "eval_miou": total_miou / total_tasks,
+            "tp": total_tp,
+            "fp": total_fp,
+            "fn": total_fn,
+            "avg_latency_sec": total_latency / total_tasks,
+            "visualizations_saved": viz_saved,
+            "visualization_paths": viz_paths,
+            "per_class": per_class_payload,
+        },
+        task_records,
+    )
 
 
 def _print_summary(title: str, metrics: dict[str, Any]) -> None:
@@ -1483,6 +1723,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default="detect_phrase",
         help="Prompt style for class-conditional tasks (used when --skill=point).",
     )
+    parser.add_argument(
+        "--runtime-tiling",
+        action="store_true",
+        help="Run each benchmark task on runtime-generated tiles, then merge the mapped predictions.",
+    )
+    parser.add_argument("--tile-grid-size", type=int, default=3)
+    parser.add_argument("--tile-overlap", type=float, default=0.10)
+    parser.add_argument("--tile-point-merge-radius", type=float, default=0.015)
+    parser.add_argument("--tile-box-merge-iou", type=float, default=0.50)
 
     reasoning_group = parser.add_mutually_exclusive_group()
     reasoning_group.add_argument(
@@ -1519,6 +1768,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--out-json", default=str(_repo_relative("outputs", "benchmark_pid_icons.json")))
+    parser.add_argument(
+        "--records-jsonl",
+        default="",
+        help="Optional JSONL path for per-task benchmark records.",
+    )
+    parser.add_argument(
+        "--run-id",
+        default="",
+        help="Optional run identifier to attach to per-task records.",
+    )
     option_to_dest: dict[str, str] = {}
     for action in parser._actions:
         if not action.option_strings:
@@ -1559,6 +1818,14 @@ def run(args: argparse.Namespace) -> None:
         args.max_samples = args.max_post_train_eval_samples
     if args.viz_samples < 0:
         raise ValueError("--viz-samples must be >= 0")
+    if args.tile_grid_size <= 0:
+        raise ValueError("--tile-grid-size must be > 0")
+    if not (0.0 <= args.tile_overlap < 1.0):
+        raise ValueError("--tile-overlap must be in [0, 1)")
+    if args.tile_point_merge_radius < 0.0:
+        raise ValueError("--tile-point-merge-radius must be >= 0")
+    if not (0.0 <= args.tile_box_merge_iou <= 1.0):
+        raise ValueError("--tile-box-merge-iou must be in [0, 1]")
     if args.skill != "point" and args.point_prompt_style != "detect_phrase":
         print("warning: --point-prompt-style is only applied when --skill=point; using detect_phrase.")
 
@@ -1586,6 +1853,14 @@ def run(args: argparse.Namespace) -> None:
         include_classes=args.include_classes,
         exclude_classes=args.exclude_classes,
     )
+    if not all_class_names and args.include_classes:
+        all_class_names = _filter_class_names(
+            list(args.include_classes),
+            include_classes=args.include_classes,
+            exclude_classes=args.exclude_classes,
+        )
+        if all_class_names:
+            print(f"using explicit include_classes fallback ({len(all_class_names)} classes)")
     if not all_class_names:
         raise ValueError("No class names remain after applying include/exclude filters.")
 
@@ -1597,13 +1872,15 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("Provide --model or (--finetune-id with --checkpoint-step) when using --skip-baseline")
 
     baseline_metrics = None
+    baseline_records: list[dict[str, Any]] = []
     if not args.skip_baseline:
-        baseline_metrics = _evaluate_model("baseline", args.baseline_model, args, all_class_names)
+        baseline_metrics, baseline_records = _evaluate_model("baseline", args.baseline_model, args, all_class_names)
         _print_summary("baseline", baseline_metrics)
 
     candidate_metrics = None
+    candidate_records: list[dict[str, Any]] = []
     if candidate_model:
-        candidate_metrics = _evaluate_model("candidate", candidate_model, args, all_class_names)
+        candidate_metrics, candidate_records = _evaluate_model("candidate", candidate_model, args, all_class_names)
         _print_summary("candidate", candidate_metrics)
 
     if baseline_metrics is not None and candidate_metrics is not None:
@@ -1637,6 +1914,15 @@ def run(args: argparse.Namespace) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"saved metrics -> {out_path}")
+    if str(args.records_jsonl).strip():
+        records_path = Path(args.records_jsonl).expanduser().resolve()
+        records_path.parent.mkdir(parents=True, exist_ok=True)
+        all_records = [*baseline_records, *candidate_records]
+        with records_path.open("w", encoding="utf-8") as handle:
+            for record in all_records:
+                handle.write(json.dumps(record, sort_keys=True))
+                handle.write("\n")
+        print(f"saved task records -> {records_path}")
 
 
 def main(argv: Optional[list[str]] = None) -> None:

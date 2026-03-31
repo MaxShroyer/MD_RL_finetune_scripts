@@ -5,6 +5,8 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from tictaktoe_QA import benchmark_ttt_query as mod
 
@@ -159,6 +161,59 @@ class QueryPayloadTests(unittest.TestCase):
             reasoning=None,
         )
         self.assertNotIn("reasoning", payload)
+
+
+class ModelResolutionTests(unittest.TestCase):
+    class _FakeFinetune:
+        def __init__(self, checkpoints: list[int]) -> None:
+            self._checkpoints = list(checkpoints)
+
+        def list_checkpoints(self, *, limit: int = 50, cursor: str | None = None):
+            del limit, cursor
+            return SimpleNamespace(
+                checkpoints=[SimpleNamespace(step=step) for step in self._checkpoints],
+                next_cursor=None,
+                has_more=False,
+            )
+
+    class _FakeClient:
+        def __init__(self, checkpoints: list[int]) -> None:
+            self._finetune = ModelResolutionTests._FakeFinetune(checkpoints)
+
+        def get_finetune(self, finetune_id: str):
+            del finetune_id
+            return self._finetune
+
+        def close(self) -> None:
+            return
+
+    def test_shared_resolution_uses_nearest_saved_checkpoint(self) -> None:
+        with mock.patch.object(
+            mod.shared_query_common,
+            "TunaClient",
+            return_value=self._FakeClient([20, 80, 140]),
+        ):
+            resolved = mod.shared_query_common.resolve_query_inference_model(
+                api_base="https://api-staging.moondream.ai/v1",
+                api_key="test-key",
+                model="",
+                finetune_id="ft-123",
+                checkpoint_step=148,
+                timeout=30.0,
+            )
+        self.assertEqual(resolved.model, "moondream3-preview/ft-123@140")
+        self.assertEqual(resolved.resolved_checkpoint_step, 140)
+
+    def test_unsuffixed_finetuned_model_string_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must include a checkpoint step"):
+            mod.shared_query_common.resolve_query_inference_model(
+                api_base="https://api-staging.moondream.ai/v1",
+                api_key="test-key",
+                model="moondream3-preview/ft-123",
+                finetune_id="",
+                checkpoint_step=None,
+                timeout=30.0,
+            )
 
 
 if __name__ == "__main__":

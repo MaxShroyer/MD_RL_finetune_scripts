@@ -40,6 +40,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from construction_site import query_common as shared_query_common  # noqa: E402
 from tictaktoe_QA import data_loader as dataset_loader  # noqa: E402
 from tictaktoe_QA.task_schema import normalize_task_type  # noqa: E402
 from tictaktoe_QA import train_ttt_query_rl as train_utils  # noqa: E402
@@ -616,11 +617,18 @@ def main(argv: Optional[list[str]] = None) -> None:
         raise ValueError("MOONDREAM_API_KEY is required")
     args.hf_token = dataset_loader.resolve_hf_token(args.hf_token)
 
-    model = _resolve_model_identifier(
-        model=args.model,
-        finetune_id=args.finetune_id,
-        checkpoint_step=args.checkpoint_step,
-    )
+    try:
+        model_resolution = shared_query_common.resolve_query_inference_model(
+            api_base=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
+            finetune_id=args.finetune_id,
+            checkpoint_step=args.checkpoint_step,
+            timeout=args.timeout,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    model = model_resolution.model
 
     dataset_dir: Optional[Path] = None
     if args.dataset_source == "local_jsonl":
@@ -657,6 +665,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     best_move_total = 0
     best_move_set_correct = 0
     best_move_canonical_correct = 0
+    best_move_valid_prediction_count = 0
     best_move_wrong_reward_sum = 0.0
     best_move_wrong_count = 0
     best_move_predicted_move_hist: Counter[str] = Counter()
@@ -751,6 +760,8 @@ def main(argv: Optional[list[str]] = None) -> None:
 
             if item.task_type == "best_move":
                 best_move_total += 1
+                if outcome.best_move_valid_prediction:
+                    best_move_valid_prediction_count += 1
                 move = train_utils._move_from_payload_obj(pred_payload)
                 if move is not None and 1 <= int(move) <= 9:
                     row = ((int(move) - 1) // 3) + 1
@@ -786,6 +797,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                             "task_correct": outcome.task_correct,
                             "best_move_set_correct": outcome.best_move_set_correct,
                             "best_move_canonical_correct": outcome.best_move_canonical_correct,
+                            "best_move_valid_prediction": outcome.best_move_valid_prediction,
                             "exact_non_best_correct": outcome.exact_non_best_correct,
                             "latency_ms": latency_ms,
                             "raw_response": raw_response,
@@ -817,8 +829,16 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     metrics: dict[str, Any] = {
         "model": model,
-        "finetune_id": str(args.finetune_id or ""),
-        "checkpoint_step": int(args.checkpoint_step) if args.checkpoint_step is not None else -1,
+        "finetune_id": str(model_resolution.finetune_id or args.finetune_id or ""),
+        "checkpoint_step": int(model_resolution.resolved_checkpoint_step)
+        if model_resolution.resolved_checkpoint_step is not None
+        else -1,
+        "requested_checkpoint_step": int(model_resolution.requested_checkpoint_step)
+        if model_resolution.requested_checkpoint_step is not None
+        else -1,
+        "resolved_checkpoint_step": int(model_resolution.resolved_checkpoint_step)
+        if model_resolution.resolved_checkpoint_step is not None
+        else -1,
         "config": args.config,
         "split": args.split,
         "dataset_source": args.dataset_source,
@@ -840,6 +860,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         "eval_best_move_set_accuracy": (best_move_set_correct / max(1, best_move_total)),
         "eval_best_move_canonical_accuracy": (
             best_move_canonical_correct / max(1, best_move_total)
+        ),
+        "eval_best_move_valid_prediction_count": float(best_move_valid_prediction_count),
+        "eval_best_move_valid_prediction_rate": (
+            best_move_valid_prediction_count / max(1, best_move_total)
         ),
         "eval_exact_accuracy_non_best_move": (
             non_best_exact_correct / max(1, non_best_total)

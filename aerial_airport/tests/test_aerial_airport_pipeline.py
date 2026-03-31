@@ -17,8 +17,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from MDpi_and_d import train_pid_icons as shared_train
+from aerial_airport import benchmark_aerial_airport_detect as bench_detect_mod
 from aerial_airport import benchmark_aerial_airport_point as bench_mod
 from aerial_airport import build_aerial_airport_hf_dataset as build_mod
+from aerial_airport import runtime_tiling as tiling_mod
+from aerial_airport import train_aerial_airport_detect as train_detect_mod
 from aerial_airport import train_aerial_airport_point as train_mod
 from aerial_airport.common import DEFAULT_CLASS_NAME, DEFAULT_CLASS_UID, DEFAULT_STAGING_API_BASE
 
@@ -547,9 +550,26 @@ class WrapperConfigTests(unittest.TestCase):
     def test_train_tiling_config_parses(self) -> None:
         config_path = REPO_ROOT / "aerial_airport" / "configs" / "train_aerial_airport_point_tiling.json"
         args = train_mod.parse_args(["--config", str(config_path)])
-        self.assertEqual(args.dataset_name, "maxs-m87/aerial_airport_point_tiling_v1")
-        self.assertEqual(args.dataset_path, "aerial_airport/outputs/maxs-m87_aerial_airport_point_tiling_v1")
+        self.assertEqual(args.dataset_name, "maxs-m87/aerial_airport_point_v2")
+        self.assertEqual(args.dataset_path, "aerial_airport/outputs/maxs-m87_aerial_airport_point_v2")
+        self.assertTrue(args.runtime_tiling)
+        self.assertEqual(args.tile_grid_size, 3)
+        self.assertAlmostEqual(args.tile_overlap, 0.1, places=8)
+        self.assertAlmostEqual(args.tile_point_merge_radius, 0.015, places=8)
         self.assertEqual(args.wandb_run_name, "aerial-airport-point-tiling-v1")
+
+    def test_detect_wrapper_defaults_resolve_to_airport_detect_settings(self) -> None:
+        args = train_detect_mod.parse_args([])
+        self.assertEqual(args.dataset_name, "maxs-m87/aerial_airport_point_v2")
+        self.assertEqual(args.env_file, "aerial_airport/.env.staging")
+        self.assertEqual(args.base_url, DEFAULT_STAGING_API_BASE)
+        self.assertEqual(args.dataset_path, "aerial_airport/outputs/maxs-m87_aerial_airport_point_v2")
+        self.assertEqual(args.val_split, "validation")
+        self.assertEqual(args.test_split, "test")
+        self.assertEqual(args.skill, "detect")
+        self.assertEqual(args.selection_metric, "f1")
+        self.assertTrue(args.run_final_test)
+        self.assertEqual(args.max_objects, 150)
 
     def test_benchmark_wrapper_defaults_resolve_to_airport_point_settings(self) -> None:
         args = bench_mod.parse_args([])
@@ -564,10 +584,24 @@ class WrapperConfigTests(unittest.TestCase):
     def test_benchmark_tiling_config_parses(self) -> None:
         config_path = REPO_ROOT / "aerial_airport" / "configs" / "benchmark_aerial_airport_point_tiling.json"
         args = bench_mod.parse_args(["--config", str(config_path)])
-        self.assertEqual(args.dataset_name, "maxs-m87/aerial_airport_point_tiling_v1")
-        self.assertEqual(args.dataset_path, "aerial_airport/outputs/maxs-m87_aerial_airport_point_tiling_v1")
+        self.assertEqual(args.dataset_name, "maxs-m87/aerial_airport_point_v2")
+        self.assertEqual(args.dataset_path, "aerial_airport/outputs/maxs-m87_aerial_airport_point_v2")
+        self.assertTrue(args.runtime_tiling)
+        self.assertEqual(args.tile_grid_size, 3)
+        self.assertAlmostEqual(args.tile_overlap, 0.1, places=8)
+        self.assertAlmostEqual(args.tile_point_merge_radius, 0.015, places=8)
         self.assertEqual(args.viz_dir, "aerial_airport/outputs/benchmark_viz/tiling_point")
         self.assertEqual(args.out_json, "aerial_airport/outputs/benchmarks/benchmark_aerial_airport_point_tiling.json")
+
+    def test_detect_benchmark_wrapper_defaults_resolve_to_airport_detect_settings(self) -> None:
+        args = bench_detect_mod.parse_args([])
+        self.assertEqual(args.dataset_name, "maxs-m87/aerial_airport_point_v2")
+        self.assertEqual(args.env_file, "aerial_airport/.env.staging")
+        self.assertEqual(args.api_base, DEFAULT_STAGING_API_BASE)
+        self.assertEqual(args.dataset_path, "aerial_airport/outputs/maxs-m87_aerial_airport_point_v2")
+        self.assertEqual(args.split, "test")
+        self.assertEqual(args.skill, "detect")
+        self.assertEqual(args.max_objects, 150)
 
     def test_api_key_env_var_precedence_matches_football_pattern(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
@@ -625,7 +659,7 @@ class WrapperConfigTests(unittest.TestCase):
                 json.dumps(
                     {
                         "dataset_name": "custom/aerial-airport",
-                        "api_key_env_var": "MOONDREAM_API_KEY_1",
+                        "api_key_env_var": "CICID_GPUB_MOONDREAM_API_KEY_1",
                         "off_policy": True,
                         "group_size": 4,
                     }
@@ -638,22 +672,22 @@ class WrapperConfigTests(unittest.TestCase):
                     "--config",
                     str(cfg_path),
                     "--api-key-env-var",
-                    "MOONDREAM_API_KEY_4",
+                    "CICID_GPUB_MOONDREAM_API_KEY_4",
                     "--group-size",
                     "6",
                 ]
             )
 
         self.assertEqual(args.dataset_name, "custom/aerial-airport")
-        self.assertEqual(args.api_key_env_var, "MOONDREAM_API_KEY_4")
+        self.assertEqual(args.api_key_env_var, "CICID_GPUB_MOONDREAM_API_KEY_4")
         self.assertEqual(args.group_size, 6)
         self.assertTrue(args.off_policy)
 
         config_root = REPO_ROOT / "aerial_airport" / "configs" / "cicd"
         expectations = {
-            "cicd_train_aerial_airport_point_control.json": (False, False, 1.0, 1.0, 1, 0.95, 0.5, "MOONDREAM_API_KEY_1"),
-            "cicd_train_aerial_airport_point_recall_primary.json": (False, True, 2.0, 1.0, 0, 0.995, 0.15, "MOONDREAM_API_KEY_2"),
-            "cicd_train_aerial_airport_point_recall_offpolicy.json": (True, True, 2.0, 1.0, 0, 0.995, 0.15, "MOONDREAM_API_KEY_3"),
+            "cicd_train_aerial_airport_point_control.json": (False, False, 1.0, 1.0, 1, 0.95, 0.5, "CICID_GPUB_MOONDREAM_API_KEY_1"),
+            "cicd_train_aerial_airport_point_recall_primary.json": (False, True, 2.0, 1.0, 0, 0.995, 0.15, "CICID_GPUB_MOONDREAM_API_KEY_2"),
+            "cicd_train_aerial_airport_point_recall_offpolicy.json": (True, True, 2.0, 1.0, 0, 0.995, 0.15, "CICID_GPUB_MOONDREAM_API_KEY_3"),
         }
         for filename, (
             off_policy,
@@ -687,10 +721,10 @@ class WrapperConfigTests(unittest.TestCase):
     def test_followup_experiment_configs_parse(self) -> None:
         config_root = REPO_ROOT / "aerial_airport" / "configs" / "cicd"
         expectations = {
-            "cicd_train_aerial_airport_point_recall_lr5e4_r8.json": (8, 8, 4, True, False, 5e-4, "MOONDREAM_API_KEY_1", "aerial-airport-point-recall-lr5e4-r8"),
-            "cicd_train_aerial_airport_point_recall_lr2e4_r16.json": (16, 16, 8, False, False, 2e-4, "MOONDREAM_API_KEY_2", "aerial-airport-point-recall-lr2e4-r16"),
-            "cicd_train_aerial_airport_point_recall_lr2e4_r8.json": (8, 8, 4, False, False, 2e-4, "MOONDREAM_API_KEY_3", "aerial-airport-point-recall-lr2e4-r8"),
-            "cicd_train_aerial_airport_point_recall_offpolicy_gentle_lr2e4_r8.json": (8, 8, 4, False, True, 2e-4, "MOONDREAM_API_KEY_4", "aerial-airport-point-recall-offpolicy-gentle-lr2e4-r8"),
+            "cicd_train_aerial_airport_point_recall_lr5e4_r8.json": (8, 8, 4, True, False, 5e-4, "CICID_GPUB_MOONDREAM_API_KEY_1", "aerial-airport-point-recall-lr5e4-r8"),
+            "cicd_train_aerial_airport_point_recall_lr2e4_r16.json": (16, 16, 8, False, False, 2e-4, "CICID_GPUB_MOONDREAM_API_KEY_2", "aerial-airport-point-recall-lr2e4-r16"),
+            "cicd_train_aerial_airport_point_recall_lr2e4_r8.json": (8, 8, 4, False, False, 2e-4, "CICID_GPUB_MOONDREAM_API_KEY_3", "aerial-airport-point-recall-lr2e4-r8"),
+            "cicd_train_aerial_airport_point_recall_offpolicy_gentle_lr2e4_r8.json": (8, 8, 4, False, True, 2e-4, "CICID_GPUB_MOONDREAM_API_KEY_4", "aerial-airport-point-recall-offpolicy-gentle-lr2e4-r8"),
         }
         for filename, (
             rank,
@@ -730,7 +764,7 @@ class WrapperConfigTests(unittest.TestCase):
                 2.0,
                 1.0,
                 0.15,
-                "MOONDREAM_API_KEY_1",
+                "CICID_GPUB_MOONDREAM_API_KEY_1",
                 "aerial-airport-point-v2-recall-anchor-explicit",
             ),
             "cicd_train_aerial_airport_point_v2_recall_anchor_lowlr.json": (
@@ -741,7 +775,7 @@ class WrapperConfigTests(unittest.TestCase):
                 2.0,
                 1.0,
                 0.15,
-                "MOONDREAM_API_KEY_2",
+                "CICID_GPUB_MOONDREAM_API_KEY_2",
                 "aerial-airport-point-v2-recall-anchor-lowlr",
             ),
             "cicd_train_aerial_airport_point_v2_recall_precision_pressure.json": (
@@ -752,7 +786,7 @@ class WrapperConfigTests(unittest.TestCase):
                 2.0,
                 2.0,
                 0.5,
-                "MOONDREAM_API_KEY_3",
+                "CICID_GPUB_MOONDREAM_API_KEY_3",
                 "aerial-airport-point-v2-recall-precision-pressure",
             ),
             "cicd_train_aerial_airport_point_v2_recall_linear_fn.json": (
@@ -763,7 +797,7 @@ class WrapperConfigTests(unittest.TestCase):
                 1.0,
                 1.0,
                 0.15,
-                "MOONDREAM_API_KEY_1",
+                "CICID_GPUB_MOONDREAM_API_KEY_1",
                 "aerial-airport-point-v2-recall-linear-fn",
             ),
             "cicd_train_aerial_airport_point_v2_recall_precision_offpolicy_light.json": (
@@ -774,7 +808,7 @@ class WrapperConfigTests(unittest.TestCase):
                 2.0,
                 2.0,
                 0.5,
-                "MOONDREAM_API_KEY_4",
+                "CICID_GPUB_MOONDREAM_API_KEY_4",
                 "aerial-airport-point-v2-recall-precision-offpolicy-light",
             ),
         }
@@ -819,7 +853,7 @@ class WrapperConfigTests(unittest.TestCase):
                 2.0,
                 1.0,
                 0.15,
-                "MOONDREAM_API_KEY_1",
+                "CICID_GPUB_MOONDREAM_API_KEY_1",
                 "aerial-airport-point-tiling-v1-recall-anchor-explicit",
             ),
             "cicd_train_aerial_airport_point_tiling_v1_recall_anchor_lowlr.json": (
@@ -828,8 +862,17 @@ class WrapperConfigTests(unittest.TestCase):
                 2.0,
                 1.0,
                 0.15,
-                "MOONDREAM_API_KEY_2",
+                "CICID_GPUB_MOONDREAM_API_KEY_2",
                 "aerial-airport-point-tiling-v1-recall-anchor-lowlr",
+            ),
+            "cicd_train_aerial_airport_point_tiling_v1_recall_anchor_r32_b32_lowlr.json": (
+                False,
+                5e-5,
+                2.0,
+                1.0,
+                0.15,
+                "CICID_GPUB_MOONDREAM_API_KEY_2",
+                "aerial-airport-point-tiling-v1-recall-anchor-r32-b32-lowlr",
             ),
             "cicd_train_aerial_airport_point_tiling_v1_recall_precision_pressure.json": (
                 False,
@@ -837,7 +880,7 @@ class WrapperConfigTests(unittest.TestCase):
                 2.0,
                 2.0,
                 0.5,
-                "MOONDREAM_API_KEY_3",
+                "CICID_GPUB_MOONDREAM_API_KEY_3",
                 "aerial-airport-point-tiling-v1-recall-precision-pressure",
             ),
             "cicd_train_aerial_airport_point_tiling_v1_recall_precision_offpolicy_light.json": (
@@ -846,7 +889,7 @@ class WrapperConfigTests(unittest.TestCase):
                 2.0,
                 2.0,
                 0.5,
-                "MOONDREAM_API_KEY_4",
+                "CICID_GPUB_MOONDREAM_API_KEY_4",
                 "aerial-airport-point-tiling-v1-recall-precision-offpolicy-light",
             ),
         }
@@ -861,14 +904,21 @@ class WrapperConfigTests(unittest.TestCase):
         ) in expectations.items():
             with self.subTest(config=filename):
                 args = train_mod.parse_args(["--config", str(config_root / filename)])
-                self.assertEqual(args.dataset_name, "maxs-m87/aerial_airport_point_tiling_v1")
-                self.assertEqual(args.dataset_path, "aerial_airport/outputs/maxs-m87_aerial_airport_point_tiling_v1")
-                self.assertEqual(args.rank, 16)
-                self.assertEqual(args.batch_size, 16)
+                self.assertEqual(args.dataset_name, "maxs-m87/aerial_airport_point_v2")
+                self.assertEqual(args.dataset_path, "aerial_airport/outputs/maxs-m87_aerial_airport_point_v2")
+                expected_rank = 32 if "r32_b32" in filename else 16
+                expected_batch_size = 32 if "r32_b32" in filename else 16
+                self.assertEqual(args.rank, expected_rank)
+                self.assertEqual(args.batch_size, expected_batch_size)
                 self.assertEqual(args.group_size, 8)
                 self.assertAlmostEqual(args.lr, lr, places=8)
                 self.assertEqual(args.off_policy, off_policy)
                 self.assertFalse(args.use_recall_first_preset)
+                self.assertEqual(args.selection_metric, "f1")
+                self.assertTrue(args.runtime_tiling)
+                self.assertEqual(args.tile_grid_size, 3)
+                self.assertAlmostEqual(args.tile_overlap, 0.1, places=8)
+                self.assertAlmostEqual(args.tile_point_merge_radius, 0.015, places=8)
                 self.assertAlmostEqual(args.fn_penalty_exponent, fn_exp, places=8)
                 self.assertAlmostEqual(args.fp_penalty_exponent, fp_exp, places=8)
                 self.assertEqual(args.neg_prompts_per_empty, 1)
@@ -876,9 +926,202 @@ class WrapperConfigTests(unittest.TestCase):
                 self.assertAlmostEqual(args.neg_reward_weight, neg_reward_weight, places=8)
                 self.assertEqual(args.api_key_env_var, api_key_env_var)
                 self.assertEqual(args.wandb_run_name, wandb_run_name)
-                self.assertEqual(args.num_steps, 120)
+                self.assertEqual(args.num_steps, 300 if "anchor_plus" not in filename else 500)
                 self.assertEqual(args.eval_every, 5)
                 self.assertEqual(args.save_every, 5)
+
+    def test_detect_tiling_round1_configs_parse(self) -> None:
+        config_root = REPO_ROOT / "aerial_airport" / "configs" / "tiling_round1"
+        expectations = {
+            "cicd_train_aerial_airport_detect_v1_control.json": (False, 1e-4, 300, 1.0, "CICID_GPUB_MOONDREAM_API_KEY_1"),
+            "cicd_train_aerial_airport_detect_v1_runtime_tiling.json": (True, 1e-4, 300, 1.0, "CICID_GPUB_MOONDREAM_API_KEY_2"),
+            "cicd_train_aerial_airport_detect_v1_runtime_tiling_fn_focus.json": (True, 1e-4, 300, 2.0, "CICID_GPUB_MOONDREAM_API_KEY_3"),
+            "cicd_train_aerial_airport_detect_v1_runtime_tiling_lowlr_long.json": (True, 5e-5, 500, 2.0, "CICID_GPUB_MOONDREAM_API_KEY_4"),
+        }
+        for filename, (runtime_tiling, lr, num_steps, fn_exp, api_key_env_var) in expectations.items():
+            with self.subTest(config=filename):
+                args = train_detect_mod.parse_args(["--config", str(config_root / filename)])
+                self.assertEqual(args.dataset_name, "maxs-m87/aerial_airport_point_v2")
+                self.assertEqual(args.dataset_path, "aerial_airport/outputs/maxs-m87_aerial_airport_point_v2")
+                self.assertEqual(args.skill, "detect")
+                self.assertEqual(args.selection_metric, "f1")
+                self.assertEqual(args.rank, 16)
+                self.assertEqual(args.batch_size, 8)
+                self.assertEqual(args.group_size, 4)
+                self.assertAlmostEqual(args.lr, lr, places=8)
+                self.assertEqual(args.num_steps, num_steps)
+                self.assertEqual(args.runtime_tiling, runtime_tiling)
+                self.assertAlmostEqual(args.tile_overlap, 0.1, places=8)
+                self.assertAlmostEqual(args.tile_box_merge_iou, 0.5, places=8)
+                self.assertAlmostEqual(args.fn_penalty_exponent, fn_exp, places=8)
+                self.assertEqual(args.max_objects, 150)
+                self.assertEqual(args.neg_prompts_per_empty, 1)
+                self.assertEqual(args.neg_prompts_per_nonempty, 0)
+                self.assertAlmostEqual(args.neg_reward_weight, 0.15, places=8)
+                self.assertTrue(args.run_final_test)
+                self.assertEqual(args.api_key_env_var, api_key_env_var)
+
+
+class RuntimeTilingTests(unittest.TestCase):
+    def test_runtime_tiling_windows_cover_full_image_with_expected_overlap(self) -> None:
+        windows = tiling_mod.build_tile_windows(width=100, height=100, grid_size=3, overlap=0.1)
+        self.assertEqual(len(windows), 9)
+        first = windows[0]
+        second = windows[1]
+        last = windows[-1]
+        self.assertAlmostEqual(first.x_min, 0.0, places=8)
+        self.assertAlmostEqual(first.y_min, 0.0, places=8)
+        self.assertAlmostEqual(last.x_max, 1.0, places=8)
+        self.assertAlmostEqual(last.y_max, 1.0, places=8)
+        self.assertLess(second.x_min, first.x_max)
+        self.assertAlmostEqual(first.x_max - second.x_min, 0.0357142857, places=6)
+
+    def test_runtime_tiling_point_merge_collapses_boundary_duplicates(self) -> None:
+        merged = tiling_mod.merge_points(
+            [
+                tiling_mod.Point2D(x=0.34, y=0.34),
+                tiling_mod.Point2D(x=0.345, y=0.345),
+                tiling_mod.Point2D(x=0.80, y=0.80),
+            ],
+            radius=0.015,
+        )
+        self.assertEqual(len(merged), 2)
+        self.assertTrue(any(abs(point.x - 0.3425) < 1e-6 for point in merged))
+        self.assertTrue(any(abs(point.x - 0.80) < 1e-6 for point in merged))
+
+    def test_runtime_tiling_box_merge_clusters_overlap_duplicates(self) -> None:
+        merged = tiling_mod.merge_boxes(
+            [
+                tiling_mod.Box2D(x_min=0.30, y_min=0.30, x_max=0.40, y_max=0.40),
+                tiling_mod.Box2D(x_min=0.31, y_min=0.30, x_max=0.41, y_max=0.40),
+                tiling_mod.Box2D(x_min=0.70, y_min=0.70, x_max=0.80, y_max=0.80),
+            ],
+            iou_threshold=0.5,
+        )
+        self.assertEqual(len(merged), 2)
+        self.assertTrue(any(abs(box.x_min - 0.305) < 1e-6 for box in merged))
+        self.assertTrue(any(abs(box.x_min - 0.70) < 1e-6 for box in merged))
+
+    def test_benchmark_runtime_tiling_visualization_marks_removed_duplicates(self) -> None:
+        tile_windows = tiling_mod.build_tile_windows(width=100, height=100, grid_size=3, overlap=0.1)
+        raw_points = [
+            bench_mod._RuntimeMappedPoint(point=bench_mod.Point(x=0.34, y=0.34), tile_row=0, tile_col=0),
+            bench_mod._RuntimeMappedPoint(point=bench_mod.Point(x=0.345, y=0.345), tile_row=0, tile_col=1),
+            bench_mod._RuntimeMappedPoint(point=bench_mod.Point(x=0.80, y=0.80), tile_row=2, tile_col=2),
+        ]
+        merged_points, removed_duplicate_indices = bench_mod._cluster_runtime_mapped_points(
+            raw_points,
+            radius=0.015,
+        )
+
+        self.assertEqual(len(merged_points), 2)
+        self.assertEqual(removed_duplicate_indices, {1})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = bench_mod._save_task_visualization(
+                out_dir=Path(tmp),
+                label="candidate",
+                sample_idx=0,
+                task=bench_mod.TaskSample(
+                    image=Image.new("RGB", (100, 100), color=(255, 255, 255)),
+                    prompt="airplane",
+                    gt_boxes=[bench_mod.Box(x_min=0.30, y_min=0.30, x_max=0.38, y_max=0.38)],
+                    class_name=DEFAULT_CLASS_NAME,
+                    sample_id="viz-sample",
+                ),
+                pred_points=merged_points,
+                f1=1.0,
+                tp=1,
+                fp=0,
+                fn=0,
+                runtime_tiling_viz=bench_mod._RuntimeTilingViz(
+                    tile_windows=tile_windows,
+                    raw_points=raw_points,
+                    removed_duplicate_indices=removed_duplicate_indices,
+                ),
+            )
+
+            self.assertIsNotNone(out_path)
+            assert out_path is not None
+            viz_path = Path(out_path)
+            self.assertTrue(viz_path.exists())
+            self.assertGreater(viz_path.stat().st_size, 0)
+
+    def test_shared_eval_runtime_tiling_merges_boundary_points_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "positive.jpg"
+            _write_image(image_path, size=(100, 100))
+            positive_row = {
+                "image": Image.open(image_path).convert("RGB"),
+                "answer_boxes": json.dumps(
+                    [
+                        {
+                            "x_min": 0.32,
+                            "y_min": 0.32,
+                            "x_max": 0.36,
+                            "y_max": 0.36,
+                            "class_uid": DEFAULT_CLASS_UID,
+                            "class_name": DEFAULT_CLASS_NAME,
+                            "source_class_name": DEFAULT_CLASS_NAME,
+                        }
+                    ]
+                ),
+                "source_collection": "unit",
+                "source_dataset": "unit",
+                "class_count": 1,
+            }
+
+            tile_windows = tiling_mod.build_tile_windows(width=100, height=100, grid_size=3, overlap=0.1)
+
+            def _fake_rollouts(*args, **kwargs):
+                requests = kwargs["requests"]
+                self.assertEqual(len(requests), 9)
+                outputs = []
+                for tile_index, window in enumerate(tile_windows):
+                    if tile_index in {0, 1, 3, 4}:
+                        local_x = (0.34 - window.x_min) / (window.x_max - window.x_min)
+                        local_y = (0.34 - window.y_min) / (window.y_max - window.y_min)
+                        points = [shared_train.PointAnnotation(x=local_x, y=local_y)]
+                    else:
+                        points = []
+                    outputs.append(
+                        SimpleNamespace(
+                            rollouts=[SimpleNamespace(output=shared_train.PointOutput(points=points))]
+                        )
+                    )
+                return outputs
+
+            with patch.object(shared_train, "_rollouts_batch_with_retry", side_effect=_fake_rollouts):
+                metrics = shared_train._evaluate(
+                    finetune=object(),
+                    eval_rows=[positive_row],
+                    all_class_names=[DEFAULT_CLASS_NAME],
+                    rng=shared_train.random.Random(42),
+                    neg_prompts_per_empty=1,
+                    neg_prompts_per_nonempty=0,
+                    max_samples=10,
+                    batch_size=1,
+                    max_workers=9,
+                    rollout_retries=0,
+                    rollout_retry_backoff_s=0.1,
+                    temperature=0.0,
+                    top_p=1.0,
+                    max_tokens=16,
+                    max_objects=10,
+                    skill="point",
+                    point_prompt_style="class_name",
+                    reasoning=False,
+                    runtime_tiling=True,
+                    tile_grid_size=3,
+                    tile_overlap=0.1,
+                    tile_point_merge_radius=0.015,
+                    tile_box_merge_iou=0.5,
+                )
+
+        self.assertEqual(metrics["eval_tp"], 1)
+        self.assertEqual(metrics["eval_fp"], 0)
+        self.assertEqual(metrics["eval_fn"], 0)
+        self.assertAlmostEqual(metrics["eval_f1"], 1.0, places=8)
 
 class SmokeTests(unittest.TestCase):
     def test_single_class_point_runs_emit_inert_knob_warnings(self) -> None:
@@ -1015,6 +1258,11 @@ class SmokeTests(unittest.TestCase):
                     skill="point",
                     point_prompt_style="class_name",
                     reasoning=False,
+                    runtime_tiling=False,
+                    tile_grid_size=3,
+                    tile_overlap=0.1,
+                    tile_point_merge_radius=0.015,
+                    tile_box_merge_iou=0.5,
                 )
 
         self.assertEqual(metrics["eval_positive_tasks"], 1)
@@ -1082,7 +1330,7 @@ class SmokeTests(unittest.TestCase):
             )
             out_json = Path(tmp) / "bench.json"
 
-            with patch("MDpi_and_d.benchmark_pid_icons._call_point_api", return_value=[]):
+            with patch("aerial_airport.benchmark_aerial_airport_point._call_point_api", return_value=[]):
                 bench_mod.main(
                     [
                         "--dataset-path",

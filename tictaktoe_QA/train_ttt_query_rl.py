@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""Query-skill RL finetuning for TicTacToe QA."""
+"""Query RL finetuning example for TicTacToe QA.
+
+Requires:
+  pip install datasets pillow python-dotenv wandb
+"""
 
 from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import os
 import random
+import re
 import shlex
 import subprocess
+from statistics import fmean, pvariance
 import string
 import sys
 import time
@@ -19,7 +26,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-import numpy as np
 from dotenv import load_dotenv
 from PIL import Image
 
@@ -64,31 +70,52 @@ except ModuleNotFoundError:  # pragma: no cover
     wandb = _WandbShim()
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
+if __package__ in {None, ""} and str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tictaktoe_QA import data_loader as dataset_loader  # noqa: E402
-from tictaktoe_QA.task_schema import (  # noqa: E402
-    CANONICAL_TASK_TYPES,
-    normalize_answer_payload_for_task,
-    normalize_task_type,
-)
 from tuna_sdk import QueryOutput, QueryRequest, QuerySettings, TunaClient  # noqa: E402
 from tuna_sdk.errors import TunaAPIError, TunaNetworkError  # noqa: E402
 
 DEFAULT_BASE_URL = "https://api.moondream.ai/v1"
-DEFAULT_DATASET_SOURCE = dataset_loader.DEFAULT_DATASET_SOURCE
-DEFAULT_HF_DATASET_REPO_ID = dataset_loader.DEFAULT_HF_DATASET_REPO_ID
-DEFAULT_HF_DATASET_REVISION = dataset_loader.DEFAULT_HF_DATASET_REVISION
+DEFAULT_DATASET_SOURCE = "hf_hub"
+SUPPORTED_DATASET_SOURCES = ("hf_hub", "local_jsonl")
+DEFAULT_HF_DATASET_REPO_ID = "maxs-m87/tictactoe-qa-v1"
+DEFAULT_HF_DATASET_REVISION = "main"
 DEFAULT_FINAL_EVAL_SPLITS = [
     "val",
-    "test",
-    "benchmark_top50_canonical",
-    "benchmark_top50_paraphrase",
+    "test"
 ]
-DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "query_rl_default.json"
 DEFAULT_REASONING = False
-DEFAULT_BENCHMARK_CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "benchmark_default.json"
+
+CANONICAL_TASK_TYPES: tuple[str, ...] = (
+    "best_move",
+    "has_winning_move",
+    "turn_player",
+    "winner",
+    "is_game_over",
+    "available_moves_count",
+    "available_moves_list",
+)
+TASK_TYPE_ALIASES: dict[str, str] = {
+    "is_terminal": "is_game_over",
+    "legal_moves_count": "available_moves_count",
+    "legal_moves_list": "available_moves_list",
+}
+TASK_TYPE_SET = set(CANONICAL_TASK_TYPES)
+ANSWER_KEY_ALIASES: dict[str, dict[str, str]] = {
+    "is_game_over": {
+        "is_game_over": "is_game_over",
+        "is_terminal": "is_game_over",
+    },
+    "available_moves_count": {
+        "available_move_count": "available_move_count",
+        "legal_move_count": "available_move_count",
+    },
+    "available_moves_list": {
+        "available_moves": "available_moves",
+        "legal_moves": "available_moves",
+    },
+}
 
 SUPPORTED_TASKS = set(CANONICAL_TASK_TYPES)
 DEFAULT_TASK_SAMPLING_WEIGHTS: dict[str, float] = {
@@ -103,6 +130,8 @@ MAIN_TRAIN_WANDB_METRIC_KEYS = (
     "reward_mean",
     "train_json_object_rate",
     "train_json_parse_rate",
+    "train_best_move_valid_prediction_count",
+    "train_best_move_valid_prediction_rate",
     "off_policy_group_fraction",
     "replay_buffer_size",
     "kl",
@@ -114,7 +143,8 @@ MAIN_EVAL_WANDB_METRIC_KEYS = (
     "eval_json_parse_rate",
     "eval_best_move_set_accuracy",
     "eval_best_move_canonical_accuracy",
-    "eval_exact_accuracy_non_best_move",
+    "eval_best_move_valid_prediction_count",
+    "eval_best_move_valid_prediction_rate",
     "eval_best_move_center_prediction_rate",
     "eval_best_move_invalid_prediction_rate",
 )
@@ -122,7 +152,6 @@ CHECKPOINT_AVG_METRIC_CHOICES = (
     "eval_reward_mean",
     "eval_best_move_set_accuracy",
     "eval_best_move_canonical_accuracy",
-    "eval_exact_accuracy_non_best_move",
     "eval_json_parse_rate",
 )
 BEST_MOVE_REWARD_MODES = ("ranked", "hybrid_strict", "binary")
@@ -146,6 +175,7 @@ REQUIRED_ROW_FIELDS = (
 
 TRAIN_CONFIG_ALLOWED_KEYS = {
     "api_key",
+    "api_key_env_var",
     "auto_benchmark_best_checkpoint",
     "auto_benchmark_config",
     "auto_benchmark_output_json",
@@ -209,14 +239,14 @@ TRAIN_CONFIG_ALLOWED_KEYS = {
     "task_sampling_weights",
     "temperature",
     "top_p",
+    "train_max_samples",
     "train_split",
+    "train_subset_seed",
     "val_split",
     "wandb_project",
     "wandb_run_name",
     "wandb_log_profile",
 }
-
-EARLY_STOP_MODES = ("conservative", "balanced", "aggressive")
 
 
 @dataclass(frozen=True)
@@ -231,6 +261,7 @@ class QAExample:
     best_move_optimal_set: frozenset[int]
     # Tuple entries are (move, value, depth), parsed from scores_by_move_json.
     best_move_scores: tuple[tuple[int, int, int], ...] = tuple()
+    best_move_legal_moves: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -242,10 +273,286 @@ class ScoreOutcome:
     best_move_set_correct: bool = False
     best_move_canonical_correct: bool = False
     exact_non_best_correct: bool = False
+    best_move_valid_prediction: bool = False
 
 
 def _repo_relative(*parts: str) -> Path:
     return Path(__file__).resolve().parent.joinpath(*parts)
+
+
+def _default_config_path() -> Path:
+    return _repo_relative("configs", "query_rl_default.json")
+
+
+def _default_benchmark_config_path() -> Path:
+    return _repo_relative("configs", "benchmark_default.json")
+
+
+def normalize_task_type(task_type: str, *, allow_unknown: bool = False) -> str:
+    normalized = TASK_TYPE_ALIASES.get(str(task_type).strip(), str(task_type).strip())
+    if normalized in TASK_TYPE_SET:
+        return normalized
+    if allow_unknown:
+        return normalized
+    raise ValueError(f"unknown task_type: {task_type}")
+
+
+def normalize_answer_payload_for_task(task_type: str, payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+
+    canonical_task = normalize_task_type(task_type, allow_unknown=True)
+    aliases = ANSWER_KEY_ALIASES.get(canonical_task)
+    if not aliases:
+        return payload
+
+    out: dict[str, Any] = {}
+    for old_key, canonical_key in aliases.items():
+        if old_key in payload and canonical_key not in out:
+            out[canonical_key] = payload[old_key]
+
+    if out:
+        return out
+    return payload
+
+
+def resolve_hf_token(raw_token: str) -> str:
+    token = str(raw_token or "").strip()
+    if token:
+        return token
+    return (
+        os.environ.get("HF_TOKEN", "").strip()
+        or os.environ.get("HUGGINGFACE_HUB_TOKEN", "").strip()
+    )
+
+
+def normalize_dataset_source(raw_source: str) -> str:
+    value = str(raw_source or "").strip().lower()
+    if value in SUPPORTED_DATASET_SOURCES:
+        return value
+    raise ValueError(
+        f"dataset_source must be one of {sorted(SUPPORTED_DATASET_SOURCES)}, got: {raw_source!r}"
+    )
+
+
+def _safe_component(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip())
+    return cleaned or "default"
+
+
+def _resolve_hf_cache_dir(raw_cache_dir: str) -> Path:
+    text = str(raw_cache_dir or "").strip()
+    if text:
+        return Path(text).expanduser().resolve()
+    return (Path.cwd() / ".cache" / "tictaktoe_QA").resolve()
+
+
+def _persist_image_bytes(
+    image_bytes: bytes,
+    *,
+    image_cache_root: Path,
+) -> Optional[Path]:
+    if not image_bytes:
+        return None
+
+    digest = hashlib.sha1(image_bytes).hexdigest()  # noqa: S324
+    out_path = image_cache_root / f"{digest}.png"
+    if out_path.exists():
+        return out_path.resolve()
+
+    image_cache_root.mkdir(parents=True, exist_ok=True)
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            img.convert("RGB").save(out_path, format="PNG")
+        return out_path.resolve()
+    except OSError:
+        fallback = image_cache_root / f"{digest}.img"
+        if not fallback.exists():
+            fallback.write_bytes(image_bytes)
+        return fallback.resolve()
+
+
+def _resolve_path_candidate(raw_path: str, *, dataset_dir: Optional[Path]) -> Optional[Path]:
+    text = str(raw_path or "").strip()
+    if not text:
+        return None
+
+    path = Path(text).expanduser()
+    if path.is_file():
+        return path.resolve()
+
+    if not path.is_absolute() and dataset_dir is not None:
+        joined = (dataset_dir / path).resolve()
+        if joined.is_file():
+            return joined
+
+    return None
+
+
+def _resolve_hf_row_image_path(
+    row: dict[str, Any],
+    *,
+    dataset_dir: Optional[Path],
+    image_cache_root: Path,
+) -> Optional[Path]:
+    for key in ("image_path", "image"):
+        value = row.get(key)
+        if isinstance(value, str):
+            resolved = _resolve_path_candidate(value, dataset_dir=dataset_dir)
+            if resolved is not None:
+                return resolved
+
+    image_payload = row.get("image")
+    if isinstance(image_payload, dict):
+        payload_path = image_payload.get("path")
+        if isinstance(payload_path, str):
+            resolved = _resolve_path_candidate(payload_path, dataset_dir=dataset_dir)
+            if resolved is not None:
+                return resolved
+
+        payload_bytes = image_payload.get("bytes")
+        if isinstance(payload_bytes, (bytes, bytearray)):
+            return _persist_image_bytes(
+                bytes(payload_bytes),
+                image_cache_root=image_cache_root,
+            )
+
+    if isinstance(image_payload, (bytes, bytearray)):
+        return _persist_image_bytes(
+            bytes(image_payload),
+            image_cache_root=image_cache_root,
+        )
+
+    return None
+
+
+def _load_local_jsonl_rows(*, dataset_dir: Path, split_name: str) -> list[dict[str, Any]]:
+    path = dataset_dir / "jsonl" / f"{split_name}.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(f"split JSONL not found: {path}")
+
+    rows: list[dict[str, Any]] = []
+    skipped = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSON in {path}:{line_number}: {exc}") from exc
+            if not isinstance(payload, dict):
+                skipped += 1
+                continue
+            rows.append(payload)
+
+    print(f"loaded split={split_name} rows={len(rows)} skipped={skipped} from {path}")
+    return rows
+
+
+def _load_hf_rows(
+    *,
+    split_name: str,
+    dataset_dir: Optional[Path],
+    hf_dataset_repo_id: str,
+    hf_dataset_revision: str,
+    hf_token: str,
+    hf_cache_dir: str,
+) -> list[dict[str, Any]]:
+    try:
+        from datasets import Image as HFImage  # type: ignore
+        from datasets import load_dataset  # type: ignore
+    except ModuleNotFoundError as exc:  # pragma: no cover
+        raise ModuleNotFoundError(
+            "datasets is required for dataset_source='hf_hub'. Install with: pip install datasets"
+        ) from exc
+
+    cache_dir = _resolve_hf_cache_dir(hf_cache_dir)
+    repo_id = str(hf_dataset_repo_id or "").strip()
+    if not repo_id:
+        raise ValueError("hf_dataset_repo_id is required when dataset_source='hf_hub'")
+
+    revision = str(hf_dataset_revision or DEFAULT_HF_DATASET_REVISION).strip() or DEFAULT_HF_DATASET_REVISION
+    resolved_token = resolve_hf_token(hf_token)
+
+    load_kwargs: dict[str, Any] = {
+        "split": split_name,
+        "revision": revision,
+        "cache_dir": str(cache_dir),
+    }
+    if resolved_token:
+        load_kwargs["token"] = resolved_token
+
+    try:
+        ds = load_dataset(repo_id, **load_kwargs)
+    except TypeError:
+        token_value = load_kwargs.pop("token", None)
+        if token_value:
+            load_kwargs["use_auth_token"] = token_value
+        ds = load_dataset(repo_id, **load_kwargs)
+
+    if "image" in getattr(ds, "column_names", []):
+        ds = ds.cast_column("image", HFImage(decode=False))
+
+    image_cache_root = (
+        cache_dir
+        / "hf_images"
+        / _safe_component(repo_id)
+        / _safe_component(revision)
+        / _safe_component(split_name)
+    )
+
+    rows: list[dict[str, Any]] = []
+    skipped = 0
+    for raw_row in ds:
+        if not isinstance(raw_row, dict):
+            skipped += 1
+            continue
+
+        row = dict(raw_row)
+        image_path = _resolve_hf_row_image_path(
+            row,
+            dataset_dir=dataset_dir,
+            image_cache_root=image_cache_root,
+        )
+        if image_path is not None:
+            row["image_path"] = str(image_path)
+            row["image"] = str(image_path)
+        rows.append(row)
+
+    print(
+        "loaded split="
+        f"{split_name} rows={len(rows)} skipped={skipped} "
+        f"from hf_hub repo={repo_id} revision={revision}"
+    )
+    return rows
+
+
+def load_split_rows(
+    *,
+    dataset_source: str,
+    split_name: str,
+    dataset_dir: Optional[Path],
+    hf_dataset_repo_id: str,
+    hf_dataset_revision: str,
+    hf_token: str,
+    hf_cache_dir: str,
+) -> list[dict[str, Any]]:
+    source = normalize_dataset_source(dataset_source)
+    if source == "local_jsonl":
+        if dataset_dir is None:
+            raise ValueError("dataset_dir is required when dataset_source='local_jsonl'")
+        return _load_local_jsonl_rows(dataset_dir=dataset_dir, split_name=split_name)
+
+    return _load_hf_rows(
+        split_name=split_name,
+        dataset_dir=dataset_dir,
+        hf_dataset_repo_id=hf_dataset_repo_id,
+        hf_dataset_revision=hf_dataset_revision,
+        hf_token=hf_token,
+        hf_cache_dir=hf_cache_dir,
+    )
 
 
 def _random_suffix(length: int = 6) -> str:
@@ -275,7 +582,7 @@ def _resolve_config_path(raw_path: str) -> Path:
 
 def _load_json_config(config_path: Path) -> dict[str, Any]:
     if not config_path.exists():
-        if config_path == DEFAULT_CONFIG_PATH:
+        if config_path == _default_config_path():
             return {}
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
@@ -677,15 +984,23 @@ def _resolve_intra_task_sampling(
 
 
 def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="RL query finetuning for TicTacToe QA")
-    parser.add_argument("--config", default=str(config_path))
+    parser = argparse.ArgumentParser(
+        description="Query RL finetuning for TicTacToe QA.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--config",
+        default=str(config_path),
+        help="JSON config file. CLI flags override config values.",
+    )
     parser.add_argument("--env-file", default=_cfg_str(config, "env_file", str(_repo_relative(".env"))))
     parser.add_argument("--api-key", default=_cfg_str(config, "api_key", ""))
+    parser.add_argument("--api-key-env-var", default=_cfg_str(config, "api_key_env_var", ""))
     parser.add_argument("--base-url", default=_cfg_str(config, "base_url", ""))
 
     parser.add_argument(
         "--dataset-source",
-        choices=sorted(dataset_loader.SUPPORTED_DATASET_SOURCES),
+        choices=sorted(SUPPORTED_DATASET_SOURCES),
         default=_cfg_str(config, "dataset_source", DEFAULT_DATASET_SOURCE),
         help="Dataset source: HF Hub or local JSONL directory.",
     )
@@ -705,6 +1020,18 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
     parser.add_argument("--hf-token", default=_cfg_str(config, "hf_token", ""))
     parser.add_argument("--hf-cache-dir", default=_cfg_str(config, "hf_cache_dir", ""))
     parser.add_argument("--train-split", default=_cfg_str(config, "train_split", "train"))
+    parser.add_argument(
+        "--train-max-samples",
+        type=int,
+        default=_cfg_int(config, "train_max_samples", 0),
+        help="Max train samples to keep after loading. <=0 means full split.",
+    )
+    parser.add_argument(
+        "--train-subset-seed",
+        type=int,
+        default=_cfg_int(config, "train_subset_seed", -1),
+        help="Seed for deterministic train subset selection. <0 reuses --seed.",
+    )
     parser.add_argument("--val-split", default=_cfg_str(config, "val_split", "val"))
     parser.add_argument(
         "--final-eval-splits",
@@ -970,7 +1297,7 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
     parser.set_defaults(early_stop=_cfg_bool(config, "early_stop", False))
     parser.add_argument(
         "--early-stop-mode",
-        choices=list(EARLY_STOP_MODES),
+        choices=["conservative", "balanced", "aggressive"],
         default=_cfg_str(config, "early_stop_mode", "balanced"),
         help="Threshold profile for early-stop collapse/plateau checks.",
     )
@@ -1006,7 +1333,7 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
     )
     parser.add_argument(
         "--auto-benchmark-config",
-        default=_cfg_str(config, "auto_benchmark_config", str(DEFAULT_BENCHMARK_CONFIG_PATH)),
+        default=_cfg_str(config, "auto_benchmark_config", str(_default_benchmark_config_path())),
         help="Benchmark config file used for automatic post-training benchmark.",
     )
     parser.add_argument(
@@ -1040,7 +1367,7 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     pre_parser = argparse.ArgumentParser(add_help=False)
-    pre_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
+    pre_parser.add_argument("--config", default=str(_default_config_path()))
     pre_args, _ = pre_parser.parse_known_args(argv)
 
     config_path = _resolve_config_path(pre_args.config)
@@ -1094,6 +1421,20 @@ def _resolve_env_file(env_file: str) -> str:
     return str(from_cwd)
 
 
+def _resolve_api_key(*, explicit_api_key: str, api_key_env_var: str) -> str:
+    direct = str(explicit_api_key or "").strip()
+    if direct:
+        return direct
+
+    env_var_name = str(api_key_env_var or "").strip()
+    if env_var_name:
+        resolved = os.environ.get(env_var_name, "").strip()
+        if resolved:
+            return resolved
+
+    return os.environ.get("MOONDREAM_API_KEY", "").strip()
+
+
 def _resolve_output_path(raw_path: str, *, fallback_name: str) -> Path:
     text = str(raw_path or "").strip()
     if text:
@@ -1105,7 +1446,7 @@ def _resolve_output_path(raw_path: str, *, fallback_name: str) -> Path:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
-    args.dataset_source = dataset_loader.normalize_dataset_source(args.dataset_source)
+    args.dataset_source = normalize_dataset_source(args.dataset_source)
     if args.num_steps < 0:
         raise ValueError("--num-steps must be >= 0")
     if args.resume_step < 0:
@@ -1128,6 +1469,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--eval-top-p must be in (0,1] when set")
     if args.max_tokens <= 0:
         raise ValueError("--max-tokens must be > 0")
+    if args.train_max_samples < 0:
+        raise ValueError("--train-max-samples must be >= 0")
     if args.eval_every < 0:
         raise ValueError("--eval-every must be >= 0")
     if args.save_every < 0:
@@ -1166,8 +1509,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--center-bias-gate-min-best-move-samples must be > 0")
     if args.wandb_log_profile not in WANDB_LOG_PROFILES:
         raise ValueError(f"--wandb-log-profile must be one of {list(WANDB_LOG_PROFILES)}")
-    if args.early_stop_mode not in EARLY_STOP_MODES:
-        raise ValueError(f"--early-stop-mode must be one of {list(EARLY_STOP_MODES)}")
     if not args.checkpoint_avg_splits:
         raise ValueError("--checkpoint-avg-splits must contain at least one split")
 
@@ -1358,6 +1699,24 @@ def _scores_by_move_from_json(payload_json: str) -> tuple[tuple[int, int, int], 
     return tuple(out)
 
 
+def _best_move_prediction_is_valid(
+    move: Optional[int],
+    *,
+    example: QAExample,
+) -> bool:
+    if move is None:
+        return False
+
+    legal_moves = example.best_move_legal_moves
+    if legal_moves:
+        return move in legal_moves
+
+    if example.best_move_scores:
+        return any(scored_move == move for scored_move, _value, _depth in example.best_move_scores)
+
+    return False
+
+
 def _best_move_rank_key(*, value: int, depth: int) -> tuple[int, int]:
     # For winning lines (value=1), faster wins are better (lower depth).
     if value == 1:
@@ -1514,13 +1873,26 @@ def _score_payload_for_example(
 
     if example.task_type == "best_move":
         move = _move_from_payload_obj(pred_payload)
+        valid_prediction = _best_move_prediction_is_valid(move, example=example)
         if move is None:
             return ScoreOutcome(
                 reward=0.0,
                 parse_success=False,
                 task_correct=False,
                 json_object_parsed=True,
+                best_move_valid_prediction=valid_prediction,
             )
+        if not valid_prediction:
+            return ScoreOutcome(
+                reward=0.0,
+                parse_success=True,
+                task_correct=False,
+                json_object_parsed=True,
+                best_move_set_correct=False,
+                best_move_canonical_correct=False,
+                best_move_valid_prediction=False,
+            )
+
         set_correct = move in example.best_move_optimal_set if move is not None else False
         canonical_correct = move == example.best_move_canonical if move is not None else False
         scores_by_move = {m: (value, depth) for m, value, depth in example.best_move_scores}
@@ -1551,6 +1923,7 @@ def _score_payload_for_example(
             json_object_parsed=True,
             best_move_set_correct=set_correct,
             best_move_canonical_correct=canonical_correct,
+            best_move_valid_prediction=valid_prediction,
         )
 
     gt_norm = _normalize_non_best_answer(example.task_type, example.expected_answer)
@@ -1669,6 +2042,9 @@ def _build_example(
     best_move_canonical = _best_move_from_json(str(row["best_move_canonical_json"]))
     best_move_optimal_set = frozenset(_as_move_set(str(row["best_move_optimal_set_json"])))
     best_move_scores = _scores_by_move_from_json(str(row.get("scores_by_move_json", "")))
+    best_move_legal_moves = frozenset(_as_move_set(str(row.get("legal_moves_json", ""))))
+    if not best_move_legal_moves and best_move_scores:
+        best_move_legal_moves = frozenset(move for move, _value, _depth in best_move_scores)
 
     return QAExample(
         row_id=str(row["row_id"]),
@@ -1680,6 +2056,7 @@ def _build_example(
         best_move_canonical=best_move_canonical,
         best_move_optimal_set=best_move_optimal_set,
         best_move_scores=best_move_scores,
+        best_move_legal_moves=best_move_legal_moves,
     )
 
 
@@ -1693,7 +2070,7 @@ def _load_split_examples(
     hf_token: str,
     hf_cache_dir: str,
 ) -> list[QAExample]:
-    rows = dataset_loader.load_split_rows(
+    rows = load_split_rows(
         dataset_source=dataset_source,
         split_name=split_name,
         dataset_dir=dataset_dir,
@@ -1768,6 +2145,20 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return "too many requests" in str(exc).lower()
 
 
+def _is_transient_rollout_error(exc: Exception) -> bool:
+    if isinstance(exc, TunaNetworkError):
+        return True
+    if not isinstance(exc, TunaAPIError):
+        return False
+    if _is_rate_limit_error(exc):
+        return True
+    if exc.status_code in {408, 502, 503, 504, 524}:
+        return True
+    body = exc.response_body
+    body_text = str(body if body is not None else exc).lower()
+    return "error code: 524" in body_text or "timeout" in body_text
+
+
 def _truncate(value: str, limit: int = 600) -> str:
     if len(value) <= limit:
         return value
@@ -1822,7 +2213,7 @@ def _rollouts_batch_with_retry(
                 max_workers=worker_count,
             )
         except (TunaAPIError, TunaNetworkError) as exc:
-            should_retry = isinstance(exc, TunaNetworkError) or _is_rate_limit_error(exc)
+            should_retry = _is_transient_rollout_error(exc)
             if (not should_retry) or attempt >= retries:
                 print(
                     f"{context}: rollouts_batch failed with no further retries. "
@@ -1884,11 +2275,9 @@ def _evaluate_split(
     best_move_total = 0
     best_move_set_correct = 0
     best_move_canonical_correct = 0
+    best_move_valid_prediction_count = 0
     best_move_center_prediction_count = 0
     best_move_invalid_prediction_count = 0
-
-    non_best_total = 0
-    non_best_exact_correct = 0
 
     per_task_total: Counter[str] = Counter()
     per_task_correct: Counter[str] = Counter()
@@ -1896,8 +2285,8 @@ def _evaluate_split(
     def _consume_batch(batch_examples: list[QAExample]) -> None:
         nonlocal total_scored, reward_sum, object_parse_count, parse_success_count
         nonlocal best_move_total, best_move_set_correct, best_move_canonical_correct
+        nonlocal best_move_valid_prediction_count
         nonlocal best_move_center_prediction_count, best_move_invalid_prediction_count
-        nonlocal non_best_total, non_best_exact_correct
 
         if not batch_examples:
             return
@@ -1966,6 +2355,8 @@ def _evaluate_split(
 
             if item.task_type == "best_move":
                 best_move_total += 1
+                if outcome.best_move_valid_prediction:
+                    best_move_valid_prediction_count += 1
                 if pred_move == 5:
                     best_move_center_prediction_count += 1
                 if pred_move is None:
@@ -1974,10 +2365,6 @@ def _evaluate_split(
                     best_move_set_correct += 1
                 if outcome.best_move_canonical_correct:
                     best_move_canonical_correct += 1
-            else:
-                non_best_total += 1
-                if outcome.exact_non_best_correct:
-                    non_best_exact_correct += 1
 
     batch: list[QAExample] = []
     eval_iter = tqdm(
@@ -2005,9 +2392,10 @@ def _evaluate_split(
             "eval_json_parse_rate": 0.0,
             "eval_best_move_set_accuracy": 0.0,
             "eval_best_move_canonical_accuracy": 0.0,
+            "eval_best_move_valid_prediction_count": 0.0,
+            "eval_best_move_valid_prediction_rate": 0.0,
             "eval_best_move_center_prediction_rate": 0.0,
             "eval_best_move_invalid_prediction_rate": 0.0,
-            "eval_exact_accuracy_non_best_move": 0.0,
         }
         for task in sorted(SUPPORTED_TASKS):
             metrics[f"eval_task_accuracy_{task}"] = 0.0
@@ -2021,13 +2409,16 @@ def _evaluate_split(
         "eval_json_parse_rate": parse_success_count / total_scored,
         "eval_best_move_set_accuracy": best_move_set_correct / max(1, best_move_total),
         "eval_best_move_canonical_accuracy": best_move_canonical_correct / max(1, best_move_total),
+        "eval_best_move_valid_prediction_count": float(best_move_valid_prediction_count),
+        "eval_best_move_valid_prediction_rate": (
+            best_move_valid_prediction_count / max(1, best_move_total)
+        ),
         "eval_best_move_center_prediction_rate": (
             best_move_center_prediction_count / max(1, best_move_total)
         ),
         "eval_best_move_invalid_prediction_rate": (
             best_move_invalid_prediction_count / max(1, best_move_total)
         ),
-        "eval_exact_accuracy_non_best_move": non_best_exact_correct / max(1, non_best_total),
     }
 
     for task in sorted(per_task_total.keys()):
@@ -2081,6 +2472,22 @@ def _build_fixed_eval_indices(
             limit = min(limit, int(max_samples))
         out[split_name] = indices[:limit]
     return out
+
+
+def _subset_examples_deterministically(
+    examples: list[QAExample],
+    *,
+    split_name: str,
+    max_samples: Optional[int],
+    subset_seed: int,
+) -> list[QAExample]:
+    if max_samples is None or max_samples <= 0 or len(examples) <= int(max_samples):
+        return list(examples)
+    indices = list(range(len(examples)))
+    rng = random.Random(int(subset_seed) + _split_seed_offset(split_name))
+    rng.shuffle(indices)
+    keep = set(indices[: int(max_samples)])
+    return [example for idx, example in enumerate(examples) if idx in keep]
 
 
 def _early_stop_thresholds(mode: str) -> dict[str, float]:
@@ -2557,31 +2964,222 @@ def _run_auto_benchmark(
     return True, output_json_path, predictions_jsonl_path, metrics_payload
 
 
+def _build_dataset_load_kwargs(
+    args: argparse.Namespace,
+    *,
+    dataset_dir: Optional[Path],
+) -> dict[str, Any]:
+    return {
+        "dataset_source": args.dataset_source,
+        "dataset_dir": dataset_dir,
+        "hf_dataset_repo_id": args.hf_dataset_repo_id,
+        "hf_dataset_revision": args.hf_dataset_revision,
+        "hf_token": args.hf_token,
+        "hf_cache_dir": args.hf_cache_dir,
+    }
+
+
+def _build_eval_kwargs(
+    args: argparse.Namespace,
+    *,
+    eval_temperature: float,
+    eval_top_p: float,
+    eval_reasoning: bool,
+    show_progress: bool,
+) -> dict[str, Any]:
+    return {
+        "batch_size": args.eval_batch_size,
+        "max_workers": args.max_workers,
+        "max_samples": args.eval_max_samples,
+        "rollout_retries": args.rollout_retries,
+        "rollout_retry_backoff_s": args.rollout_retry_backoff_s,
+        "temperature": eval_temperature,
+        "top_p": eval_top_p,
+        "max_tokens": args.max_tokens,
+        "max_tokens_by_task": args.max_tokens_by_task,
+        "reasoning": eval_reasoning,
+        "best_move_optimal_reward": args.best_move_optimal_reward,
+        "best_move_reward_mode": args.best_move_reward_mode,
+        "best_move_wrong_rank_scale": args.best_move_wrong_rank_scale,
+        "show_progress": show_progress,
+    }
+
+
+def _run_split_eval(
+    *,
+    finetune: Any,
+    split_name: str,
+    examples: list[QAExample],
+    seed: int,
+    eval_kwargs: dict[str, Any],
+    fixed_indices: Optional[list[int]],
+) -> dict[str, float]:
+    return _evaluate_split(
+        finetune=finetune,
+        examples=examples,
+        split_name=split_name,
+        seed=seed,
+        fixed_indices=fixed_indices,
+        **eval_kwargs,
+    )
+
+
+def _print_eval_summary(
+    *,
+    label: str,
+    metrics: dict[str, float],
+    step: Optional[int] = None,
+    split_name: Optional[str] = None,
+) -> None:
+    prefix_parts = [label]
+    if step is not None:
+        prefix_parts.append(f"step={step}")
+    if split_name is not None:
+        prefix_parts.append(f"split={split_name}")
+    prefix = " ".join(prefix_parts)
+    print(
+        f"{prefix} reward={metrics['eval_reward_mean']:.4f} "
+        f"obj_parse={metrics['eval_json_object_rate']:.4f} "
+        f"parse={metrics['eval_json_parse_rate']:.4f} "
+        f"best_move_set={metrics['eval_best_move_set_accuracy']:.4f} "
+        f"best_move_canon={metrics['eval_best_move_canonical_accuracy']:.4f} "
+        f"best_move_valid={metrics.get('eval_best_move_valid_prediction_count', 0.0):.0f}/"
+        f"{metrics.get('eval_task_count_best_move', 0.0):.0f} "
+        f"({metrics.get('eval_best_move_valid_prediction_rate', 0.0):.4f})"
+    )
+
+
+def _build_wandb_run_config(
+    *,
+    args: argparse.Namespace,
+    finetune: Any,
+    dataset_dir: Optional[Path],
+    final_eval_splits: list[str],
+    checkpoint_avg_splits: list[str],
+    train_rows: int,
+    val_rows: int,
+    eval_temperature: float,
+    eval_top_p: float,
+    eval_reasoning: bool,
+    eval_fixed_subset_size: int,
+    eval_fixed_subset_seed: int,
+) -> dict[str, Any]:
+    return {
+        "config": args.config,
+        "env_file": args.env_file,
+        "api_key_env_var": str(args.api_key_env_var or ""),
+        "base_url": args.base_url,
+        "dataset_source": args.dataset_source,
+        "dataset_dir": str(dataset_dir) if dataset_dir is not None else "",
+        "hf_dataset_repo_id": args.hf_dataset_repo_id,
+        "hf_dataset_revision": args.hf_dataset_revision,
+        "hf_cache_dir": args.hf_cache_dir,
+        "train_split": args.train_split,
+        "train_max_samples": args.train_max_samples,
+        "train_subset_seed": args.train_subset_seed,
+        "val_split": args.val_split,
+        "final_eval_splits": final_eval_splits,
+        "checkpoint_avg_splits": checkpoint_avg_splits,
+        "checkpoint_avg_metric": args.checkpoint_avg_metric,
+        "train_rows": train_rows,
+        "val_rows": val_rows,
+        "finetune_id": finetune.finetune_id,
+        "finetune_name": finetune.name,
+        "rank": args.rank,
+        "seed": args.seed,
+        "num_steps": args.num_steps,
+        "resume_step": args.resume_step,
+        "batch_size": args.batch_size,
+        "group_size": args.group_size,
+        "lr": args.lr,
+        "max_workers": args.max_workers,
+        "rollout_retries": args.rollout_retries,
+        "rollout_retry_backoff_s": args.rollout_retry_backoff_s,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "eval_temperature": eval_temperature,
+        "eval_top_p": eval_top_p,
+        "eval_reasoning": eval_reasoning,
+        "eval_temperature_override": args.eval_temperature,
+        "eval_top_p_override": args.eval_top_p,
+        "eval_reasoning_override": args.eval_reasoning,
+        "max_tokens": args.max_tokens,
+        "off_policy": args.off_policy,
+        "off_policy_mix_ratio": args.off_policy_mix_ratio,
+        "off_policy_buffer_size": args.off_policy_buffer_size,
+        "off_policy_warmup_steps": args.off_policy_warmup_steps,
+        "off_policy_min_buffer_groups": args.off_policy_min_buffer_groups,
+        "max_tokens_by_task": dict(args.max_tokens_by_task),
+        "reasoning": args.reasoning,
+        "task_sampling_weights": {
+            task: float(args.task_sampling_weights.get(task, 1.0))
+            for task in sorted(args.task_sampling_weights.keys())
+        },
+        "eval_every": args.eval_every,
+        "save_every": args.save_every,
+        "save_on_eval": args.save_on_eval,
+        "eval_batch_size": args.eval_batch_size,
+        "eval_max_samples": args.eval_max_samples,
+        "eval_fixed_subset_size": eval_fixed_subset_size,
+        "eval_fixed_subset_seed": eval_fixed_subset_seed,
+        "early_stop": args.early_stop,
+        "early_stop_mode": args.early_stop_mode,
+        "skip_final_eval": args.skip_final_eval,
+        "best_metric": args.best_metric,
+        "best_move_optimal_reward": args.best_move_optimal_reward,
+        "best_move_reward_mode": args.best_move_reward_mode,
+        "best_move_wrong_rank_scale": args.best_move_wrong_rank_scale,
+        "best_move_center_not_optimal_ratio": args.best_move_center_not_optimal_ratio,
+        "center_bias_gate_enabled": bool(args.center_bias_gate_enabled),
+        "center_bias_gate_threshold": args.center_bias_gate_threshold,
+        "center_bias_gate_after_evals": args.center_bias_gate_after_evals,
+        "center_bias_gate_min_best_move_samples": args.center_bias_gate_min_best_move_samples,
+        "intra_task_sampling_json": dict(args.intra_task_sampling),
+        "checkpoint_ranking_output": args.checkpoint_ranking_output,
+        "auto_benchmark_best_checkpoint": bool(args.auto_benchmark_best_checkpoint),
+        "auto_benchmark_config": str(args.auto_benchmark_config),
+        "auto_benchmark_output_json": str(args.auto_benchmark_output_json or ""),
+        "auto_benchmark_predictions_jsonl": str(args.auto_benchmark_predictions_jsonl or ""),
+        "wandb_log_profile": str(args.wandb_log_profile),
+    }
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     args = parse_args(argv)
     args.env_file = _resolve_env_file(args.env_file)
+    args.api_key_env_var = str(args.api_key_env_var or "").strip()
     show_progress = _progress_enabled(args.no_progress)
 
     load_dotenv(args.env_file, override=False)
-    if not args.api_key:
-        args.api_key = os.environ.get("MOONDREAM_API_KEY", "")
+    args.api_key = _resolve_api_key(
+        explicit_api_key=args.api_key,
+        api_key_env_var=args.api_key_env_var,
+    )
     if not args.base_url:
         args.base_url = os.environ.get("TUNA_BASE_URL", DEFAULT_BASE_URL)
 
     _validate_args(args)
     _warn_on_unsafe_mode_combo(off_policy=bool(args.off_policy), reasoning=bool(args.reasoning))
     if not args.api_key:
+        if args.api_key_env_var:
+            raise ValueError(
+                "Missing Moondream API key. Pass --api-key, set "
+                f"{args.api_key_env_var} in {args.env_file}, or set MOONDREAM_API_KEY."
+            )
         raise ValueError("MOONDREAM_API_KEY is required")
-    args.hf_token = dataset_loader.resolve_hf_token(args.hf_token)
+    args.hf_token = resolve_hf_token(args.hf_token)
 
     if args.eval_max_samples is not None and args.eval_max_samples <= 0:
         args.eval_max_samples = None
+    if args.train_max_samples is not None and args.train_max_samples <= 0:
+        args.train_max_samples = None
 
     eval_temperature = float(args.temperature) if args.eval_temperature is None else float(args.eval_temperature)
     eval_top_p = float(args.top_p) if args.eval_top_p is None else float(args.eval_top_p)
     eval_reasoning = bool(args.reasoning) if args.eval_reasoning is None else bool(args.eval_reasoning)
     eval_fixed_subset_size = int(args.eval_fixed_subset_size)
     eval_fixed_subset_seed = int(args.eval_fixed_subset_seed)
+    train_subset_seed = int(args.seed) if int(args.train_subset_seed) < 0 else int(args.train_subset_seed)
 
     dataset_dir: Optional[Path] = None
     if args.dataset_source == "local_jsonl":
@@ -2597,24 +3195,27 @@ def main(argv: Optional[list[str]] = None) -> None:
         raise ValueError("--checkpoint-avg-splits must contain at least one split")
 
     rng = random.Random(args.seed)
+    dataset_load_kwargs = _build_dataset_load_kwargs(args, dataset_dir=dataset_dir)
 
     train_examples = _load_split_examples(
         split_name=args.train_split,
-        dataset_source=args.dataset_source,
-        dataset_dir=dataset_dir,
-        hf_dataset_repo_id=args.hf_dataset_repo_id,
-        hf_dataset_revision=args.hf_dataset_revision,
-        hf_token=args.hf_token,
-        hf_cache_dir=args.hf_cache_dir,
+        **dataset_load_kwargs,
     )
+    train_examples = _subset_examples_deterministically(
+        train_examples,
+        split_name=args.train_split,
+        max_samples=args.train_max_samples,
+        subset_seed=train_subset_seed,
+    )
+    if args.train_max_samples is not None:
+        print(
+            f"train subset active: split={args.train_split} "
+            f"kept={len(train_examples)} max_samples={args.train_max_samples} "
+            f"seed={train_subset_seed}"
+        )
     val_examples = _load_split_examples(
         split_name=args.val_split,
-        dataset_source=args.dataset_source,
-        dataset_dir=dataset_dir,
-        hf_dataset_repo_id=args.hf_dataset_repo_id,
-        hf_dataset_revision=args.hf_dataset_revision,
-        hf_token=args.hf_token,
-        hf_cache_dir=args.hf_cache_dir,
+        **dataset_load_kwargs,
     )
     train_examples_by_task: dict[str, list[QAExample]] = {}
     for item in train_examples:
@@ -2681,12 +3282,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         if split_name not in split_examples_cache:
             raw_examples = _load_split_examples(
                 split_name=split_name,
-                dataset_source=args.dataset_source,
-                dataset_dir=dataset_dir,
-                hf_dataset_repo_id=args.hf_dataset_repo_id,
-                hf_dataset_revision=args.hf_dataset_revision,
-                hf_token=args.hf_token,
-                hf_cache_dir=args.hf_cache_dir,
+                **dataset_load_kwargs,
             )
             filtered_examples = _filter_examples_by_active_tasks(
                 raw_examples,
@@ -2721,6 +3317,14 @@ def main(argv: Optional[list[str]] = None) -> None:
             )
         )
 
+    eval_kwargs = _build_eval_kwargs(
+        args,
+        eval_temperature=eval_temperature,
+        eval_top_p=eval_top_p,
+        eval_reasoning=eval_reasoning,
+        show_progress=show_progress,
+    )
+
     if not args.finetune_id and not args.finetune_name:
         args.finetune_name = f"ttt-query-rl-{_random_suffix()}"
 
@@ -2733,81 +3337,20 @@ def main(argv: Optional[list[str]] = None) -> None:
     run = wandb.init(
         project=args.wandb_project,
         name=args.wandb_run_name or None,
-        config={
-            "config": args.config,
-            "env_file": args.env_file,
-            "base_url": args.base_url,
-            "dataset_source": args.dataset_source,
-            "dataset_dir": str(dataset_dir) if dataset_dir is not None else "",
-            "hf_dataset_repo_id": args.hf_dataset_repo_id,
-            "hf_dataset_revision": args.hf_dataset_revision,
-            "hf_cache_dir": args.hf_cache_dir,
-            "train_split": args.train_split,
-            "val_split": args.val_split,
-            "final_eval_splits": final_eval_splits,
-            "checkpoint_avg_splits": checkpoint_avg_splits,
-            "checkpoint_avg_metric": args.checkpoint_avg_metric,
-            "train_rows": len(train_examples),
-            "val_rows": len(val_examples),
-            "finetune_id": finetune.finetune_id,
-            "finetune_name": finetune.name,
-            "rank": args.rank,
-            "seed": args.seed,
-            "num_steps": args.num_steps,
-            "resume_step": args.resume_step,
-            "batch_size": args.batch_size,
-            "group_size": args.group_size,
-            "lr": args.lr,
-            "max_workers": args.max_workers,
-            "rollout_retries": args.rollout_retries,
-            "rollout_retry_backoff_s": args.rollout_retry_backoff_s,
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "eval_temperature": eval_temperature,
-            "eval_top_p": eval_top_p,
-            "eval_reasoning": eval_reasoning,
-            "eval_temperature_override": args.eval_temperature,
-            "eval_top_p_override": args.eval_top_p,
-            "eval_reasoning_override": args.eval_reasoning,
-            "max_tokens": args.max_tokens,
-            "off_policy": args.off_policy,
-            "off_policy_mix_ratio": args.off_policy_mix_ratio,
-            "off_policy_buffer_size": args.off_policy_buffer_size,
-            "off_policy_warmup_steps": args.off_policy_warmup_steps,
-            "off_policy_min_buffer_groups": args.off_policy_min_buffer_groups,
-            "max_tokens_by_task": args.max_tokens_by_task,
-            "reasoning": args.reasoning,
-            "task_sampling_weights": {
-                task: float(args.task_sampling_weights.get(task, 1.0))
-                for task in sorted(args.task_sampling_weights.keys())
-            },
-            "eval_every": args.eval_every,
-            "save_every": args.save_every,
-            "save_on_eval": args.save_on_eval,
-            "eval_batch_size": args.eval_batch_size,
-            "eval_max_samples": args.eval_max_samples,
-            "eval_fixed_subset_size": eval_fixed_subset_size,
-            "eval_fixed_subset_seed": eval_fixed_subset_seed,
-            "early_stop": args.early_stop,
-            "early_stop_mode": args.early_stop_mode,
-            "skip_final_eval": args.skip_final_eval,
-            "best_metric": args.best_metric,
-            "best_move_optimal_reward": args.best_move_optimal_reward,
-            "best_move_reward_mode": args.best_move_reward_mode,
-            "best_move_wrong_rank_scale": args.best_move_wrong_rank_scale,
-            "best_move_center_not_optimal_ratio": args.best_move_center_not_optimal_ratio,
-            "center_bias_gate_enabled": bool(args.center_bias_gate_enabled),
-            "center_bias_gate_threshold": args.center_bias_gate_threshold,
-            "center_bias_gate_after_evals": args.center_bias_gate_after_evals,
-            "center_bias_gate_min_best_move_samples": args.center_bias_gate_min_best_move_samples,
-            "intra_task_sampling_json": dict(args.intra_task_sampling),
-            "checkpoint_ranking_output": args.checkpoint_ranking_output,
-            "auto_benchmark_best_checkpoint": bool(args.auto_benchmark_best_checkpoint),
-            "auto_benchmark_config": str(args.auto_benchmark_config),
-            "auto_benchmark_output_json": str(args.auto_benchmark_output_json or ""),
-            "auto_benchmark_predictions_jsonl": str(args.auto_benchmark_predictions_jsonl or ""),
-            "wandb_log_profile": str(args.wandb_log_profile),
-        },
+        config=_build_wandb_run_config(
+            args=args,
+            finetune=finetune,
+            dataset_dir=dataset_dir,
+            final_eval_splits=final_eval_splits,
+            checkpoint_avg_splits=checkpoint_avg_splits,
+            train_rows=len(train_examples),
+            val_rows=len(val_examples),
+            eval_temperature=eval_temperature,
+            eval_top_p=eval_top_p,
+            eval_reasoning=eval_reasoning,
+            eval_fixed_subset_size=eval_fixed_subset_size,
+            eval_fixed_subset_seed=eval_fixed_subset_seed,
+        ),
     )
     run.summary["finetune_id"] = finetune.finetune_id
 
@@ -2834,25 +3377,12 @@ def main(argv: Optional[list[str]] = None) -> None:
     ) -> dict[str, dict[str, float]]:
         by_split: dict[str, dict[str, float]] = {}
         for split_idx, split_name in enumerate(checkpoint_avg_splits):
-            split_metrics = _evaluate_split(
+            split_metrics = _run_split_eval(
                 finetune=finetune,
                 examples=checkpoint_avg_examples[split_name],
                 split_name=split_name,
                 seed=seed_base + split_idx,
-                batch_size=args.eval_batch_size,
-                max_workers=args.max_workers,
-                max_samples=args.eval_max_samples,
-                rollout_retries=args.rollout_retries,
-                rollout_retry_backoff_s=args.rollout_retry_backoff_s,
-                temperature=eval_temperature,
-                top_p=eval_top_p,
-                max_tokens=args.max_tokens,
-                max_tokens_by_task=args.max_tokens_by_task,
-                reasoning=eval_reasoning,
-                best_move_optimal_reward=args.best_move_optimal_reward,
-                best_move_reward_mode=args.best_move_reward_mode,
-                best_move_wrong_rank_scale=args.best_move_wrong_rank_scale,
-                show_progress=show_progress,
+                eval_kwargs=eval_kwargs,
                 fixed_indices=fixed_eval_indices_by_split.get(split_name),
             )
             by_split[split_name] = split_metrics
@@ -2860,18 +3390,22 @@ def main(argv: Optional[list[str]] = None) -> None:
                 prefix = f"checkpoint_{_sanitize_split_name(split_name)}_"
                 split_wandb_metrics = _select_eval_wandb_metrics(split_metrics)
                 wandb.log({f"{prefix}{k}": v for k, v in split_wandb_metrics.items()}, step=step_for_log)
-            print(
-                f"{stage_label} eval step={step_for_log} split={split_name} "
-                f"reward={split_metrics['eval_reward_mean']:.4f} "
-                f"obj_parse={split_metrics['eval_json_object_rate']:.4f} "
-                f"parse={split_metrics['eval_json_parse_rate']:.4f}"
+            _print_eval_summary(
+                label=f"{stage_label} eval",
+                metrics=split_metrics,
+                step=step_for_log,
+                split_name=split_name,
             )
 
-        avg_checkpoint_metric = float(
-            np.mean([float(m.get(args.checkpoint_avg_metric, 0.0)) for m in by_split.values()])
+        avg_checkpoint_metric = (
+            float(fmean(float(m.get(args.checkpoint_avg_metric, 0.0)) for m in by_split.values()))
+            if by_split
+            else 0.0
         )
-        avg_eval_reward_mean = float(
-            np.mean([float(m.get("eval_reward_mean", 0.0)) for m in by_split.values()])
+        avg_eval_reward_mean = (
+            float(fmean(float(m.get("eval_reward_mean", 0.0)) for m in by_split.values()))
+            if by_split
+            else 0.0
         )
         wandb.log(
             _checkpoint_wandb_payload(
@@ -2906,25 +3440,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         )
         baseline_metrics = baseline_by_split.get(args.val_split)
         if baseline_metrics is None:
-            baseline_metrics = _evaluate_split(
+            baseline_metrics = _run_split_eval(
                 finetune=finetune,
                 examples=val_examples,
                 split_name=args.val_split,
                 seed=args.seed + 151,
-                batch_size=args.eval_batch_size,
-                max_workers=args.max_workers,
-                max_samples=args.eval_max_samples,
-                rollout_retries=args.rollout_retries,
-                rollout_retry_backoff_s=args.rollout_retry_backoff_s,
-                temperature=eval_temperature,
-                top_p=eval_top_p,
-                max_tokens=args.max_tokens,
-                max_tokens_by_task=args.max_tokens_by_task,
-                reasoning=eval_reasoning,
-                best_move_optimal_reward=args.best_move_optimal_reward,
-                best_move_reward_mode=args.best_move_reward_mode,
-                best_move_wrong_rank_scale=args.best_move_wrong_rank_scale,
-                show_progress=show_progress,
+                eval_kwargs=eval_kwargs,
                 fixed_indices=fixed_eval_indices_by_split.get(args.val_split),
             )
         baseline_wandb_metrics = _select_eval_wandb_metrics(baseline_metrics)
@@ -2935,13 +3456,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         best_metric_value = baseline_metric
         best_step = args.resume_step
         best_eval_reward_seen = float(baseline_metrics.get("eval_reward_mean", 0.0))
-        print(
-            f"baseline eval step={args.resume_step} reward={baseline_metrics['eval_reward_mean']:.4f} "
-            f"obj_parse={baseline_metrics['eval_json_object_rate']:.4f} "
-            f"parse={baseline_metrics['eval_json_parse_rate']:.4f} "
-            f"best_move_set={baseline_metrics['eval_best_move_set_accuracy']:.4f} "
-            f"best_move_canon={baseline_metrics['eval_best_move_canonical_accuracy']:.4f} "
-            f"exact_non_best={baseline_metrics['eval_exact_accuracy_non_best_move']:.4f}"
+        _print_eval_summary(
+            label="baseline eval",
+            metrics=baseline_metrics,
+            step=args.resume_step,
         )
         if args.save_on_eval:
             baseline_saved = _try_save_checkpoint(
@@ -3015,6 +3533,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         rewards_all: list[float] = []
         object_parses = 0
         parse_successes = 0
+        best_move_rollout_count = 0
+        best_move_valid_prediction_count = 0
 
         for item, result in zip(active_examples, results):
             if not result.rollouts:
@@ -3035,6 +3555,10 @@ def main(argv: Optional[list[str]] = None) -> None:
                     object_parses += 1
                 if outcome.parse_success:
                     parse_successes += 1
+                if item.task_type == "best_move":
+                    best_move_rollout_count += 1
+                    if outcome.best_move_valid_prediction:
+                        best_move_valid_prediction_count += 1
 
             if rewards:
                 on_policy_groups.append(result.to_group(rewards=rewards))
@@ -3068,8 +3592,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             )
             continue
 
-        reward_mean = float(np.mean(rewards_all)) if rewards_all else 0.0
-        reward_var = float(np.var(rewards_all)) if rewards_all else 0.0
+        reward_mean = float(fmean(rewards_all)) if rewards_all else 0.0
+        reward_var = float(pvariance(rewards_all)) if len(rewards_all) > 1 else 0.0
         object_parse_rate = object_parses / max(1, len(rewards_all))
         parse_rate = parse_successes / max(1, len(rewards_all))
 
@@ -3078,6 +3602,10 @@ def main(argv: Optional[list[str]] = None) -> None:
             "reward_var": reward_var,
             "train_json_object_rate": object_parse_rate,
             "train_json_parse_rate": parse_rate,
+            "train_best_move_valid_prediction_count": float(best_move_valid_prediction_count),
+            "train_best_move_valid_prediction_rate": (
+                best_move_valid_prediction_count / max(1, best_move_rollout_count)
+            ),
             "accepted_groups": float(len(train_groups)),
             "on_policy_groups": float(len(train_groups) - off_policy_groups_used),
             "off_policy_groups": float(off_policy_groups_used),
@@ -3094,6 +3622,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         print(
             f"step {global_step} reward={reward_mean:.4f} "
             f"obj_parse_rate={object_parse_rate:.4f} parse_rate={parse_rate:.4f} "
+            f"best_move_valid={best_move_valid_prediction_count}/{best_move_rollout_count} "
+            f"({train_metrics['train_best_move_valid_prediction_rate']:.4f}) "
             f"offp={off_policy_groups_used}/{len(train_groups)} "
             f"replay={len(replay_buffer)} "
             f"kl={float(train_out.kl or 0.0):.4f} "
@@ -3117,36 +3647,20 @@ def main(argv: Optional[list[str]] = None) -> None:
             )
             eval_metrics = eval_by_split.get(args.val_split)
             if eval_metrics is None:
-                eval_metrics = _evaluate_split(
+                eval_metrics = _run_split_eval(
                     finetune=finetune,
                     examples=val_examples,
                     split_name=args.val_split,
                     seed=args.seed + 1000 + global_step,
-                    batch_size=args.eval_batch_size,
-                    max_workers=args.max_workers,
-                    max_samples=args.eval_max_samples,
-                    rollout_retries=args.rollout_retries,
-                    rollout_retry_backoff_s=args.rollout_retry_backoff_s,
-                    temperature=eval_temperature,
-                    top_p=eval_top_p,
-                    max_tokens=args.max_tokens,
-                    max_tokens_by_task=args.max_tokens_by_task,
-                    reasoning=eval_reasoning,
-                    best_move_optimal_reward=args.best_move_optimal_reward,
-                    best_move_reward_mode=args.best_move_reward_mode,
-                    best_move_wrong_rank_scale=args.best_move_wrong_rank_scale,
-                    show_progress=show_progress,
+                    eval_kwargs=eval_kwargs,
                     fixed_indices=fixed_eval_indices_by_split.get(args.val_split),
                 )
             wandb.log(_select_eval_wandb_metrics(eval_metrics), step=global_step)
             metric_value = float(eval_metrics.get(args.best_metric, 0.0))
-            print(
-                f"eval step {global_step} reward={eval_metrics['eval_reward_mean']:.4f} "
-                f"obj_parse={eval_metrics['eval_json_object_rate']:.4f} "
-                f"parse={eval_metrics['eval_json_parse_rate']:.4f} "
-                f"best_move_set={eval_metrics['eval_best_move_set_accuracy']:.4f} "
-                f"best_move_canon={eval_metrics['eval_best_move_canonical_accuracy']:.4f} "
-                f"exact_non_best={eval_metrics['eval_exact_accuracy_non_best_move']:.4f}"
+            _print_eval_summary(
+                label="eval",
+                metrics=eval_metrics,
+                step=global_step,
             )
 
             if best_metric_value is None or metric_value > best_metric_value:
@@ -3277,25 +3791,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         print("skip_final_eval=true; skipping final split eval pass.")
     else:
         for idx, (split_name, split_examples) in enumerate(final_eval_examples.items()):
-            eval_metrics = _evaluate_split(
+            eval_metrics = _run_split_eval(
                 finetune=finetune,
                 examples=split_examples,
                 split_name=split_name,
                 seed=args.seed + 5000 + idx,
-                batch_size=args.eval_batch_size,
-                max_workers=args.max_workers,
-                max_samples=args.eval_max_samples,
-                rollout_retries=args.rollout_retries,
-                rollout_retry_backoff_s=args.rollout_retry_backoff_s,
-                temperature=eval_temperature,
-                top_p=eval_top_p,
-                max_tokens=args.max_tokens,
-                max_tokens_by_task=args.max_tokens_by_task,
-                reasoning=eval_reasoning,
-                best_move_optimal_reward=args.best_move_optimal_reward,
-                best_move_reward_mode=args.best_move_reward_mode,
-                best_move_wrong_rank_scale=args.best_move_wrong_rank_scale,
-                show_progress=show_progress,
+                eval_kwargs=eval_kwargs,
                 fixed_indices=fixed_eval_indices_by_split.get(split_name),
             )
             prefix = _metric_prefix_for_split(split_name)
@@ -3303,13 +3804,10 @@ def main(argv: Optional[list[str]] = None) -> None:
             if _should_log_prefixed_eval_streams(wandb_log_profile=args.wandb_log_profile):
                 wandb.log({f"{prefix}{k}": v for k, v in final_eval_wandb_metrics.items()}, step=final_eval_step)
 
-            print(
-                f"final eval split={split_name} reward={eval_metrics['eval_reward_mean']:.4f} "
-                f"obj_parse={eval_metrics['eval_json_object_rate']:.4f} "
-                f"parse={eval_metrics['eval_json_parse_rate']:.4f} "
-                f"best_move_set={eval_metrics['eval_best_move_set_accuracy']:.4f} "
-                f"best_move_canon={eval_metrics['eval_best_move_canonical_accuracy']:.4f} "
-                f"exact_non_best={eval_metrics['eval_exact_accuracy_non_best_move']:.4f}"
+            _print_eval_summary(
+                label="final eval",
+                metrics=eval_metrics,
+                split_name=split_name,
             )
 
     ranking_payload = _build_checkpoint_ranking_payload(
@@ -3387,6 +3885,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     run.summary["center_bias_gate_threshold"] = float(args.center_bias_gate_threshold)
     run.summary["finetune_id"] = finetune.finetune_id
     run.summary["train_rows"] = len(train_examples)
+    run.summary["train_max_samples"] = int(args.train_max_samples or 0)
+    run.summary["train_subset_seed"] = int(train_subset_seed)
     run.summary["val_rows"] = len(val_examples)
     run.summary["checkpoint_avg_metric_name"] = args.checkpoint_avg_metric
     run.summary["best_avg_checkpoint_metric"] = float(best_avg_checkpoint_metric)
@@ -3418,7 +3918,6 @@ def main(argv: Optional[list[str]] = None) -> None:
             "eval_json_parse_rate",
             "eval_best_move_set_accuracy",
             "eval_best_move_canonical_accuracy",
-            "eval_exact_accuracy_non_best_move",
         ):
             if isinstance(auto_benchmark_metrics.get(key), (int, float)):
                 run.summary[f"auto_benchmark_{key}"] = float(auto_benchmark_metrics[key])

@@ -930,6 +930,7 @@ def _benchmark_model(
     best_move_total = 0
     best_move_set_correct = 0
     best_move_canonical_correct = 0
+    best_move_valid_prediction_count = 0
     best_move_wrong_reward_sum = 0.0
     best_move_wrong_count = 0
 
@@ -1045,6 +1046,8 @@ def _benchmark_model(
 
             if item.task_type == "best_move":
                 best_move_total += 1
+                if outcome.best_move_valid_prediction:
+                    best_move_valid_prediction_count += 1
                 if outcome.best_move_set_correct:
                     best_move_set_correct += 1
                 if outcome.best_move_canonical_correct:
@@ -1104,6 +1107,7 @@ def _benchmark_model(
                         "task_correct": outcome.task_correct,
                         "best_move_set_correct": outcome.best_move_set_correct,
                         "best_move_canonical_correct": outcome.best_move_canonical_correct,
+                        "best_move_valid_prediction": outcome.best_move_valid_prediction,
                         "exact_non_best_correct": outcome.exact_non_best_correct,
                         "latency_ms": latency_ms,
                         "raw_response_excerpt": common.truncate_json_payload(raw_response, limit=2000),
@@ -1145,6 +1149,10 @@ def _benchmark_model(
         "eval_json_parse_rate": (parse_success_count / max(1, total_scored)),
         "eval_best_move_set_accuracy": (best_move_set_correct / max(1, best_move_total)),
         "eval_best_move_canonical_accuracy": (best_move_canonical_correct / max(1, best_move_total)),
+        "eval_best_move_valid_prediction_count": float(best_move_valid_prediction_count),
+        "eval_best_move_valid_prediction_rate": (
+            best_move_valid_prediction_count / max(1, best_move_total)
+        ),
         "eval_exact_accuracy_non_best_move": (non_best_exact_correct / max(1, non_best_total)),
         "prediction_lines_written": int(prediction_lines_written),
         "latency_avg_ms": avg_latency_ms,

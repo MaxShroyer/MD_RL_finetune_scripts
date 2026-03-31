@@ -138,7 +138,7 @@ class ConfigPrecedenceTests(unittest.TestCase):
                 json.dumps(
                     {
                         "env_file": ".env.staging",
-                        "api_key_env_var": "MOONDREAM_API_KEY_1",
+                        "api_key_env_var": "CICID_GPUB_MOONDREAM_API_KEY_1",
                         "base_url": "https://api-staging.moondream.ai/v1",
                         "off_policy": True,
                     }
@@ -151,13 +151,13 @@ class ConfigPrecedenceTests(unittest.TestCase):
                     "--config",
                     str(cfg_path),
                     "--api-key-env-var",
-                    "MOONDREAM_API_KEY_4",
+                    "CICID_GPUB_MOONDREAM_API_KEY_4",
                 ]
             )
 
         self.assertEqual(args.env_file, ".env.staging")
         self.assertEqual(args.base_url, "https://api-staging.moondream.ai/v1")
-        self.assertEqual(args.api_key_env_var, "MOONDREAM_API_KEY_4")
+        self.assertEqual(args.api_key_env_var, "CICID_GPUB_MOONDREAM_API_KEY_4")
         self.assertTrue(args.off_policy)
 
     def test_explicit_env_file_resolves_named_key_from_env_file(self) -> None:
@@ -168,7 +168,7 @@ class ConfigPrecedenceTests(unittest.TestCase):
         ):
             env_path = Path(tmp) / ".env.staging"
             env_path.write_text(
-                "MOONDREAM_API_KEY_3=file_key_from_named_env_var\n",
+                "CICID_GPUB_MOONDREAM_API_KEY_3=file_key_from_named_env_var\n",
                 encoding="utf-8",
             )
 
@@ -177,7 +177,7 @@ class ConfigPrecedenceTests(unittest.TestCase):
                     "--env-file",
                     str(env_path),
                     "--api-key-env-var",
-                    "MOONDREAM_API_KEY_3",
+                    "CICID_GPUB_MOONDREAM_API_KEY_3",
                     "--base-url",
                     "https://api-staging.moondream.ai/v1",
                 ]
@@ -185,7 +185,7 @@ class ConfigPrecedenceTests(unittest.TestCase):
             resolved = mod._resolve_runtime_env(args)
 
         self.assertEqual(resolved.api_key, "file_key_from_named_env_var")
-        self.assertEqual(resolved.api_key_env_var, "MOONDREAM_API_KEY_3")
+        self.assertEqual(resolved.api_key_env_var, "CICID_GPUB_MOONDREAM_API_KEY_3")
         self.assertEqual(resolved.base_url, "https://api-staging.moondream.ai/v1")
 
     def test_fallback_to_generic_api_key_when_named_key_missing(self) -> None:
@@ -202,13 +202,13 @@ class ConfigPrecedenceTests(unittest.TestCase):
                     "--env-file",
                     str(env_path),
                     "--api-key-env-var",
-                    "MOONDREAM_API_KEY_4",
+                    "CICID_GPUB_MOONDREAM_API_KEY_4",
                 ]
             )
             resolved = mod._resolve_runtime_env(args)
 
         self.assertEqual(resolved.api_key, "generic_shell_key_should_win")
-        self.assertEqual(resolved.api_key_env_var, "MOONDREAM_API_KEY_4")
+        self.assertEqual(resolved.api_key_env_var, "CICID_GPUB_MOONDREAM_API_KEY_4")
 
     def test_cicd_configs_parse_with_staging_settings(self) -> None:
         config_root = REPO_ROOT / "football_detect" / "configs" / "cicd"
@@ -217,7 +217,7 @@ class ConfigPrecedenceTests(unittest.TestCase):
                 False,
                 0.00005,
                 16,
-                "MOONDREAM_API_KEY_1",
+                "CICID_GPUB_MOONDREAM_API_KEY_1",
                 [],
                 "football-staging-onpolicy-lr5e5-r16",
             ),
@@ -225,7 +225,7 @@ class ConfigPrecedenceTests(unittest.TestCase):
                 False,
                 0.0001,
                 16,
-                "MOONDREAM_API_KEY_2",
+                "CICID_GPUB_MOONDREAM_API_KEY_2",
                 [],
                 "football-staging-onpolicy-lr1e4-r16",
             ),
@@ -233,7 +233,7 @@ class ConfigPrecedenceTests(unittest.TestCase):
                 True,
                 0.00005,
                 16,
-                "MOONDREAM_API_KEY_3",
+                "CICID_GPUB_MOONDREAM_API_KEY_3",
                 [],
                 "football-staging-offpolicy-lr5e5-r16",
             ),
@@ -241,7 +241,7 @@ class ConfigPrecedenceTests(unittest.TestCase):
                 True,
                 0.0001,
                 16,
-                "MOONDREAM_API_KEY_4",
+                "CICID_GPUB_MOONDREAM_API_KEY_4",
                 [],
                 "football-staging-offpolicy-lr1e4-r16",
             ),
@@ -249,7 +249,7 @@ class ConfigPrecedenceTests(unittest.TestCase):
                 True,
                 0.0001,
                 16,
-                "MOONDREAM_API_KEY_4",
+                "CICID_GPUB_MOONDREAM_API_KEY_4",
                 ["area of focus"],
                 "football-staging-offpolicy-lr1e4-r16-area-of-focus",
             ),
@@ -257,7 +257,7 @@ class ConfigPrecedenceTests(unittest.TestCase):
                 True,
                 0.0001,
                 16,
-                "MOONDREAM_API_KEY_4",
+                "CICID_GPUB_MOONDREAM_API_KEY_4",
                 ["ball holder"],
                 "football-staging-offpolicy-lr1e4-r16-ball-holder",
             ),
@@ -265,7 +265,7 @@ class ConfigPrecedenceTests(unittest.TestCase):
                 True,
                 0.0001,
                 16,
-                "MOONDREAM_API_KEY_3",
+                "CICID_GPUB_MOONDREAM_API_KEY_3",
                 ["defensive line"],
                 "football-staging-offpolicy-lr1e4-r16-defensive-line",
             ),
@@ -273,7 +273,7 @@ class ConfigPrecedenceTests(unittest.TestCase):
                 True,
                 0.0001,
                 16,
-                "MOONDREAM_API_KEY_1",
+                "CICID_GPUB_MOONDREAM_API_KEY_1",
                 ["offensive line"],
                 "football-staging-offpolicy-lr1e4-r16-offensive-line",
             ),
@@ -281,7 +281,7 @@ class ConfigPrecedenceTests(unittest.TestCase):
                 True,
                 0.0001,
                 16,
-                "MOONDREAM_API_KEY_1",
+                "CICID_GPUB_MOONDREAM_API_KEY_1",
                 ["offensive line / defensive line"],
                 "football-staging-offpolicy-lr1e4-r16-offensive-line-defensive-line",
             ),
@@ -289,7 +289,7 @@ class ConfigPrecedenceTests(unittest.TestCase):
                 True,
                 0.0001,
                 16,
-                "MOONDREAM_API_KEY_2",
+                "CICID_GPUB_MOONDREAM_API_KEY_2",
                 ["players on the field"],
                 "football-staging-offpolicy-lr1e4-r16-players-on-the-field",
             ),
@@ -297,7 +297,7 @@ class ConfigPrecedenceTests(unittest.TestCase):
                 True,
                 0.0001,
                 16,
-                "MOONDREAM_API_KEY_3",
+                "CICID_GPUB_MOONDREAM_API_KEY_3",
                 ["tackle"],
                 "football-staging-offpolicy-lr1e4-r16-tackle",
             ),

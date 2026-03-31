@@ -47,3 +47,7 @@ rawdatasets/
 
 .env-staging
 configs/
+
+!tictaktoe_QA/configs/
+tictaktoe_QA/configs/*
+!tictaktoe_QA/configs/query_rl_compact.json

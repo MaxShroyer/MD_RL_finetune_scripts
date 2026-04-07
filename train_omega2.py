@@ -13,8 +13,10 @@ import json
 import os
 import random
 import string
+import sys
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from pathlib import Path
+from typing import Any, Iterable, List, Optional
 
 import numpy as np
 import wandb
@@ -22,6 +24,13 @@ from datasets import load_dataset
 from PIL import Image, ImageEnhance
 from scipy.optimize import linear_sum_assignment
 
+from async_checkpoint_eval import (
+    CheckpointEvalResult,
+    DispatchHandle,
+    dispatch_checkpoint_eval,
+    drain_checkpoint_eval_jobs,
+    poll_checkpoint_eval_jobs,
+)
 from tuna_sdk import (
     DetectAnnotation,
     DetectRequest,
@@ -808,6 +817,103 @@ def _evaluate(
     }
 
 
+def _build_async_checkpoint_eval_command(
+    *,
+    args: argparse.Namespace,
+    finetune_id: str,
+    checkpoint_step: int,
+    metrics_json_path: Path,
+    predictions_jsonl_path: Path,
+) -> list[str]:
+    cmd = [
+        sys.executable,
+        str((Path(__file__).resolve().parent / "benchmark_omega2.py").resolve()),
+        "--base-url",
+        str(args.base_url),
+        "--dataset-name",
+        str(TEST_DATASET),
+        "--split",
+        "train",
+        "--finetune-id",
+        str(finetune_id),
+        "--checkpoint-step",
+        str(int(checkpoint_step)),
+        "--temperature",
+        str(float(args.temperature)),
+        "--top-p",
+        str(float(args.top_p)),
+        "--max-tokens",
+        str(int(args.max_tokens)),
+        "--max-objects",
+        str(int(args.max_objects)),
+        "--max-workers",
+        str(int(args.max_workers)),
+        "--eval-batch-size",
+        str(int(args.eval_batch_size)),
+        "--output-json",
+        str(metrics_json_path),
+        "--predictions-jsonl",
+        str(predictions_jsonl_path),
+        "--checkpoint-fallback-policy",
+        "exact",
+        "--checkpoint-ready-max-wait-s",
+        "300",
+        "--checkpoint-ready-poll-interval-s",
+        "5",
+    ]
+    if args.max_boxes is not None:
+        cmd.extend(["--max-boxes", str(int(args.max_boxes))])
+    if args.eval_max_samples is not None:
+        cmd.extend(["--eval-max-samples", str(int(args.eval_max_samples))])
+    return cmd
+
+
+def _ingest_async_checkpoint_eval_results(
+    *,
+    run: Any,
+    results: list[CheckpointEvalResult],
+    log_step: int,
+    best_metric: Optional[float],
+    best_step: Optional[int],
+    best_checkpoint_step: Optional[int],
+    latest_checkpoint_step: Optional[int],
+) -> tuple[Optional[float], Optional[int], Optional[int], Optional[int], int]:
+    success_count = 0
+    for result in results:
+        source_step = int(result.metadata.get("step_for_log", result.checkpoint_step))
+        arrival_step = int(log_step)
+        if result.status != "succeeded" or result.metrics_payload is None:
+            print(
+                f"async checkpoint eval failed step={source_step} "
+                f"checkpoint_step={result.checkpoint_step} log={result.stdout_log_path}"
+            )
+            continue
+        success_count += 1
+        metrics = dict(result.metrics_payload)
+        metrics["async_eval_source_step"] = int(source_step)
+        metrics["async_eval_checkpoint_step"] = int(result.checkpoint_step)
+        wandb.log(metrics, step=arrival_step)
+        metric = float(metrics.get("eval_miou", 0.0))
+        latest_checkpoint_step = int(result.checkpoint_step)
+        run.summary["latest_checkpoint_step"] = int(result.checkpoint_step)
+        if best_metric is None or metric > best_metric:
+            best_metric = metric
+            best_step = int(source_step)
+            best_checkpoint_step = int(result.checkpoint_step)
+            run.summary["best_metric_name"] = "eval_miou"
+            run.summary["best_metric"] = float(best_metric)
+            run.summary["best_step"] = int(best_step)
+            run.summary["best_checkpoint_step"] = int(best_checkpoint_step)
+            run.summary["best_eval_f1"] = float(metrics.get("eval_f1", 0.0))
+            run.summary["best_eval_f1_macro"] = float(metrics.get("eval_f1_macro", 0.0))
+            run.summary["best_eval_miou"] = float(metrics.get("eval_miou", 0.0))
+        print(
+            f"async checkpoint eval completed step={source_step} checkpoint_step={result.checkpoint_step} "
+            f"eval_miou={metric:.4f} logged_at_step={arrival_step}"
+        )
+    return best_metric, best_step, best_checkpoint_step, latest_checkpoint_step, success_count
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Omega logo detect finetuning.")
     parser.add_argument("--api-key", default=os.environ.get("MOONDREAM_API_KEY"))
@@ -841,6 +947,27 @@ def main() -> None:
     parser.add_argument("--save-every", type=int, default=20)
     parser.add_argument("--eval-batch-size", type=int, default=32)
     parser.add_argument("--eval-max-samples", type=int, default=None)
+    async_eval_group = parser.add_mutually_exclusive_group()
+    async_eval_group.add_argument("--async-checkpoint-eval", dest="async_checkpoint_eval", action="store_true")
+    async_eval_group.add_argument("--no-async-checkpoint-eval", dest="async_checkpoint_eval", action="store_false")
+    parser.set_defaults(async_checkpoint_eval=False)
+    parser.add_argument(
+        "--async-checkpoint-eval-dir",
+        default=str(Path(__file__).resolve().parent / "outputs" / "async_checkpoint_eval"),
+    )
+    parser.add_argument("--async-checkpoint-eval-max-inflight", type=int, default=1)
+    async_drain_group = parser.add_mutually_exclusive_group()
+    async_drain_group.add_argument(
+        "--async-checkpoint-eval-drain-on-exit",
+        dest="async_checkpoint_eval_drain_on_exit",
+        action="store_true",
+    )
+    async_drain_group.add_argument(
+        "--no-async-checkpoint-eval-drain-on-exit",
+        dest="async_checkpoint_eval_drain_on_exit",
+        action="store_false",
+    )
+    parser.set_defaults(async_checkpoint_eval_drain_on_exit=True)
     args = parser.parse_args()
 
     if not args.api_key:
@@ -859,6 +986,10 @@ def main() -> None:
         raise ValueError("Other prompt probabilities must be >= 0.0")
     if args.other_omega_prompt_prob + args.other_wrong_class_prob > 1.0:
         raise ValueError("Sum of other prompt probabilities must be <= 1.0")
+    if args.async_checkpoint_eval_max_inflight <= 0:
+        raise ValueError("--async-checkpoint-eval-max-inflight must be > 0")
+
+    args.async_checkpoint_eval_dir = str(Path(args.async_checkpoint_eval_dir).expanduser().resolve())
 
     rng = random.Random(args.seed)
     rng_np = np.random.default_rng(args.seed)
@@ -992,6 +1123,12 @@ def main() -> None:
         },
     )
     run.summary["finetune_id"] = finetune.finetune_id
+    best_metric: Optional[float] = None
+    best_step: Optional[int] = None
+    best_checkpoint_step: Optional[int] = None
+    latest_checkpoint_step: Optional[int] = None
+    async_eval_jobs: list[DispatchHandle] = []
+    async_eval_success_count = 0
 
     did_initial_eval = False
     if args.eval_every > 0:
@@ -1023,6 +1160,24 @@ def main() -> None:
 
     for step in range(args.num_steps):
         global_step = args.resume_step + step
+        if async_eval_jobs:
+            async_eval_jobs, completed_async_results = poll_checkpoint_eval_jobs(async_eval_jobs)
+            (
+                best_metric,
+                best_step,
+                best_checkpoint_step,
+                latest_checkpoint_step,
+                completed_successes,
+            ) = _ingest_async_checkpoint_eval_results(
+                run=run,
+                results=completed_async_results,
+                log_step=int(global_step),
+                best_metric=best_metric,
+                best_step=best_step,
+                best_checkpoint_step=best_checkpoint_step,
+                latest_checkpoint_step=latest_checkpoint_step,
+            )
+            async_eval_success_count += int(completed_successes)
         batch: List[Sample] = []
         for _ in range(args.batch_size):
             roll = rng.random()
@@ -1098,35 +1253,109 @@ def main() -> None:
         )
 
         if args.eval_every > 0 and (global_step + 1) % args.eval_every == 0 and not (did_initial_eval and step == 0):
-            eval_metrics = _evaluate(
-                finetune=finetune,
-                dataset_name=TEST_DATASET,
-                split="train",
-                token=args.hf_token,
-                batch_size=args.eval_batch_size,
-                max_boxes=args.max_boxes,
-                max_samples=args.eval_max_samples,
-                rng=rng,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                max_tokens=args.max_tokens,
-                max_objects=args.max_objects,
-                max_workers=args.max_workers,
-            )
-            wandb.log(eval_metrics, step=global_step)
-            print(
-                f"eval step {global_step} f1={eval_metrics['eval_f1']:.3f} "
-                f"macro_f1={eval_metrics['eval_f1_macro']:.3f} "
-                f"miou={eval_metrics['eval_miou']:.3f} "
-                f"tp={eval_metrics['eval_true_pos']} "
-                f"fp={eval_metrics['eval_false_pos']} "
-                f"fn={eval_metrics['eval_false_neg']}"
-            )
+            if args.async_checkpoint_eval:
+                saved_checkpoint = finetune.save_checkpoint()
+                checkpoint = getattr(saved_checkpoint, "checkpoint", None)
+                checkpoint_step_raw = getattr(checkpoint, "step", global_step)
+                latest_checkpoint_step = int(checkpoint_step_raw)
+                run.summary["latest_checkpoint_step"] = int(latest_checkpoint_step)
+                job = dispatch_checkpoint_eval(
+                    trainer="omega2_detect",
+                    finetune_id=str(finetune.finetune_id),
+                    checkpoint_step=int(latest_checkpoint_step),
+                    selection_metric="eval_miou",
+                    base_dir=str(args.async_checkpoint_eval_dir),
+                    command_builder=lambda metrics_json_path, predictions_jsonl_path, _stdout_log_path: _build_async_checkpoint_eval_command(
+                        args=args,
+                        finetune_id=str(finetune.finetune_id),
+                        checkpoint_step=int(latest_checkpoint_step),
+                        metrics_json_path=metrics_json_path,
+                        predictions_jsonl_path=predictions_jsonl_path,
+                    ),
+                    metadata={"step_for_log": int(global_step)},
+                    env_overrides={
+                        "MOONDREAM_API_KEY": str(args.api_key),
+                        "HF_TOKEN": str(args.hf_token),
+                    },
+                    max_inflight=int(args.async_checkpoint_eval_max_inflight),
+                    inflight_jobs=async_eval_jobs,
+                )
+                if job is None:
+                    print(
+                        f"async checkpoint eval skipped step={global_step} checkpoint_step={latest_checkpoint_step} "
+                        f"reason=max_inflight"
+                    )
+                else:
+                    async_eval_jobs.append(job)
+                    print(
+                        f"async checkpoint eval dispatched step={global_step} checkpoint_step={latest_checkpoint_step} "
+                        f"job_dir={job.job_dir}"
+                    )
+            else:
+                eval_metrics = _evaluate(
+                    finetune=finetune,
+                    dataset_name=TEST_DATASET,
+                    split="train",
+                    token=args.hf_token,
+                    batch_size=args.eval_batch_size,
+                    max_boxes=args.max_boxes,
+                    max_samples=args.eval_max_samples,
+                    rng=rng,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    max_tokens=args.max_tokens,
+                    max_objects=args.max_objects,
+                    max_workers=args.max_workers,
+                )
+                wandb.log(eval_metrics, step=global_step)
+                metric = float(eval_metrics.get("eval_miou", 0.0))
+                if best_metric is None or metric > best_metric:
+                    best_metric = metric
+                    best_step = int(global_step)
+                print(
+                    f"eval step {global_step} f1={eval_metrics['eval_f1']:.3f} "
+                    f"macro_f1={eval_metrics['eval_f1_macro']:.3f} "
+                    f"miou={eval_metrics['eval_miou']:.3f} "
+                    f"tp={eval_metrics['eval_true_pos']} "
+                    f"fp={eval_metrics['eval_false_pos']} "
+                    f"fn={eval_metrics['eval_false_neg']}"
+                )
 
         if args.save_every > 0 and (global_step + 1) % args.save_every == 0:
-            finetune.save_checkpoint()
+            saved_checkpoint = finetune.save_checkpoint()
+            checkpoint = getattr(saved_checkpoint, "checkpoint", None)
+            checkpoint_step_raw = getattr(checkpoint, "step", global_step)
+            latest_checkpoint_step = int(checkpoint_step_raw)
 
-    finetune.save_checkpoint()
+    saved_checkpoint = finetune.save_checkpoint()
+    checkpoint = getattr(saved_checkpoint, "checkpoint", None)
+    checkpoint_step_raw = getattr(checkpoint, "step", args.resume_step + args.num_steps)
+    latest_checkpoint_step = int(checkpoint_step_raw)
+    if args.async_checkpoint_eval and bool(args.async_checkpoint_eval_drain_on_exit):
+        completed_async_results = drain_checkpoint_eval_jobs(async_eval_jobs)
+        (
+            best_metric,
+            best_step,
+            best_checkpoint_step,
+            latest_checkpoint_step,
+            completed_successes,
+        ) = _ingest_async_checkpoint_eval_results(
+            run=run,
+            results=completed_async_results,
+            log_step=int(args.resume_step + args.num_steps),
+            best_metric=best_metric,
+            best_step=best_step,
+            best_checkpoint_step=best_checkpoint_step,
+            latest_checkpoint_step=latest_checkpoint_step,
+        )
+        async_eval_success_count += int(completed_successes)
+    run.summary["best_metric_name"] = "eval_miou"
+    run.summary["best_metric"] = float(best_metric or 0.0)
+    run.summary["best_step"] = int(best_step if best_step is not None else -1)
+    run.summary["best_checkpoint_step"] = int(best_checkpoint_step if best_checkpoint_step is not None else -1)
+    run.summary["latest_checkpoint_step"] = int(latest_checkpoint_step if latest_checkpoint_step is not None else -1)
+    run.summary["async_checkpoint_eval_enabled"] = bool(args.async_checkpoint_eval)
+    run.summary["async_checkpoint_eval_success_count"] = int(async_eval_success_count)
     wandb.finish()
     client.close()
 

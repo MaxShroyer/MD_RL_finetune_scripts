@@ -16,6 +16,7 @@ from MDpi_and_d import train_pid_icons as _base
 
 from aerial_airport.common import DEFAULT_STAGING_API_BASE, repo_relative
 
+SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = repo_relative("configs", "train_aerial_airport_detect_default.json")
 
 
@@ -29,6 +30,9 @@ def parse_args(argv: Optional[list[str]] = None):
         args.base_url = DEFAULT_STAGING_API_BASE
     if not args.finetune_id and str(args.finetune_name).startswith("pid-icons-"):
         args.finetune_name = f"aerial-airport-detect-{_base._random_suffix()}"
+    args.async_checkpoint_eval_benchmark_script = str(
+        (SCRIPT_DIR / "benchmark_aerial_airport_detect.py").resolve()
+    )
     return args
 
 

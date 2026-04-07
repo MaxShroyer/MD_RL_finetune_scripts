@@ -16,6 +16,7 @@ from MDpi_and_d import train_pid_icons as _base
 
 from construction_site.common import DEFAULT_STAGING_API_BASE, DETECT_PROMPT_OVERRIDES, build_detect_boxes, repo_relative
 
+SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = repo_relative("configs", "train_construction_site_detect_default.json")
 _ORIGINAL_TO_BASE_SAMPLE = _base._to_base_sample
 _ALLOWED_DETECT_CLASS_NAMES: set[str] = set()
@@ -77,6 +78,9 @@ def parse_args(argv: Optional[list[str]] = None):
         args.base_url = DEFAULT_STAGING_API_BASE
     if not args.finetune_id and str(args.finetune_name).startswith("pid-icons-"):
         args.finetune_name = f"construction-site-detect-{_base._random_suffix()}"
+    args.async_checkpoint_eval_benchmark_script = str(
+        (SCRIPT_DIR / "benchmark_construction_site_detect.py").resolve()
+    )
     return args
 
 

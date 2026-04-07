@@ -29,6 +29,9 @@ def parse_args(argv: Optional[list[str]] = None):
         args.base_url = DEFAULT_STAGING_API_BASE
     if not args.finetune_id and str(args.finetune_name).startswith("pid-icons-"):
         args.finetune_name = f"aerial-airport-point-{_base._random_suffix()}"
+    args.async_checkpoint_eval_benchmark_script = str(
+        (SCRIPT_DIR / "benchmark_aerial_airport_point.py").resolve()
+    )
     return args
 
 

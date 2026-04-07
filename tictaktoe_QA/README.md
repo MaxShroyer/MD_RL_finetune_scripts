@@ -147,7 +147,7 @@ Config precedence:
 
 ## Reward and parse semantics
 - `best_move`:
-  - invalid or occupied predictions are treated as parsed-but-invalid and always receive reward `0.0`
+  - invalid or occupied predictions receive reward `0.0` when legality can be determined from row metadata
   - if `scores_by_move_json` is present, reward is ranked: `1.0 - (# available moves strictly better than predicted)/(n-1)` (top-tier move gets `1.0`)
   - if `scores_by_move_json` is missing/invalid, fallback to legacy behavior:
     - reward `1.0` for canonical move

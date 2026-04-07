@@ -65,6 +65,14 @@ except ModuleNotFoundError:  # pragma: no cover
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
+from async_checkpoint_eval import (
+    CheckpointEvalResult,
+    DispatchHandle,
+    dispatch_checkpoint_eval,
+    drain_checkpoint_eval_jobs,
+    poll_checkpoint_eval_jobs,
+)
+
 try:
     from football_detect.common import (
         NormalizedBox,
@@ -1795,6 +1803,27 @@ def _build_arg_parser(config_path: Path) -> argparse.ArgumentParser:
         action="store_true",
         help="Evaluate the best validation checkpoint once on a held-out test split after training.",
     )
+    async_eval_group = eval_group.add_mutually_exclusive_group()
+    async_eval_group.add_argument("--async-checkpoint-eval", dest="async_checkpoint_eval", action="store_true")
+    async_eval_group.add_argument("--no-async-checkpoint-eval", dest="async_checkpoint_eval", action="store_false")
+    parser.set_defaults(async_checkpoint_eval=False)
+    eval_group.add_argument(
+        "--async-checkpoint-eval-dir",
+        default=str(repo_relative("outputs", "async_checkpoint_eval")),
+    )
+    eval_group.add_argument("--async-checkpoint-eval-max-inflight", type=int, default=1)
+    async_drain_group = eval_group.add_mutually_exclusive_group()
+    async_drain_group.add_argument(
+        "--async-checkpoint-eval-drain-on-exit",
+        dest="async_checkpoint_eval_drain_on_exit",
+        action="store_true",
+    )
+    async_drain_group.add_argument(
+        "--no-async-checkpoint-eval-drain-on-exit",
+        dest="async_checkpoint_eval_drain_on_exit",
+        action="store_false",
+    )
+    parser.set_defaults(async_checkpoint_eval_drain_on_exit=True)
 
     logging_group = parser.add_argument_group("Checkpointing And Logging")
     logging_group.add_argument("--save-every", type=int, default=20)
@@ -1812,6 +1841,11 @@ def _build_arg_parser(config_path: Path) -> argparse.ArgumentParser:
     )
     logging_group.add_argument("--wandb-project", default=DEFAULT_WANDB_PROJECT)
     logging_group.add_argument("--wandb-run-name", default="")
+    parser.add_argument(
+        "--async-checkpoint-eval-benchmark-script",
+        default=str((SCRIPT_DIR / "benchmark_football_detect.py").resolve()),
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -1897,12 +1931,142 @@ def _validate_args(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("--kl-stop-consecutive must be > 0")
     if args.run_final_test and args.eval_every <= 0:
         raise ValueError("--run-final-test requires --eval-every > 0 so a best validation checkpoint can be selected")
+    if args.async_checkpoint_eval_max_inflight <= 0:
+        raise ValueError("--async-checkpoint-eval-max-inflight must be > 0")
     return args
+
+
+def _numeric_eval_payload(metrics: Mapping[str, Any]) -> dict[str, float]:
+    return {
+        str(key): float(value)
+        for key, value in metrics.items()
+        if isinstance(value, (int, float, np.integer, np.floating))
+    }
+
+
+def _build_async_checkpoint_eval_command(
+    *,
+    args: argparse.Namespace,
+    finetune_id: str,
+    split_name: str,
+    checkpoint_step: int,
+    metrics_json_path: Path,
+    predictions_jsonl_path: Path,
+) -> list[str]:
+    cmd = [
+        sys.executable,
+        str(Path(str(args.async_checkpoint_eval_benchmark_script)).expanduser().resolve()),
+        "--env-file",
+        str(args.env_file),
+        "--base-url",
+        str(args.base_url),
+        "--split",
+        str(split_name),
+        "--finetune-id",
+        str(finetune_id),
+        "--checkpoint-step",
+        str(int(checkpoint_step)),
+        "--temperature",
+        str(float(args.eval_temperature)),
+        "--top-p",
+        str(float(args.eval_top_p)),
+        "--max-tokens",
+        str(int(args.max_tokens)),
+        "--max-objects",
+        str(int(args.max_objects)),
+        "--output-json",
+        str(metrics_json_path),
+        "--predictions-jsonl",
+        str(predictions_jsonl_path),
+        "--checkpoint-fallback-policy",
+        "exact",
+        "--checkpoint-ready-max-wait-s",
+        "300",
+        "--checkpoint-ready-poll-interval-s",
+        "5",
+        "--neg-prompts-per-empty",
+        str(int(args.neg_prompts_per_empty)),
+        "--neg-prompts-per-nonempty",
+        str(int(args.neg_prompts_per_nonempty)),
+        "--seed",
+        str(int(args.seed)),
+    ]
+    if int(args.eval_max_samples or 0) > 0:
+        cmd.extend(["--max-samples", str(int(args.eval_max_samples))])
+    if str(args.dataset_path or "").strip():
+        cmd.extend(["--dataset-path", str(args.dataset_path)])
+    elif str(args.dataset_name or "").strip():
+        cmd.extend(["--dataset-name", str(args.dataset_name)])
+    if str(args.class_names_file or "").strip():
+        cmd.extend(["--class-names-file", str(args.class_names_file)])
+    if args.include_classes:
+        cmd.extend(["--include-classes", *list(args.include_classes)])
+    if args.exclude_classes:
+        cmd.extend(["--exclude-classes", *list(args.exclude_classes)])
+    if args.prompt_overrides:
+        cmd.extend(["--prompt-overrides-json", json.dumps(args.prompt_overrides)])
+    return cmd
+
+
+def _ingest_async_checkpoint_eval_results(
+    *,
+    args: argparse.Namespace,
+    run: Any,
+    results: list[CheckpointEvalResult],
+    log_step: int,
+    baseline_selection_metric: Optional[float],
+    best_metric: Optional[float],
+    best_step: Optional[int],
+    best_checkpoint_step: Optional[int],
+    best_eval_metrics: Optional[dict[str, Any]],
+    latest_checkpoint_step: Optional[int],
+) -> tuple[Optional[float], Optional[int], Optional[int], Optional[dict[str, Any]], Optional[int], int]:
+    success_count = 0
+    for result in results:
+        source_step = int(result.metadata.get("step_for_log", result.checkpoint_step))
+        arrival_step = int(log_step)
+        if result.status != "succeeded" or result.metrics_payload is None:
+            print(
+                f"async checkpoint eval failed step={source_step} "
+                f"checkpoint_step={result.checkpoint_step} log={result.stdout_log_path}"
+            )
+            continue
+        success_count += 1
+        metrics = dict(result.metrics_payload)
+        numeric_payload = _numeric_eval_payload(metrics)
+        numeric_payload["async_eval_source_step"] = int(source_step)
+        numeric_payload["async_eval_checkpoint_step"] = int(result.checkpoint_step)
+        if baseline_selection_metric is not None:
+            numeric_payload["eval_selection_metric_delta_vs_baseline"] = (
+                _selection_metric_value(metrics, args.selection_metric) - baseline_selection_metric
+            )
+        wandb.log(numeric_payload, step=arrival_step)
+        latest_checkpoint_step = int(result.checkpoint_step)
+        run.summary["latest_checkpoint_step"] = int(result.checkpoint_step)
+        metric = _selection_metric_value(metrics, args.selection_metric)
+        print(
+            f"async checkpoint eval completed step={source_step} checkpoint_step={result.checkpoint_step} "
+            f"{args.selection_metric}={metric:.4f} logged_at_step={arrival_step}"
+        )
+        if best_metric is None or metric > best_metric:
+            best_metric = metric
+            best_step = int(source_step)
+            best_checkpoint_step = int(result.checkpoint_step)
+            best_eval_metrics = dict(metrics)
+            run.summary["best_selection_metric_name"] = args.selection_metric
+            run.summary["best_selection_metric"] = float(best_metric)
+            run.summary["best_step"] = int(best_step)
+            run.summary["best_checkpoint_step"] = int(best_checkpoint_step)
+            run.summary["best_eval_f1"] = float(metrics.get("eval_f1", 0.0))
+            run.summary["best_eval_f1_macro"] = float(metrics.get("eval_f1_macro", 0.0))
+            run.summary["best_eval_miou"] = float(metrics.get("eval_miou", 0.0))
+    return best_metric, best_step, best_checkpoint_step, best_eval_metrics, latest_checkpoint_step, success_count
 
 
 def main(argv: Optional[list[str]] = None) -> None:
     args = parse_args(argv)
     args = _resolve_runtime_env(args)
+    args.async_checkpoint_eval_dir = str(resolve_config_path(str(args.async_checkpoint_eval_dir), script_dir=SCRIPT_DIR))
     args = _validate_args(args)
 
     selection_metric = str(args.selection_metric or "").strip()
@@ -2195,6 +2359,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     best_metric: Optional[float] = None
     best_step: Optional[int] = None
     best_checkpoint_step: Optional[int] = None
+    latest_checkpoint_step: Optional[int] = None
     best_eval_metrics: Optional[dict[str, Any]] = None
     successful_updates = args.resume_step
     baseline_eval_metrics: Optional[dict[str, Any]] = None
@@ -2203,6 +2368,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     kl_consecutive_hits = 0
     stopped_early = False
     early_stop_reason = ""
+    async_eval_jobs: list[DispatchHandle] = []
+    async_eval_success_count = 0
 
     def _run_and_log_eval(*, trigger: str, step_for_log: int) -> Optional[dict[str, Any]]:
         nonlocal eval_events_logged
@@ -2268,6 +2435,28 @@ def main(argv: Optional[list[str]] = None) -> None:
     for step in range(args.num_steps):
         global_step = args.resume_step + step
         step_start = time.monotonic()
+        if async_eval_jobs:
+            async_eval_jobs, completed_async_results = poll_checkpoint_eval_jobs(async_eval_jobs)
+            (
+                best_metric,
+                best_step,
+                best_checkpoint_step,
+                best_eval_metrics,
+                latest_checkpoint_step,
+                completed_successes,
+            ) = _ingest_async_checkpoint_eval_results(
+                args=args,
+                run=run,
+                results=completed_async_results,
+                log_step=int(global_step),
+                baseline_selection_metric=baseline_selection_metric,
+                best_metric=best_metric,
+                best_step=best_step,
+                best_checkpoint_step=best_checkpoint_step,
+                best_eval_metrics=best_eval_metrics,
+                latest_checkpoint_step=latest_checkpoint_step,
+            )
+            async_eval_success_count += int(completed_successes)
 
         batch = [_next_task() for _ in range(args.batch_size)]
         requests = [
@@ -2510,49 +2699,122 @@ def main(argv: Optional[list[str]] = None) -> None:
             _print_usage_snapshot(usage_summary, prefix=f"usage step {global_step}")
 
         if args.eval_every > 0 and successful_updates % args.eval_every == 0:
-            eval_metrics = _run_and_log_eval(trigger="periodic", step_for_log=global_step)
-            if eval_metrics is None:
-                continue
-            delta_payload: dict[str, Any] = {}
-            if baseline_eval_metrics is not None:
-                delta_payload["eval_miou_delta_vs_baseline"] = (
-                    float(eval_metrics.get("eval_miou", 0.0)) - float(baseline_eval_metrics.get("eval_miou", 0.0))
-                )
-            if baseline_selection_metric is not None:
-                delta_payload["eval_selection_metric_delta_vs_baseline"] = (
-                    _selection_metric_value(eval_metrics, args.selection_metric) - baseline_selection_metric
-                )
-            if delta_payload:
-                wandb.log(delta_payload, step=global_step)
-            print(
-                f"eval step {global_step} tasks={eval_metrics['eval_tasks']} "
-                f"miou={eval_metrics['eval_miou']:.4f} f1={eval_metrics['eval_f1']:.4f} "
-                f"macro_f1={eval_metrics['eval_f1_macro']:.4f} "
-                f"{args.selection_metric}={_selection_metric_value(eval_metrics, args.selection_metric):.4f} "
-                f"updates={successful_updates}"
-            )
-
-            metric = _selection_metric_value(eval_metrics, args.selection_metric)
-            if best_metric is None or metric > best_metric:
-                best_metric = metric
-                best_step = global_step
-                best_eval_metrics = dict(eval_metrics)
+            if args.async_checkpoint_eval:
                 saved_checkpoint = finetune.save_checkpoint()
                 checkpoint = getattr(saved_checkpoint, "checkpoint", None)
                 checkpoint_step_raw = getattr(checkpoint, "step", global_step)
-                best_checkpoint_step = int(checkpoint_step_raw)
-                run.summary["best_selection_metric_name"] = args.selection_metric
-                run.summary["best_selection_metric"] = float(best_metric)
-                run.summary["best_step"] = int(best_step)
-                run.summary["best_checkpoint_step"] = int(best_checkpoint_step)
-                run.summary["best_eval_f1"] = float(eval_metrics.get("eval_f1", 0.0))
-                run.summary["best_eval_f1_macro"] = float(eval_metrics.get("eval_f1_macro", 0.0))
-                run.summary["best_eval_miou"] = float(eval_metrics.get("eval_miou", 0.0))
+                latest_checkpoint_step = int(checkpoint_step_raw)
+                run.summary["latest_checkpoint_step"] = int(latest_checkpoint_step)
+                job = dispatch_checkpoint_eval(
+                    trainer="football_detect",
+                    finetune_id=str(finetune.finetune_id),
+                    checkpoint_step=int(latest_checkpoint_step),
+                    selection_metric=str(args.selection_metric),
+                    base_dir=str(args.async_checkpoint_eval_dir),
+                    command_builder=lambda metrics_json_path, predictions_jsonl_path, _stdout_log_path: _build_async_checkpoint_eval_command(
+                        args=args,
+                        finetune_id=str(finetune.finetune_id),
+                        split_name=str(val_split),
+                        checkpoint_step=int(latest_checkpoint_step),
+                        metrics_json_path=metrics_json_path,
+                        predictions_jsonl_path=predictions_jsonl_path,
+                    ),
+                    metadata={
+                        "step_for_log": int(global_step),
+                        "split_name": str(val_split),
+                    },
+                    env_overrides={
+                        "MOONDREAM_API_KEY": str(args.api_key),
+                        "HF_TOKEN": str(args.hf_token),
+                    },
+                    max_inflight=int(args.async_checkpoint_eval_max_inflight),
+                    inflight_jobs=async_eval_jobs,
+                )
+                if job is None:
+                    print(
+                        f"async checkpoint eval skipped step={global_step} checkpoint_step={latest_checkpoint_step} "
+                        f"reason=max_inflight"
+                    )
+                else:
+                    async_eval_jobs.append(job)
+                    print(
+                        f"async checkpoint eval dispatched step={global_step} checkpoint_step={latest_checkpoint_step} "
+                        f"job_dir={job.job_dir}"
+                    )
+            else:
+                eval_metrics = _run_and_log_eval(trigger="periodic", step_for_log=global_step)
+                if eval_metrics is None:
+                    continue
+                delta_payload: dict[str, Any] = {}
+                if baseline_eval_metrics is not None:
+                    delta_payload["eval_miou_delta_vs_baseline"] = (
+                        float(eval_metrics.get("eval_miou", 0.0)) - float(baseline_eval_metrics.get("eval_miou", 0.0))
+                    )
+                if baseline_selection_metric is not None:
+                    delta_payload["eval_selection_metric_delta_vs_baseline"] = (
+                        _selection_metric_value(eval_metrics, args.selection_metric) - baseline_selection_metric
+                    )
+                if delta_payload:
+                    wandb.log(delta_payload, step=global_step)
+                print(
+                    f"eval step {global_step} tasks={eval_metrics['eval_tasks']} "
+                    f"miou={eval_metrics['eval_miou']:.4f} f1={eval_metrics['eval_f1']:.4f} "
+                    f"macro_f1={eval_metrics['eval_f1_macro']:.4f} "
+                    f"{args.selection_metric}={_selection_metric_value(eval_metrics, args.selection_metric):.4f} "
+                    f"updates={successful_updates}"
+                )
+
+                metric = _selection_metric_value(eval_metrics, args.selection_metric)
+                if best_metric is None or metric > best_metric:
+                    best_metric = metric
+                    best_step = global_step
+                    best_eval_metrics = dict(eval_metrics)
+                    saved_checkpoint = finetune.save_checkpoint()
+                    checkpoint = getattr(saved_checkpoint, "checkpoint", None)
+                    checkpoint_step_raw = getattr(checkpoint, "step", global_step)
+                    best_checkpoint_step = int(checkpoint_step_raw)
+                    latest_checkpoint_step = int(checkpoint_step_raw)
+                    run.summary["best_selection_metric_name"] = args.selection_metric
+                    run.summary["best_selection_metric"] = float(best_metric)
+                    run.summary["best_step"] = int(best_step)
+                    run.summary["best_checkpoint_step"] = int(best_checkpoint_step)
+                    run.summary["latest_checkpoint_step"] = int(latest_checkpoint_step)
+                    run.summary["best_eval_f1"] = float(eval_metrics.get("eval_f1", 0.0))
+                    run.summary["best_eval_f1_macro"] = float(eval_metrics.get("eval_f1_macro", 0.0))
+                    run.summary["best_eval_miou"] = float(eval_metrics.get("eval_miou", 0.0))
 
         if args.save_every > 0 and (global_step + 1) % args.save_every == 0:
-            finetune.save_checkpoint()
+            saved_checkpoint = finetune.save_checkpoint()
+            checkpoint = getattr(saved_checkpoint, "checkpoint", None)
+            checkpoint_step_raw = getattr(checkpoint, "step", global_step)
+            latest_checkpoint_step = int(checkpoint_step_raw)
 
-    finetune.save_checkpoint()
+    saved_checkpoint = finetune.save_checkpoint()
+    checkpoint = getattr(saved_checkpoint, "checkpoint", None)
+    checkpoint_step_raw = getattr(checkpoint, "step", successful_updates)
+    latest_checkpoint_step = int(checkpoint_step_raw)
+    if args.async_checkpoint_eval and (bool(args.async_checkpoint_eval_drain_on_exit) or bool(args.run_final_test)):
+        completed_async_results = drain_checkpoint_eval_jobs(async_eval_jobs)
+        (
+            best_metric,
+            best_step,
+            best_checkpoint_step,
+            best_eval_metrics,
+            latest_checkpoint_step,
+            completed_successes,
+        ) = _ingest_async_checkpoint_eval_results(
+            args=args,
+            run=run,
+            results=completed_async_results,
+            log_step=int(args.resume_step + args.num_steps),
+            baseline_selection_metric=baseline_selection_metric,
+            best_metric=best_metric,
+            best_step=best_step,
+            best_checkpoint_step=best_checkpoint_step,
+            best_eval_metrics=best_eval_metrics,
+            latest_checkpoint_step=latest_checkpoint_step,
+        )
+        async_eval_success_count += int(completed_successes)
     if best_step is not None:
         run.summary["best_step"] = int(best_step)
         run.summary["best_selection_metric_name"] = args.selection_metric
@@ -2563,8 +2825,12 @@ def main(argv: Optional[list[str]] = None) -> None:
             run.summary["best_eval_f1"] = float(best_eval_metrics.get("eval_f1", 0.0))
             run.summary["best_eval_f1_macro"] = float(best_eval_metrics.get("eval_f1_macro", 0.0))
             run.summary["best_eval_miou"] = float(best_eval_metrics.get("eval_miou", 0.0))
+    if latest_checkpoint_step is not None:
+        run.summary["latest_checkpoint_step"] = int(latest_checkpoint_step)
     run.summary["stopped_early"] = int(stopped_early)
     run.summary["early_stop_reason"] = early_stop_reason
+    run.summary["async_checkpoint_eval_enabled"] = bool(args.async_checkpoint_eval)
+    run.summary["async_checkpoint_eval_success_count"] = int(async_eval_success_count)
     if args.run_final_test:
         if test_rows_factory is None or test_split is None:
             raise ValueError("--run-final-test requested, but no held-out test split could be resolved")
@@ -2573,7 +2839,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         else:
             model = f"moondream3-preview/{finetune.finetune_id}@{best_checkpoint_step}"
             test_rng = random.Random(args.seed + 54321)
-            test_log_step = best_step if best_step is not None else successful_updates
+            test_log_step = max(
+                int(best_step if best_step is not None else -1),
+                int(args.resume_step + args.num_steps),
+            )
             try:
                 test_metrics = _evaluate_api(
                     model=model,

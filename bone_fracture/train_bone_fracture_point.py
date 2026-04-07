@@ -53,6 +53,9 @@ def parse_args(argv: Optional[list[str]] = None):
         args.wandb_project = DEFAULT_POINT_WANDB_PROJECT
     if not args.finetune_id and str(args.finetune_name).startswith("pid-icons-"):
         args.finetune_name = f"bone-fracture-point-{_base._random_suffix()}"
+    args.async_checkpoint_eval_benchmark_script = str(
+        (SCRIPT_DIR / "benchmark_bone_fracture_point.py").resolve()
+    )
     return args
 
 

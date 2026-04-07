@@ -15,6 +15,13 @@ from typing import Any, Callable, Optional
 
 from PIL import Image
 
+from finetune_checkpoints import (
+    format_checkpoint_steps,
+    list_saved_checkpoint_steps as shared_list_saved_checkpoint_steps,
+    resolve_checkpoint_step,
+    save_checkpoint_step,
+)
+
 os.environ.setdefault("WANDB_START_METHOD", "thread")
 os.environ.setdefault("WANDB__SERVICE_WAIT", "300")
 
@@ -284,12 +291,11 @@ def _checkpoint_step_from_save_result(saved_checkpoint: Any) -> Optional[int]:
 
 
 def save_checkpoint(*, finetune: Any, context: str) -> Optional[int]:
-    try:
-        saved_checkpoint = finetune.save_checkpoint()
-        return _checkpoint_step_from_save_result(saved_checkpoint)
-    except (TunaAPIError, TunaNetworkError) as exc:
-        print(f"{context}: checkpoint save failed; continuing. details={error_message(exc)}")
-        return None
+    return save_checkpoint_step(
+        finetune=finetune,
+        context=context,
+        error_formatter=error_message,
+    )
 
 
 def compose_train_groups(
@@ -384,12 +390,7 @@ def _parse_finetuned_model(model: str) -> Optional[tuple[str, Optional[int]]]:
 
 
 def _format_checkpoint_steps(steps: list[int], *, limit: int = 20) -> str:
-    if not steps:
-        return "(none)"
-    shown = [str(int(step)) for step in steps[:limit]]
-    if len(steps) > limit:
-        shown.append("...")
-    return ", ".join(shown)
+    return format_checkpoint_steps(steps, limit=limit)
 
 
 def list_saved_checkpoint_steps(
@@ -399,28 +400,12 @@ def list_saved_checkpoint_steps(
     finetune_id: str,
     timeout: float = 180.0,
 ) -> list[int]:
-    client = TunaClient(api_key=api_key, base_url=api_base, timeout=float(timeout))
-    try:
-        finetune = client.get_finetune(finetune_id)
-        cursor: Optional[str] = None
-        steps: set[int] = set()
-        while True:
-            page = finetune.list_checkpoints(limit=100, cursor=cursor)
-            for checkpoint in page.checkpoints:
-                steps.add(int(checkpoint.step))
-            if not page.has_more or not page.next_cursor:
-                break
-            cursor = page.next_cursor
-        return sorted(steps)
-    except (TunaAPIError, TunaNetworkError) as exc:
-        raise ValueError(
-            f"unable to list saved checkpoints for finetune_id={finetune_id}. "
-            f"details={error_message(exc)}"
-        ) from exc
-    finally:
-        close = getattr(client, "close", None)
-        if callable(close):
-            close()
+    return shared_list_saved_checkpoint_steps(
+        api_base=api_base,
+        api_key=api_key,
+        finetune_id=finetune_id,
+        timeout=timeout,
+    )
 
 
 def resolve_query_inference_model(
@@ -432,6 +417,8 @@ def resolve_query_inference_model(
     checkpoint_step: Optional[int],
     timeout: float = 180.0,
     fallback_policy: str = "nearest_saved",
+    checkpoint_ready_max_wait_s: float = 0.0,
+    checkpoint_ready_poll_interval_s: float = 5.0,
 ) -> QueryModelResolution:
     raw_model = str(model or "").strip()
     raw_finetune_id = str(finetune_id or "").strip()
@@ -468,30 +455,17 @@ def resolve_query_inference_model(
     if requested_step is None:
         raise ValueError("checkpoint step is required for finetuned inference.")
 
-    saved_steps = list_saved_checkpoint_steps(
+    resolved_step, used_fallback = resolve_checkpoint_step(
         api_base=api_base,
         api_key=api_key,
         finetune_id=raw_finetune_id,
+        requested_step=int(requested_step),
         timeout=timeout,
+        fallback_policy=fallback_policy,
+        ready_max_wait_s=checkpoint_ready_max_wait_s,
+        ready_poll_interval_s=checkpoint_ready_poll_interval_s,
     )
-    if not saved_steps:
-        raise ValueError(
-            f"finetune_id={raw_finetune_id} has no saved checkpoints available for inference."
-        )
-    if requested_step in saved_steps:
-        resolved_step = int(requested_step)
-        used_fallback = False
-    else:
-        if fallback_policy != "nearest_saved":
-            raise ValueError(f"unsupported checkpoint fallback policy: {fallback_policy}")
-        eligible_steps = [int(step) for step in saved_steps if int(step) <= requested_step]
-        if not eligible_steps:
-            raise ValueError(
-                f"requested checkpoint step={requested_step} is earlier than all saved checkpoints for "
-                f"finetune_id={raw_finetune_id}. saved_steps={_format_checkpoint_steps(saved_steps)}"
-            )
-        resolved_step = int(eligible_steps[-1])
-        used_fallback = True
+    if used_fallback:
         print(
             "checkpoint resolution: "
             f"finetune_id={raw_finetune_id} requested_step={requested_step} "

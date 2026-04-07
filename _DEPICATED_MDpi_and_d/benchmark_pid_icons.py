@@ -1,0 +1,1960 @@
+#!/usr/bin/env python3
+"""Benchmark class-conditional PI&D symbol benchmarks.
+
+Evaluation mode:
+- For each sample, run one prompt per class present in GT.
+- Add random negative prompts for absent classes and for empty images.
+- Supports `detect` (bbox) and `point` (point-in-box) skills.
+- Report micro/macro F1, mIoU (detect only), latency, and per-class tp/fp/fn.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import io
+import json
+import os
+import random
+import socket
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+import numpy as np
+from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
+from dotenv import load_dotenv
+from PIL import Image, ImageDraw
+from scipy.optimize import linear_sum_assignment
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from finetune_checkpoints import resolve_checkpoint_step
+from aerial_airport.runtime_tiling import (
+    Box2D as RuntimeBox,
+    Point2D as RuntimePoint,
+    crop_image_to_tiles,
+    map_box_from_tile,
+    map_point_from_tile,
+    merge_boxes as merge_runtime_boxes,
+    merge_points as merge_runtime_points,
+)
+
+
+def _repo_relative(*parts: str) -> Path:
+    return Path(__file__).resolve().parent.joinpath(*parts)
+
+
+DEFAULT_CONFIG_PATH = _repo_relative("configs", "benchmark_pid_icons_default.json")
+
+
+def _resolve_config_path(raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    if path.is_absolute():
+        return path
+    from_cwd = (Path.cwd() / path).resolve()
+    if from_cwd.exists():
+        return from_cwd
+    from_script = (_repo_relative(path.as_posix())).resolve()
+    if from_script.exists():
+        return from_script
+    return from_cwd
+
+
+def _load_json_config(config_path: Path) -> dict[str, Any]:
+    if not config_path.exists():
+        if config_path == DEFAULT_CONFIG_PATH:
+            return {}
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Config must be a JSON object: {config_path}")
+    return payload
+
+
+def _option_for_action(action: argparse.Action) -> str:
+    for opt in action.option_strings:
+        if opt.startswith("--"):
+            return opt
+    return action.option_strings[0]
+
+
+def _config_to_cli_args(
+    parser: argparse.ArgumentParser,
+    config: dict[str, Any],
+    *,
+    config_path: Path,
+    overridden_dests: Optional[set[str]] = None,
+) -> list[str]:
+    overridden = set(overridden_dests or set())
+    by_dest: dict[str, list[argparse.Action]] = {}
+    for action in parser._actions:
+        if not action.option_strings or action.dest == "help":
+            continue
+        by_dest.setdefault(action.dest, []).append(action)
+
+    unknown = sorted(key for key in config if key not in by_dest)
+    if unknown:
+        raise ValueError(
+            f"Unknown config key(s) in {config_path}: {unknown}. "
+            "Remove typos or update script support."
+        )
+
+    cli_args: list[str] = []
+    for key, raw_value in config.items():
+        if key in overridden:
+            continue
+        actions = by_dest[key]
+        const_actions = [a for a in actions if isinstance(a, argparse._StoreConstAction)]
+        store_actions = [a for a in actions if not isinstance(a, argparse._StoreConstAction)]
+
+        if raw_value is None:
+            matched = next((a for a in const_actions if getattr(a, "const", object()) is None), None)
+            if matched is not None:
+                cli_args.append(_option_for_action(matched))
+            continue
+
+        if isinstance(raw_value, bool):
+            matched = next((a for a in const_actions if getattr(a, "const", object()) is raw_value), None)
+            if matched is not None:
+                cli_args.append(_option_for_action(matched))
+            continue
+
+        if not store_actions:
+            continue
+
+        action = store_actions[0]
+        cli_args.append(_option_for_action(action))
+        if isinstance(raw_value, list):
+            cli_args.extend(str(item) for item in raw_value)
+        elif isinstance(raw_value, dict):
+            cli_args.append(json.dumps(raw_value))
+        else:
+            cli_args.append(str(raw_value))
+    return cli_args
+
+
+def _to_data_url(image: Image.Image, *, quality: int = 90) -> str:
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=max(1, min(100, int(quality))))
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def _build_auth_headers(api_key: str) -> dict[str, str]:
+    header_name = os.environ.get("MOONDREAM_AUTH_HEADER", "X-Moondream-Auth")
+    user_agent = os.environ.get("MOONDREAM_USER_AGENT") or (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    )
+    key = api_key.strip()
+    if header_name.lower() == "authorization" and not key.lower().startswith("bearer "):
+        key = f"Bearer {key}"
+    return {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        header_name: key,
+        "User-Agent": user_agent,
+    }
+
+
+def _object_from_prompt(prompt: str) -> str:
+    raw_prompt = str(prompt).strip()
+    object_name = raw_prompt
+    lower = raw_prompt.lower()
+    if lower.startswith("detect the "):
+        object_name = raw_prompt[len("detect the ") :].strip()
+    if len(object_name) >= 2 and object_name[0] == object_name[-1] and object_name[0] in {"'", '"'}:
+        candidate = object_name[1:-1].strip()
+        if candidate:
+            object_name = candidate
+    return object_name
+
+
+def _post_with_fallback_payloads(
+    *,
+    api_base: str,
+    api_key: str,
+    endpoint: str,
+    payloads: list[dict[str, Any]],
+    timeout: float,
+    retry_429_max_retries: int,
+    retry_429_backoff_s: float,
+    retry_429_max_backoff_s: float,
+    retry_timeout_max_retries: int,
+    retry_timeout_backoff_s: float,
+    retry_timeout_max_backoff_s: float,
+) -> dict[str, Any]:
+    data: dict[str, Any] = {}
+    first_request_error: Optional[Exception] = None
+    for payload in payloads:
+        attempts = 0
+        while True:
+            req = urllib.request.Request(
+                api_base.rstrip("/") + endpoint,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=_build_auth_headers(api_key),
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    body = resp.read().decode("utf-8")
+                data = json.loads(body) if body else {}
+                first_request_error = None
+                break
+            except urllib.error.HTTPError as exc:
+                detail = ""
+                retry_after_s = 0.0
+                try:
+                    raw = exc.read().decode("utf-8", errors="replace")
+                    if raw:
+                        detail = raw.strip().replace("\n", " ")
+                except Exception:
+                    detail = ""
+                if exc.code == 429:
+                    retry_after_header = (exc.headers.get("Retry-After") or "").strip()
+                    if retry_after_header:
+                        try:
+                            retry_after_s = max(0.0, float(retry_after_header))
+                        except (TypeError, ValueError):
+                            retry_after_s = 0.0
+                if detail:
+                    max_len = 300
+                    if len(detail) > max_len:
+                        detail = detail[:max_len] + "..."
+                    exc.msg = f"{exc.msg}: {detail}"
+                if exc.code == 429 and attempts < max(0, int(retry_429_max_retries)):
+                    backoff_s = max(0.0, float(retry_429_backoff_s)) * (2.0**attempts)
+                    capped_backoff_s = min(max(0.0, float(retry_429_max_backoff_s)), backoff_s)
+                    sleep_s = max(retry_after_s, capped_backoff_s) * random.uniform(0.9, 1.1)
+                    if sleep_s > 0.0:
+                        time.sleep(sleep_s)
+                    attempts += 1
+                    continue
+                if first_request_error is None:
+                    first_request_error = exc
+                break
+            except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
+                reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+                detail = str(reason or exc).strip()
+                lower_detail = detail.lower()
+                is_timeout = isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in lower_detail
+                if not is_timeout:
+                    raise
+                if attempts < max(0, int(retry_timeout_max_retries)):
+                    backoff_s = max(0.0, float(retry_timeout_backoff_s)) * (2.0**attempts)
+                    capped_backoff_s = min(max(0.0, float(retry_timeout_max_backoff_s)), backoff_s)
+                    sleep_s = capped_backoff_s * random.uniform(0.9, 1.1)
+                    if sleep_s > 0.0:
+                        time.sleep(sleep_s)
+                    attempts += 1
+                    continue
+                if first_request_error is None:
+                    first_request_error = TimeoutError(detail or "The read operation timed out")
+                break
+        if first_request_error is None:
+            break
+    if first_request_error is not None:
+        raise first_request_error
+    return data
+
+
+def _call_detect_api(
+    *,
+    api_base: str,
+    api_key: str,
+    model: str,
+    image: Image.Image,
+    prompt: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    max_objects: int,
+    timeout: float,
+    retry_429_max_retries: int,
+    retry_429_backoff_s: float,
+    retry_429_max_backoff_s: float,
+    retry_timeout_max_retries: int,
+    retry_timeout_backoff_s: float,
+    retry_timeout_max_backoff_s: float,
+    reasoning: bool,
+) -> list["Box"]:
+    detect_object = _object_from_prompt(prompt)
+
+    image_url = _to_data_url(image, quality=90)
+    settings = {
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "max_tokens": int(max_tokens),
+        "max_objects": int(max_objects),
+    }
+    payloads = [
+        {
+            "model": model,
+            "skill": "detect",
+            "image_url": image_url,
+            "object": detect_object,
+            "settings": settings,
+        },
+        {
+            "model": model,
+            "image_url": image_url,
+            "object": detect_object,
+            "settings": settings,
+        },
+    ]
+    if bool(reasoning):
+        for payload in payloads:
+            payload["reasoning"] = True
+    data = _post_with_fallback_payloads(
+        api_base=api_base,
+        api_key=api_key,
+        endpoint="/detect",
+        payloads=payloads,
+        timeout=timeout,
+        retry_429_max_retries=retry_429_max_retries,
+        retry_429_backoff_s=retry_429_backoff_s,
+        retry_429_max_backoff_s=retry_429_max_backoff_s,
+        retry_timeout_max_retries=retry_timeout_max_retries,
+        retry_timeout_backoff_s=retry_timeout_backoff_s,
+        retry_timeout_max_backoff_s=retry_timeout_max_backoff_s,
+    )
+
+    objects = data.get("objects")
+    if objects is None and isinstance(data.get("output"), dict):
+        objects = data["output"].get("objects")
+
+    boxes: list[Box] = []
+    for item in objects or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            boxes.append(
+                Box(
+                    x_min=max(0.0, min(1.0, float(item["x_min"]))),
+                    y_min=max(0.0, min(1.0, float(item["y_min"]))),
+                    x_max=max(0.0, min(1.0, float(item["x_max"]))),
+                    y_max=max(0.0, min(1.0, float(item["y_max"]))),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return [b for b in boxes if b.x_max > b.x_min and b.y_max > b.y_min]
+
+
+def _call_point_api(
+    *,
+    api_base: str,
+    api_key: str,
+    model: str,
+    image: Image.Image,
+    prompt: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    timeout: float,
+    retry_429_max_retries: int,
+    retry_429_backoff_s: float,
+    retry_429_max_backoff_s: float,
+    retry_timeout_max_retries: int,
+    retry_timeout_backoff_s: float,
+    retry_timeout_max_backoff_s: float,
+    reasoning: bool,
+) -> list["Point"]:
+    object_name = _object_from_prompt(prompt)
+    image_url = _to_data_url(image, quality=90)
+    settings = {
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "max_tokens": int(max_tokens),
+    }
+    payloads = [
+        {
+            "model": model,
+            "skill": "point",
+            "image_url": image_url,
+            "object": object_name,
+            "settings": settings,
+        },
+        {
+            "model": model,
+            "image_url": image_url,
+            "object": object_name,
+            "settings": settings,
+        },
+    ]
+    if bool(reasoning):
+        for payload in payloads:
+            payload["reasoning"] = True
+    data = _post_with_fallback_payloads(
+        api_base=api_base,
+        api_key=api_key,
+        endpoint="/point",
+        payloads=payloads,
+        timeout=timeout,
+        retry_429_max_retries=retry_429_max_retries,
+        retry_429_backoff_s=retry_429_backoff_s,
+        retry_429_max_backoff_s=retry_429_max_backoff_s,
+        retry_timeout_max_retries=retry_timeout_max_retries,
+        retry_timeout_backoff_s=retry_timeout_backoff_s,
+        retry_timeout_max_backoff_s=retry_timeout_max_backoff_s,
+    )
+
+    points_raw: Any = data.get("points")
+    if points_raw is None and isinstance(data.get("output"), dict):
+        output_payload = data["output"]
+        points_raw = output_payload.get("points")
+        if points_raw is None and ("x" in output_payload and "y" in output_payload):
+            points_raw = [output_payload]
+    if points_raw is None and ("x" in data and "y" in data):
+        points_raw = [data]
+    if isinstance(points_raw, dict):
+        points_raw = [points_raw]
+    if not isinstance(points_raw, list):
+        return []
+
+    width, height = image.size
+    points: list[Point] = []
+    for item in points_raw:
+        if not isinstance(item, dict):
+            continue
+        raw_x = item.get("x")
+        raw_y = item.get("y")
+        if raw_x is None or raw_y is None:
+            continue
+        try:
+            x = float(raw_x)
+            y = float(raw_y)
+        except (TypeError, ValueError):
+            continue
+        if max(abs(x), abs(y)) > 1.5 and width > 0 and height > 0:
+            x /= width
+            y /= height
+        x = max(0.0, min(1.0, x))
+        y = max(0.0, min(1.0, y))
+        points.append(Point(x=x, y=y))
+    return points
+
+
+@dataclass(frozen=True)
+class Box:
+    x_min: float
+    y_min: float
+    x_max: float
+    y_max: float
+
+
+@dataclass(frozen=True)
+class Point:
+    x: float
+    y: float
+
+
+@dataclass(frozen=True)
+class ClassBox:
+    class_uid: str
+    class_name: str
+    box: Box
+
+
+@dataclass(frozen=True)
+class BaseSample:
+    image: Image.Image
+    boxes: list[ClassBox]
+    sample_id: str
+
+
+@dataclass(frozen=True)
+class TaskSample:
+    image: Image.Image
+    prompt: str
+    gt_boxes: list[Box]
+    class_name: str
+    sample_id: str
+
+
+def _runtime_point(point: Point) -> RuntimePoint:
+    return RuntimePoint(x=float(point.x), y=float(point.y))
+
+
+def _runtime_box(box: Box) -> RuntimeBox:
+    return RuntimeBox(
+        x_min=float(box.x_min),
+        y_min=float(box.y_min),
+        x_max=float(box.x_max),
+        y_max=float(box.y_max),
+    )
+
+
+def _point_from_runtime(point: RuntimePoint) -> Point:
+    return Point(x=float(point.x), y=float(point.y))
+
+
+def _box_from_runtime(box: RuntimeBox) -> Box:
+    return Box(
+        x_min=float(box.x_min),
+        y_min=float(box.y_min),
+        x_max=float(box.x_max),
+        y_max=float(box.y_max),
+    )
+
+
+def _load_class_names(class_names_file: str, dataset_path: Optional[str]) -> list[str]:
+    if class_names_file:
+        raw = Path(class_names_file).expanduser().read_text(encoding="utf-8")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            names: list[str] = []
+            for raw_line in raw.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                parts = line.split(maxsplit=1)
+                if len(parts) == 2 and parts[0].isdigit():
+                    class_name = parts[1].strip()
+                else:
+                    class_name = line
+                if class_name:
+                    names.append(" ".join(class_name.split()))
+            if names:
+                return sorted(set(names))
+        else:
+            if isinstance(payload, dict) and "class_catalog" in payload:
+                names = [str(item.get("class_name", "")).strip() for item in payload["class_catalog"]]
+                names = [name for name in names if name]
+                if names:
+                    return sorted(set(names))
+            if isinstance(payload, list):
+                names = [str(item).strip() for item in payload]
+                names = [name for name in names if name]
+                if names:
+                    return sorted(set(names))
+
+    if dataset_path:
+        meta = Path(dataset_path).expanduser().resolve() / "metadata.json"
+        if meta.exists():
+            payload = json.loads(meta.read_text(encoding="utf-8"))
+            catalog = payload.get("class_catalog") or []
+            names = [str(item.get("class_name", "")).strip() for item in catalog if isinstance(item, dict)]
+            names = [name for name in names if name]
+            if names:
+                return sorted(set(names))
+
+    return []
+
+
+def _normalize_class_name_list(values: Optional[list[str]]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        class_name = str(value or "").strip()
+        if not class_name or class_name in seen:
+            continue
+        seen.add(class_name)
+        out.append(class_name)
+    return out
+
+
+def _filter_class_names(
+    class_names: list[str],
+    *,
+    include_classes: Optional[list[str]] = None,
+    exclude_classes: Optional[list[str]] = None,
+) -> list[str]:
+    include_set = set(_normalize_class_name_list(include_classes))
+    exclude_set = set(_normalize_class_name_list(exclude_classes))
+    return [
+        class_name
+        for class_name in class_names
+        if (not include_set or class_name in include_set) and class_name not in exclude_set
+    ]
+
+
+def _resolve_dataset_source(dataset_path: str, dataset_name: str) -> tuple[str, str]:
+    path = dataset_path.strip()
+    name = dataset_name.strip()
+    if name:
+        if path:
+            resolved = Path(path).expanduser().resolve()
+            if resolved.exists():
+                print(f"using HF dataset '{name}' (ignoring local dataset path: {resolved})")
+            else:
+                print(f"dataset path not found: {resolved}; falling back to HF dataset '{name}'")
+        return "", name
+    if path:
+        resolved = Path(path).expanduser().resolve()
+        if resolved.exists():
+            return str(resolved), name
+        raise FileNotFoundError(f"dataset path does not exist: {resolved}")
+    raise ValueError("Provide --dataset-name or --dataset-path")
+
+
+def _infer_class_names_from_dataset(
+    *,
+    dataset_path: str,
+    dataset_name: str,
+    split: str,
+    token: Optional[str],
+    max_samples: Optional[int],
+) -> list[str]:
+    names: set[str] = set()
+    for idx, row in enumerate(
+        _iter_rows(
+            dataset_path=dataset_path,
+            dataset_name=dataset_name,
+            split=split,
+            token=token,
+            max_samples=max_samples,
+        )
+    ):
+        sample = _to_base_sample(row, idx)
+        if sample is None:
+            continue
+        for item in sample.boxes:
+            class_name = item.class_name.strip()
+            if class_name:
+                names.add(class_name)
+    return sorted(names)
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_element_class_names(attributes: Any) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for attr in _as_list(attributes):
+        if not isinstance(attr, dict):
+            continue
+        key = str(attr.get("key") or "").strip().lower()
+        if key != "element":
+            continue
+        for item in _as_list(attr.get("value")):
+            class_name = str(item or "").strip()
+            if not class_name or class_name in seen:
+                continue
+            seen.add(class_name)
+            out.append(class_name)
+    return out
+
+
+def _parse_box_item(item: dict[str, Any], *, width: int, height: int) -> Optional[Box]:
+    x_min = _coerce_float(item.get("x_min", item.get("xmin")))
+    y_min = _coerce_float(item.get("y_min", item.get("ymin")))
+    x_max = _coerce_float(item.get("x_max", item.get("xmax")))
+    y_max = _coerce_float(item.get("y_max", item.get("ymax")))
+    if None not in (x_min, y_min, x_max, y_max):
+        x0 = float(x_min)
+        y0 = float(y_min)
+        x1 = float(x_max)
+        y1 = float(y_max)
+    else:
+        nested = item.get("box")
+        if isinstance(nested, dict):
+            return _parse_box_item(nested, width=width, height=height)
+
+        x_center = _coerce_float(item.get("x_center", item.get("cx", item.get("x"))))
+        y_center = _coerce_float(item.get("y_center", item.get("cy", item.get("y"))))
+        box_w = _coerce_float(item.get("width", item.get("w")))
+        box_h = _coerce_float(item.get("height", item.get("h")))
+        if None in (x_center, y_center, box_w, box_h):
+            return None
+
+        x_center_n = float(x_center)
+        y_center_n = float(y_center)
+        width_n = float(box_w)
+        height_n = float(box_h)
+        if abs(x_center_n) > 1.5 and width > 0:
+            x_center_n /= float(width)
+        if abs(y_center_n) > 1.5 and height > 0:
+            y_center_n /= float(height)
+        if abs(width_n) > 1.5 and width > 0:
+            width_n /= float(width)
+        if abs(height_n) > 1.5 and height > 0:
+            height_n /= float(height)
+        x0 = x_center_n - (width_n / 2.0)
+        y0 = y_center_n - (height_n / 2.0)
+        x1 = x_center_n + (width_n / 2.0)
+        y1 = y_center_n + (height_n / 2.0)
+
+    if max(abs(x0), abs(y0), abs(x1), abs(y1)) > 1.5:
+        if width <= 0 or height <= 0:
+            return None
+        x0 /= width
+        y0 /= height
+        x1 /= width
+        y1 /= height
+
+    x0 = max(0.0, min(1.0, x0))
+    y0 = max(0.0, min(1.0, y0))
+    x1 = max(0.0, min(1.0, x1))
+    y1 = max(0.0, min(1.0, y1))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return Box(x0, y0, x1, y1)
+
+
+def _parse_answer_boxes(value: Any, width: int, height: int) -> list[ClassBox]:
+    if value is None:
+        return []
+    raw = value
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+
+    parsed: list[ClassBox] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        box = _parse_box_item(item, width=width, height=height)
+        if box is None:
+            continue
+
+        class_names: list[str] = []
+        explicit_class_name = str(item.get("class_name") or item.get("source_class_name") or "").strip()
+        if explicit_class_name:
+            class_names.append(explicit_class_name)
+        for attr_class_name in _extract_element_class_names(item.get("attributes")):
+            if attr_class_name not in class_names:
+                class_names.append(attr_class_name)
+        if not class_names:
+            continue
+
+        explicit_class_uid = str(item.get("class_uid") or "").strip()
+        for class_name in class_names:
+            class_uid = explicit_class_uid if explicit_class_uid and len(class_names) == 1 else class_name
+            parsed.append(ClassBox(class_uid=class_uid, class_name=class_name, box=box))
+
+    return parsed
+
+
+def _to_base_sample(row: dict, fallback_id: int) -> Optional[BaseSample]:
+    image = row.get("image")
+    if image is None:
+        return None
+    image = image.convert("RGB")
+    width, height = image.size
+    boxes = _parse_answer_boxes(row.get("answer_boxes"), width=width, height=height)
+    sample_id = str(row.get("source_image_id") or row.get("id") or fallback_id)
+    return BaseSample(image=image, boxes=boxes, sample_id=sample_id)
+
+
+def _filter_sample_boxes(
+    sample: BaseSample,
+    *,
+    include_classes: Optional[list[str]] = None,
+    exclude_classes: Optional[list[str]] = None,
+) -> BaseSample:
+    include_set = set(_normalize_class_name_list(include_classes))
+    exclude_set = set(_normalize_class_name_list(exclude_classes))
+    if not include_set and not exclude_set:
+        return sample
+    filtered_boxes = [
+        item
+        for item in sample.boxes
+        if (not include_set or item.class_name in include_set) and item.class_name not in exclude_set
+    ]
+    return BaseSample(image=sample.image, boxes=filtered_boxes, sample_id=sample.sample_id)
+
+
+def _parse_prompt_overrides_json(raw_value: str) -> dict[str, str]:
+    text = str(raw_value or "").strip()
+    if not text:
+        return {}
+    payload = json.loads(text)
+    if not isinstance(payload, dict):
+        raise ValueError("--prompt-overrides-json must decode to an object")
+    out: dict[str, str] = {}
+    for key, value in payload.items():
+        class_name = str(key or "").strip()
+        prompt = str(value or "").strip()
+        if class_name and prompt:
+            out[class_name] = prompt
+    return out
+
+
+def _prompt_for_class(
+    class_name: str,
+    *,
+    style: str = "detect_phrase",
+    prompt_overrides: Optional[dict[str, str]] = None,
+) -> str:
+    override = str((prompt_overrides or {}).get(class_name, "") or "").strip()
+    if override:
+        return override
+    normalized_style = (style or "detect_phrase").strip().lower()
+    if normalized_style == "class_name":
+        return class_name
+    # This string is sent as the /detect or /point API "object". Keep it aligned with training/inference usage.
+    return f"{class_name} icon or icons"
+
+
+def _tasks_from_sample(
+    sample: BaseSample,
+    *,
+    all_class_names: list[str],
+    rng: random.Random,
+    neg_prompts_per_empty: int,
+    neg_prompts_per_nonempty: int,
+    prompt_style: str = "detect_phrase",
+    prompt_overrides: Optional[dict[str, str]] = None,
+) -> list[TaskSample]:
+    grouped: dict[str, tuple[str, list[Box]]] = {}
+    for item in sample.boxes:
+        if item.class_uid not in grouped:
+            grouped[item.class_uid] = (item.class_name, [item.box])
+        else:
+            grouped[item.class_uid][1].append(item.box)
+
+    tasks: list[TaskSample] = []
+    present_names = {entry[0] for entry in grouped.values()}
+
+    for _, (class_name, boxes) in grouped.items():
+        tasks.append(
+            TaskSample(
+                image=sample.image,
+                prompt=_prompt_for_class(class_name, style=prompt_style, prompt_overrides=prompt_overrides),
+                gt_boxes=list(boxes),
+                class_name=class_name,
+                sample_id=sample.sample_id,
+            )
+        )
+
+    if grouped:
+        absent = [name for name in all_class_names if name not in present_names]
+        if absent and neg_prompts_per_nonempty > 0:
+            picks = rng.sample(absent, k=min(neg_prompts_per_nonempty, len(absent)))
+            for class_name in picks:
+                tasks.append(
+                    TaskSample(
+                        image=sample.image,
+                        prompt=_prompt_for_class(class_name, style=prompt_style, prompt_overrides=prompt_overrides),
+                        gt_boxes=[],
+                        class_name=class_name,
+                        sample_id=sample.sample_id,
+                    )
+                )
+    else:
+        if all_class_names and neg_prompts_per_empty > 0:
+            k = min(int(neg_prompts_per_empty), len(all_class_names))
+            picks = rng.sample(all_class_names, k=min(k, len(all_class_names)))
+            for class_name in picks:
+                tasks.append(
+                    TaskSample(
+                        image=sample.image,
+                        prompt=_prompt_for_class(class_name, style=prompt_style, prompt_overrides=prompt_overrides),
+                        gt_boxes=[],
+                        class_name=class_name,
+                        sample_id=sample.sample_id,
+                    )
+                )
+
+    return tasks
+
+
+def _iter_rows(dataset_path: str, dataset_name: str, split: str, token: Optional[str], max_samples: Optional[int]) -> Iterable[dict]:
+    count = 0
+    if dataset_path:
+        path = Path(dataset_path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"dataset path not found: {path}")
+        dataset_obj = load_from_disk(str(path))
+        if isinstance(dataset_obj, DatasetDict):
+            if split not in dataset_obj:
+                available = ", ".join(dataset_obj.keys())
+                raise ValueError(f"Split '{split}' not found. Available: {available}")
+            ds: Dataset = dataset_obj[split]
+        else:
+            ds = dataset_obj
+        for row in ds:
+            yield row
+            count += 1
+            if max_samples is not None and count >= max_samples:
+                break
+        return
+
+    if not dataset_name:
+        raise ValueError("No dataset source resolved. Provide --dataset-name or --dataset-path")
+
+    ds = load_dataset(dataset_name, split=split, token=token, streaming=True)
+    for row in ds:
+        yield row
+        count += 1
+        if max_samples is not None and count >= max_samples:
+            break
+
+
+def _safe_slug(value: str, max_len: int = 64) -> str:
+    text = "".join(ch if ch.isalnum() else "_" for ch in value.lower()).strip("_")
+    while "__" in text:
+        text = text.replace("__", "_")
+    if not text:
+        text = "item"
+    return text[:max_len]
+
+
+def _draw_box(drawer: ImageDraw.ImageDraw, box: Box, width: int, height: int, color: str, line_width: int) -> None:
+    x0 = int(round(box.x_min * width))
+    y0 = int(round(box.y_min * height))
+    x1 = int(round(box.x_max * width))
+    y1 = int(round(box.y_max * height))
+    drawer.rectangle((x0, y0, x1, y1), outline=color, width=line_width)
+
+
+def _draw_point(drawer: ImageDraw.ImageDraw, point: Point, width: int, height: int, color: str, radius: int) -> None:
+    x = int(round(point.x * width))
+    y = int(round(point.y * height))
+    drawer.ellipse((x - radius, y - radius, x + radius, y + radius), outline=color, fill=color)
+
+
+def _save_task_visualization(
+    *,
+    out_dir: Path,
+    label: str,
+    sample_idx: int,
+    task: TaskSample,
+    skill: str,
+    pred_boxes: list[Box],
+    pred_points: list[Point],
+    iou_threshold: float,
+    f1: float,
+    miou: float,
+    tp: int,
+    fp: int,
+    fn: int,
+) -> Optional[str]:
+    image = task.image.copy().convert("RGB")
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        return None
+    drawer = ImageDraw.Draw(image)
+    line_width = max(2, int(round(min(width, height) * 0.004)))
+    point_radius = max(2, int(round(min(width, height) * 0.006)))
+
+    for gt_box in task.gt_boxes:
+        _draw_box(drawer, gt_box, width, height, color="#3498DB", line_width=line_width)
+    if skill == "point":
+        tp_point_indices = _matched_point_indices(pred_points, task.gt_boxes)
+        for idx, pred_point in enumerate(pred_points):
+            color = "#2ECC71" if idx in tp_point_indices else "#E74C3C"
+            _draw_point(drawer, pred_point, width, height, color=color, radius=point_radius)
+        pred_count = len(pred_points)
+        metric_text = f"f1={f1:.3f}"
+    else:
+        tp_box_indices = _matched_detect_indices(pred_boxes, task.gt_boxes, iou_threshold=iou_threshold)
+        for idx, pred_box in enumerate(pred_boxes):
+            color = "#2ECC71" if idx in tp_box_indices else "#E74C3C"
+            _draw_box(drawer, pred_box, width, height, color=color, line_width=line_width)
+        pred_count = len(pred_boxes)
+        metric_text = f"f1={f1:.3f} miou={miou:.3f}"
+
+    caption = (
+        f"{label} | sample={task.sample_id} | class={task.class_name} "
+        f"| gt={len(task.gt_boxes)} pred={pred_count} tp={tp} fp={fp} fn={fn} "
+        f"| {metric_text}"
+    )
+    text_height = max(20, int(round(height * 0.06)))
+    overlay = Image.new("RGB", (width, text_height), color=(0, 0, 0))
+    image.paste(overlay, (0, 0))
+    drawer = ImageDraw.Draw(image)
+    drawer.text((8, max(2, text_height // 4)), caption, fill=(255, 255, 255))
+
+    label_dir = out_dir / _safe_slug(label)
+    label_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{sample_idx:04d}_{_safe_slug(task.sample_id, 48)}_{_safe_slug(task.class_name, 48)}.jpg"
+    path = label_dir / filename
+    image.save(path, format="JPEG", quality=92)
+    return str(path)
+
+
+def _box_iou(a: Box, b: Box) -> float:
+    inter_x_min = max(a.x_min, b.x_min)
+    inter_y_min = max(a.y_min, b.y_min)
+    inter_x_max = min(a.x_max, b.x_max)
+    inter_y_max = min(a.y_max, b.y_max)
+    inter_w = max(0.0, inter_x_max - inter_x_min)
+    inter_h = max(0.0, inter_y_max - inter_y_min)
+    inter = inter_w * inter_h
+    if inter == 0.0:
+        return 0.0
+    area_a = max(0.0, a.x_max - a.x_min) * max(0.0, a.y_max - a.y_min)
+    area_b = max(0.0, b.x_max - b.x_min) * max(0.0, b.y_max - b.y_min)
+    union = area_a + area_b - inter
+    if union <= 0.0:
+        return 0.0
+    return inter / union
+
+
+def _match_ious(predicted: list[Box], ground_truth: list[Box]) -> np.ndarray:
+    n_gt = len(ground_truth)
+    n_pred = len(predicted)
+    if n_gt == 0 or n_pred == 0:
+        return np.array([], dtype=np.float32)
+    size = max(n_gt, n_pred)
+    iou_matrix = np.zeros((size, size), dtype=np.float32)
+    for i, gt in enumerate(ground_truth):
+        for j, pred in enumerate(predicted):
+            iou_matrix[i, j] = _box_iou(pred, gt)
+    cost = 1.0 - iou_matrix
+    row_idx, col_idx = linear_sum_assignment(cost)
+    return iou_matrix[row_idx, col_idx]
+
+
+def _matched_detect_indices(predicted: list[Box], ground_truth: list[Box], *, iou_threshold: float) -> set[int]:
+    n_gt = len(ground_truth)
+    n_pred = len(predicted)
+    if n_gt == 0 or n_pred == 0:
+        return set()
+    size = max(n_gt, n_pred)
+    iou_matrix = np.zeros((size, size), dtype=np.float32)
+    for i, gt in enumerate(ground_truth):
+        for j, pred in enumerate(predicted):
+            iou_matrix[i, j] = _box_iou(pred, gt)
+    cost = 1.0 - iou_matrix
+    row_idx, col_idx = linear_sum_assignment(cost)
+    matched: set[int] = set()
+    for gt_idx, pred_idx in zip(row_idx.tolist(), col_idx.tolist()):
+        if gt_idx >= n_gt or pred_idx >= n_pred:
+            continue
+        if iou_matrix[gt_idx, pred_idx] >= iou_threshold:
+            matched.add(pred_idx)
+    return matched
+
+
+def _reward_miou(predicted: list[Box], ground_truth: list[Box]) -> float:
+    if not predicted and not ground_truth:
+        return 1.0
+    if not predicted or not ground_truth:
+        return 0.0
+    matches = _match_ious(predicted, ground_truth)
+    denom = max(len(predicted), len(ground_truth))
+    return float(matches.sum()) / float(denom) if denom else 0.0
+
+
+def _reward_f1(predicted: list[Box], ground_truth: list[Box]) -> float:
+    if not predicted and not ground_truth:
+        return 1.0
+    if not predicted or not ground_truth:
+        return 0.0
+    matches = _match_ious(predicted, ground_truth)
+    true_pos = float((matches >= 0.5).sum())
+    precision = true_pos / len(predicted) if predicted else 0.0
+    recall = true_pos / len(ground_truth) if ground_truth else 0.0
+    if precision + recall == 0.0:
+        return 0.0
+    return 2.0 * precision * recall / (precision + recall)
+
+
+def _count_tp_fp_fn(predicted: list[Box], ground_truth: list[Box], iou_threshold: float) -> tuple[int, int, int]:
+    n_pred = len(predicted)
+    n_gt = len(ground_truth)
+    if n_pred == 0 and n_gt == 0:
+        return 0, 0, 0
+    if n_pred == 0:
+        return 0, 0, n_gt
+    if n_gt == 0:
+        return 0, n_pred, 0
+    matched_pred_indices = _matched_detect_indices(predicted, ground_truth, iou_threshold=iou_threshold)
+    true_pos = len(matched_pred_indices)
+    false_pos = n_pred - true_pos
+    false_neg = n_gt - true_pos
+    return true_pos, false_pos, false_neg
+
+
+def _point_in_box(point: Point, box: Box) -> bool:
+    return box.x_min <= point.x <= box.x_max and box.y_min <= point.y <= box.y_max
+
+
+def _match_points_in_boxes(points: list[Point], ground_truth: list[Box]) -> int:
+    n_points = len(points)
+    n_gt = len(ground_truth)
+    if n_points == 0 or n_gt == 0:
+        return 0
+    size = max(n_points, n_gt)
+    score = np.zeros((size, size), dtype=np.float32)
+    for i, gt in enumerate(ground_truth):
+        for j, point in enumerate(points):
+            score[i, j] = 1.0 if _point_in_box(point, gt) else 0.0
+    cost = -score
+    row_idx, col_idx = linear_sum_assignment(cost)
+    return int(score[row_idx, col_idx].sum())
+
+
+def _matched_point_indices(points: list[Point], ground_truth: list[Box]) -> set[int]:
+    n_points = len(points)
+    n_gt = len(ground_truth)
+    if n_points == 0 or n_gt == 0:
+        return set()
+    size = max(n_points, n_gt)
+    score = np.zeros((size, size), dtype=np.float32)
+    for i, gt in enumerate(ground_truth):
+        for j, point in enumerate(points):
+            score[i, j] = 1.0 if _point_in_box(point, gt) else 0.0
+    cost = -score
+    row_idx, col_idx = linear_sum_assignment(cost)
+    matched: set[int] = set()
+    for gt_idx, point_idx in zip(row_idx.tolist(), col_idx.tolist()):
+        if gt_idx >= n_gt or point_idx >= n_points:
+            continue
+        if score[gt_idx, point_idx] >= 0.5:
+            matched.add(point_idx)
+    return matched
+
+
+def _count_tp_fp_fn_points(points: list[Point], ground_truth: list[Box]) -> tuple[int, int, int]:
+    n_points = len(points)
+    n_gt = len(ground_truth)
+    if n_points == 0 and n_gt == 0:
+        return 0, 0, 0
+    if n_points == 0:
+        return 0, 0, n_gt
+    if n_gt == 0:
+        return 0, n_points, 0
+    tp = len(_matched_point_indices(points, ground_truth))
+    fp = n_points - tp
+    fn = n_gt - tp
+    return tp, fp, fn
+
+
+def _reward_f1_points(points: list[Point], ground_truth: list[Box]) -> float:
+    tp, fp, fn = _count_tp_fp_fn_points(points, ground_truth)
+    if tp == 0 and fp == 0 and fn == 0:
+        return 1.0
+    denom = (2.0 * float(tp)) + float(fp) + float(fn)
+    if denom <= 0.0:
+        return 0.0
+    return (2.0 * float(tp)) / denom
+
+
+def _parse_model_finetune_checkpoint(model_name: Any) -> tuple[Optional[str], Optional[int]]:
+    text = str(model_name or "").strip()
+    if "/" not in text or "@" not in text:
+        return (None, None)
+    _, tail = text.split("/", 1)
+    finetune_id, _, step_text = tail.partition("@")
+    return (finetune_id or None, _coerce_int(step_text))
+
+
+def _task_record(
+    *,
+    label: str,
+    skill: str,
+    model: str,
+    run_id: str,
+    dataset_name: Optional[str],
+    dataset_path: Optional[str],
+    split: str,
+    task: TaskSample,
+    pred_count: Optional[int],
+    tp: Optional[int],
+    fp: Optional[int],
+    fn: Optional[int],
+    f1: Optional[float],
+    miou: Optional[float],
+    latency_sec: Optional[float],
+    failed: bool,
+    error: Optional[str],
+) -> dict[str, Any]:
+    finetune_id, checkpoint_step = _parse_model_finetune_checkpoint(model)
+    return {
+        "label": label,
+        "skill": skill,
+        "model": model,
+        "run_id": str(run_id or "").strip() or None,
+        "finetune_id": finetune_id,
+        "checkpoint_step": checkpoint_step,
+        "dataset_name": dataset_name,
+        "dataset_path": dataset_path,
+        "split": split,
+        "sample_id": task.sample_id,
+        "task_key": f"{task.sample_id}::{task.class_name}::{task.prompt}",
+        "class_name": task.class_name,
+        "prompt": task.prompt,
+        "is_positive": bool(task.gt_boxes),
+        "gt_count": len(task.gt_boxes),
+        "pred_count": pred_count,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "task_f1": f1,
+        "task_miou": miou,
+        "latency_sec": latency_sec,
+        "failed": failed,
+        "error": error,
+    }
+
+
+def _evaluate_model(
+    label: str,
+    model: str,
+    args: argparse.Namespace,
+    all_class_names: list[str],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    rng = random.Random(args.seed)
+    effective_skill = (args.skill or "detect").strip().lower()
+    last_request_end: Optional[float] = None
+    viz_saved = 0
+    viz_paths: list[str] = []
+    viz_out_dir = Path(args.viz_dir).expanduser().resolve() if args.viz_dir else None
+
+    total_base_samples = 0
+    total_tasks = 0
+    total_f1 = 0.0
+    total_miou = 0.0
+    total_tp = 0
+    total_fp = 0
+    total_fn = 0
+    total_latency = 0.0
+    total_gt_boxes = 0
+    positive_tasks = 0
+    negative_tasks = 0
+    failed_tasks = 0
+
+    per_class: dict[str, dict[str, Any]] = {}
+    task_records: list[dict[str, Any]] = []
+
+    def _class_stats(name: str) -> dict[str, Any]:
+        if name not in per_class:
+            per_class[name] = {"tasks": 0, "tp": 0, "fp": 0, "fn": 0, "f1_sum": 0.0, "miou_sum": 0.0}
+        return per_class[name]
+
+    def _predict_task(task: TaskSample) -> tuple[list[Point], list[Box], float]:
+        nonlocal last_request_end
+        if not args.runtime_tiling:
+            if args.min_request_interval_s > 0.0 and last_request_end is not None:
+                wait_s = float(args.min_request_interval_s) - (time.monotonic() - last_request_end)
+                if wait_s > 0.0:
+                    time.sleep(wait_s)
+            start = time.monotonic()
+            if effective_skill == "point":
+                pred_points = _call_point_api(
+                    api_base=args.api_base,
+                    api_key=args.api_key,
+                    model=model,
+                    image=task.image,
+                    prompt=task.prompt,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    max_tokens=args.max_tokens,
+                    timeout=args.timeout,
+                    retry_429_max_retries=args.retry_429_max_retries,
+                    retry_429_backoff_s=args.retry_429_backoff_s,
+                    retry_429_max_backoff_s=args.retry_429_max_backoff_s,
+                    retry_timeout_max_retries=args.retry_timeout_max_retries,
+                    retry_timeout_backoff_s=args.retry_timeout_backoff_s,
+                    retry_timeout_max_backoff_s=args.retry_timeout_max_backoff_s,
+                    reasoning=args.reasoning,
+                )
+                pred_boxes: list[Box] = []
+            else:
+                pred_boxes = _call_detect_api(
+                    api_base=args.api_base,
+                    api_key=args.api_key,
+                    model=model,
+                    image=task.image,
+                    prompt=task.prompt,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    max_tokens=args.max_tokens,
+                    max_objects=args.max_objects,
+                    timeout=args.timeout,
+                    retry_429_max_retries=args.retry_429_max_retries,
+                    retry_429_backoff_s=args.retry_429_backoff_s,
+                    retry_429_max_backoff_s=args.retry_429_max_backoff_s,
+                    retry_timeout_max_retries=args.retry_timeout_max_retries,
+                    retry_timeout_backoff_s=args.retry_timeout_backoff_s,
+                    retry_timeout_max_backoff_s=args.retry_timeout_max_backoff_s,
+                    reasoning=args.reasoning,
+                )
+                pred_points = []
+            latency = time.monotonic() - start
+            last_request_end = time.monotonic()
+            return pred_points, pred_boxes, latency
+
+        merged_points: list[RuntimePoint] = []
+        merged_boxes: list[RuntimeBox] = []
+        total_latency = 0.0
+        for tile_window, tile_image in crop_image_to_tiles(
+            task.image,
+            grid_size=int(args.tile_grid_size),
+            overlap=float(args.tile_overlap),
+        ):
+            if args.min_request_interval_s > 0.0 and last_request_end is not None:
+                wait_s = float(args.min_request_interval_s) - (time.monotonic() - last_request_end)
+                if wait_s > 0.0:
+                    time.sleep(wait_s)
+            start = time.monotonic()
+            if effective_skill == "point":
+                pred_tile_points = _call_point_api(
+                    api_base=args.api_base,
+                    api_key=args.api_key,
+                    model=model,
+                    image=tile_image,
+                    prompt=task.prompt,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    max_tokens=args.max_tokens,
+                    timeout=args.timeout,
+                    retry_429_max_retries=args.retry_429_max_retries,
+                    retry_429_backoff_s=args.retry_429_backoff_s,
+                    retry_429_max_backoff_s=args.retry_429_max_backoff_s,
+                    retry_timeout_max_retries=args.retry_timeout_max_retries,
+                    retry_timeout_backoff_s=args.retry_timeout_backoff_s,
+                    retry_timeout_max_backoff_s=args.retry_timeout_max_backoff_s,
+                    reasoning=args.reasoning,
+                )
+                for point in pred_tile_points:
+                    merged_points.append(map_point_from_tile(_runtime_point(point), tile_window))
+            else:
+                pred_tile_boxes = _call_detect_api(
+                    api_base=args.api_base,
+                    api_key=args.api_key,
+                    model=model,
+                    image=tile_image,
+                    prompt=task.prompt,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    max_tokens=args.max_tokens,
+                    max_objects=args.max_objects,
+                    timeout=args.timeout,
+                    retry_429_max_retries=args.retry_429_max_retries,
+                    retry_429_backoff_s=args.retry_429_backoff_s,
+                    retry_429_max_backoff_s=args.retry_429_max_backoff_s,
+                    retry_timeout_max_retries=args.retry_timeout_max_retries,
+                    retry_timeout_backoff_s=args.retry_timeout_backoff_s,
+                    retry_timeout_max_backoff_s=args.retry_timeout_max_backoff_s,
+                    reasoning=args.reasoning,
+                )
+                for box in pred_tile_boxes:
+                    mapped = map_box_from_tile(_runtime_box(box), tile_window)
+                    if mapped is not None:
+                        merged_boxes.append(mapped)
+            total_latency += time.monotonic() - start
+            last_request_end = time.monotonic()
+
+        if effective_skill == "point":
+            return [
+                _point_from_runtime(point)
+                for point in merge_runtime_points(merged_points, radius=float(args.tile_point_merge_radius))
+            ], [], total_latency
+        return [], [
+            _box_from_runtime(box)
+            for box in merge_runtime_boxes(merged_boxes, iou_threshold=float(args.tile_box_merge_iou))
+        ], total_latency
+
+    row_iter = _iter_rows(
+        dataset_path=args.dataset_path.strip(),
+        dataset_name=args.dataset_name,
+        split=args.split,
+        token=args.hf_token,
+        max_samples=args.max_samples,
+    )
+
+    for idx, row in enumerate(row_iter):
+        sample = _to_base_sample(row, idx)
+        if sample is None:
+            continue
+        sample = _filter_sample_boxes(
+            sample,
+            include_classes=args.include_classes,
+            exclude_classes=args.exclude_classes,
+        )
+        total_base_samples += 1
+
+        tasks = _tasks_from_sample(
+            sample,
+            all_class_names=all_class_names,
+            rng=rng,
+            neg_prompts_per_empty=args.neg_prompts_per_empty,
+            neg_prompts_per_nonempty=args.neg_prompts_per_nonempty,
+            prompt_style=args.point_prompt_style if effective_skill == "point" else "detect_phrase",
+            prompt_overrides=args.prompt_overrides,
+        )
+
+        for task in tasks:
+            total_gt_boxes += len(task.gt_boxes)
+            if task.gt_boxes:
+                positive_tasks += 1
+            else:
+                negative_tasks += 1
+            try:
+                pred_points, pred_boxes, latency = _predict_task(task)
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
+                print(f"{label}: {effective_skill} failed for sample={task.sample_id} class={task.class_name}: {exc}")
+                failed_tasks += 1
+                last_request_end = time.monotonic()
+                task_records.append(
+                    _task_record(
+                        label=label,
+                        skill=effective_skill,
+                        model=model,
+                        run_id=getattr(args, "run_id", ""),
+                        dataset_name=args.dataset_name or None,
+                        dataset_path=args.dataset_path.strip() or None,
+                        split=args.split,
+                        task=task,
+                        pred_count=None,
+                        tp=None,
+                        fp=None,
+                        fn=None,
+                        f1=None,
+                        miou=None,
+                        latency_sec=None,
+                        failed=True,
+                        error=str(exc),
+                    )
+                )
+                continue
+
+            if effective_skill == "point":
+                f1 = _reward_f1_points(pred_points, task.gt_boxes)
+                miou = 0.0
+                tp, fp, fn = _count_tp_fp_fn_points(pred_points, task.gt_boxes)
+                pred_count = len(pred_points)
+            else:
+                f1 = _reward_f1(pred_boxes, task.gt_boxes)
+                miou = _reward_miou(pred_boxes, task.gt_boxes)
+                tp, fp, fn = _count_tp_fp_fn(pred_boxes, task.gt_boxes, iou_threshold=args.iou_threshold)
+                pred_count = len(pred_boxes)
+
+            total_tasks += 1
+            total_f1 += f1
+            total_miou += miou
+            total_tp += tp
+            total_fp += fp
+            total_fn += fn
+            total_latency += latency
+
+            stats = _class_stats(task.class_name)
+            stats["tasks"] += 1
+            stats["tp"] += tp
+            stats["fp"] += fp
+            stats["fn"] += fn
+            stats["f1_sum"] += f1
+            stats["miou_sum"] += miou
+            task_records.append(
+                _task_record(
+                    label=label,
+                    skill=effective_skill,
+                    model=model,
+                    run_id=getattr(args, "run_id", ""),
+                    dataset_name=args.dataset_name or None,
+                    dataset_path=args.dataset_path.strip() or None,
+                    split=args.split,
+                    task=task,
+                    pred_count=pred_count,
+                    tp=tp,
+                    fp=fp,
+                    fn=fn,
+                    f1=f1,
+                    miou=miou,
+                    latency_sec=latency,
+                    failed=False,
+                    error=None,
+                )
+            )
+
+            if args.viz_samples > 0 and viz_saved < args.viz_samples and viz_out_dir is not None:
+                out_path = _save_task_visualization(
+                    out_dir=viz_out_dir,
+                    label=label,
+                    sample_idx=viz_saved,
+                    task=task,
+                    skill=effective_skill,
+                    pred_boxes=pred_boxes,
+                    pred_points=pred_points,
+                    iou_threshold=args.iou_threshold,
+                    f1=f1,
+                    miou=miou,
+                    tp=tp,
+                    fp=fp,
+                    fn=fn,
+                )
+                if out_path:
+                    viz_paths.append(out_path)
+                    viz_saved += 1
+
+            if args.progress_every > 0 and total_tasks > 0 and total_tasks % args.progress_every == 0:
+                print(f"{label}: progress tasks={total_tasks}")
+
+    if total_tasks == 0:
+        return (
+            {
+                "label": label,
+                "skill": effective_skill,
+                "model": model,
+                "reasoning": bool(args.reasoning),
+                "error": "No tasks evaluated",
+                "base_samples": total_base_samples,
+                "tasks": 0,
+                "failed_tasks": failed_tasks,
+                "attempted_tasks": failed_tasks,
+                "total_gt_boxes": total_gt_boxes,
+                "positive_tasks": positive_tasks,
+                "negative_tasks": negative_tasks,
+                "visualizations_saved": viz_saved,
+                "visualization_paths": viz_paths,
+            },
+            task_records,
+        )
+
+    micro_denom = 2 * total_tp + total_fp + total_fn
+    micro_f1 = 1.0 if micro_denom == 0 else (2 * total_tp) / micro_denom
+
+    per_class_payload: dict[str, Any] = {}
+    for class_name, stats in sorted(per_class.items()):
+        tasks = int(stats["tasks"])
+        denom = 2 * int(stats["tp"]) + int(stats["fp"]) + int(stats["fn"])
+        micro = 1.0 if denom == 0 else (2 * int(stats["tp"])) / denom
+        per_class_payload[class_name] = {
+            "tasks": tasks,
+            "tp": int(stats["tp"]),
+            "fp": int(stats["fp"]),
+            "fn": int(stats["fn"]),
+            "f1_micro": micro,
+            "f1_macro": (float(stats["f1_sum"]) / tasks) if tasks else 0.0,
+            "miou": (float(stats["miou_sum"]) / tasks) if tasks else 0.0,
+        }
+
+    return (
+        {
+            "label": label,
+            "skill": effective_skill,
+            "model": model,
+            "reasoning": bool(args.reasoning),
+            "dataset_name": args.dataset_name or None,
+            "dataset_path": args.dataset_path.strip() or None,
+            "split": args.split,
+            "base_samples": total_base_samples,
+            "tasks": total_tasks,
+            "failed_tasks": failed_tasks,
+            "attempted_tasks": total_tasks + failed_tasks,
+            "total_gt_boxes": total_gt_boxes,
+            "positive_tasks": positive_tasks,
+            "negative_tasks": negative_tasks,
+            "eval_f1": micro_f1,
+            "eval_f1_macro": total_f1 / total_tasks,
+            "eval_miou": total_miou / total_tasks,
+            "tp": total_tp,
+            "fp": total_fp,
+            "fn": total_fn,
+            "avg_latency_sec": total_latency / total_tasks,
+            "visualizations_saved": viz_saved,
+            "visualization_paths": viz_paths,
+            "per_class": per_class_payload,
+        },
+        task_records,
+    )
+
+
+def _print_summary(title: str, metrics: dict[str, Any]) -> None:
+    if "error" in metrics:
+        print(f"{title}: error={metrics['error']}")
+        return
+    skill = str(metrics.get("skill") or "detect")
+    if skill == "point":
+        print(
+            f"{title}: skill={skill} base_samples={metrics.get('base_samples', 0)} tasks={metrics['tasks']} "
+            f"f1={metrics['eval_f1']:.4f} macro_f1={metrics['eval_f1_macro']:.4f} "
+            f"tp={metrics['tp']} fp={metrics['fp']} fn={metrics['fn']} "
+            f"failed={metrics.get('failed_tasks', 0)} latency={metrics['avg_latency_sec']:.3f}s"
+        )
+    else:
+        print(
+            f"{title}: skill={skill} base_samples={metrics.get('base_samples', 0)} tasks={metrics['tasks']} "
+            f"miou={metrics['eval_miou']:.4f} "
+            f"f1={metrics['eval_f1']:.4f} macro_f1={metrics['eval_f1_macro']:.4f} "
+            f"tp={metrics['tp']} fp={metrics['fp']} fn={metrics['fn']} "
+            f"failed={metrics.get('failed_tasks', 0)} latency={metrics['avg_latency_sec']:.3f}s"
+        )
+
+
+def _resolve_env_file(env_file: str) -> str:
+    path = Path(env_file).expanduser()
+    if path.is_absolute():
+        return str(path)
+
+    from_cwd = (Path.cwd() / path).resolve()
+    if from_cwd.exists():
+        return str(from_cwd)
+
+    from_script = (_repo_relative(path.as_posix())).resolve()
+    if from_script.exists():
+        return str(from_script)
+
+    return str(from_cwd)
+
+
+def _resolve_runtime_env(args: argparse.Namespace) -> argparse.Namespace:
+    args.env_file = _resolve_env_file(str(args.env_file))
+    args.api_key_env_var = str(getattr(args, "api_key_env_var", "") or "").strip() or "MOONDREAM_API_KEY"
+    load_dotenv(args.env_file, override=True)
+    if not args.api_key:
+        args.api_key = os.environ.get(args.api_key_env_var, "")
+    if not args.api_key and args.api_key_env_var != "MOONDREAM_API_KEY":
+        args.api_key = os.environ.get("MOONDREAM_API_KEY", "")
+    if not args.hf_token:
+        args.hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    if not args.api_base:
+        args.api_base = (
+            os.environ.get("TUNA_BASE_URL")
+            or os.environ.get("MOONDREAM_BASE_URL")
+            or "https://api.moondream.ai/v1"
+        )
+    return args
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
+    pre_args, _ = pre_parser.parse_known_args(raw_argv)
+    config_path = _resolve_config_path(pre_args.config)
+    config = _load_json_config(config_path)
+
+    parser = argparse.ArgumentParser(description="Benchmark PI&D class-conditional detect/point performance.")
+    parser.add_argument("--config", default=str(config_path))
+    parser.add_argument("--env-file", default=str(_repo_relative(".env")))
+    parser.add_argument("--api-key", default="")
+    parser.add_argument("--api-key-env-var", default="MOONDREAM_API_KEY")
+    parser.add_argument("--hf-token", default="")
+    parser.add_argument("--api-base", default="")
+
+    parser.add_argument("--dataset-path", default=str(_repo_relative("outputs", "pid_icons_merged")))
+    parser.add_argument("--dataset-name", default="")
+    parser.add_argument("--split", default="post_val")
+    parser.add_argument(
+        "--class-names-file",
+        default="",
+        help=(
+            "Optional class names source. Supports JSON list, JSON with class_catalog, "
+            "or plain text label key lines (e.g. '12 generic valve closed')."
+        ),
+    )
+    parser.add_argument("--include-classes", nargs="*", default=None)
+    parser.add_argument("--exclude-classes", nargs="*", default=None)
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Max base samples to read from the selected eval split (applies before class-conditional task expansion).",
+    )
+    parser.add_argument(
+        "--max-post-train-eval-samples",
+        type=int,
+        default=None,
+        help="Alias for --max-samples, intended for post-train eval benchmarking.",
+    )
+    parser.add_argument(
+        "--viz-samples",
+        type=int,
+        default=0,
+        help="Number of evaluated tasks to visualize per model label (0 disables).",
+    )
+    parser.add_argument(
+        "--viz-dir",
+        default=str(_repo_relative("outputs", "benchmark_viz")),
+        help="Directory where benchmark visualizations are written.",
+    )
+
+    parser.add_argument("--model", default="")
+    parser.add_argument("--finetune-id", default="")
+    parser.add_argument("--checkpoint-step", type=int, default=None)
+    parser.add_argument(
+        "--checkpoint-fallback-policy",
+        choices=["nearest_saved", "exact"],
+        default="nearest_saved",
+    )
+    parser.add_argument("--checkpoint-ready-max-wait-s", type=float, default=0.0)
+    parser.add_argument("--checkpoint-ready-poll-interval-s", type=float, default=5.0)
+    parser.add_argument("--base-model", default="moondream3-preview")
+
+    parser.add_argument("--baseline-model", default="moondream3-preview")
+    parser.add_argument("--skip-baseline", action="store_true")
+    parser.add_argument(
+        "--prompt-overrides-json",
+        default="{}",
+        help="Optional JSON object mapping class name to benchmark prompt/object string.",
+    )
+    parser.add_argument(
+        "--skill",
+        choices=["detect", "point"],
+        default="detect",
+        help=(
+            "Skill to benchmark. In 'point' mode, a prediction counts as true-positive when a returned point "
+            "falls inside a GT box."
+        ),
+    )
+    parser.add_argument(
+        "--point-prompt-style",
+        choices=["detect_phrase", "class_name"],
+        default="detect_phrase",
+        help="Prompt style for class-conditional tasks (used when --skill=point).",
+    )
+    parser.add_argument(
+        "--runtime-tiling",
+        action="store_true",
+        help="Run each benchmark task on runtime-generated tiles, then merge the mapped predictions.",
+    )
+    parser.add_argument("--tile-grid-size", type=int, default=3)
+    parser.add_argument("--tile-overlap", type=float, default=0.10)
+    parser.add_argument("--tile-point-merge-radius", type=float, default=0.015)
+    parser.add_argument("--tile-box-merge-iou", type=float, default=0.50)
+
+    reasoning_group = parser.add_mutually_exclusive_group()
+    reasoning_group.add_argument(
+        "--reasoning",
+        dest="reasoning",
+        action="store_true",
+        help="Enable Moondream reasoning for benchmark requests.",
+    )
+    reasoning_group.add_argument(
+        "--no-reasoning",
+        dest="reasoning",
+        action="store_false",
+        help="Disable Moondream reasoning for benchmark requests.",
+    )
+    parser.set_defaults(reasoning=False)
+
+    parser.add_argument("--neg-prompts-per-empty", type=int, default=2)
+    parser.add_argument("--neg-prompts-per-nonempty", type=int, default=1)
+
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--max-objects", type=int, default=50)
+    parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--retry-429-max-retries", type=int, default=6)
+    parser.add_argument("--retry-429-backoff-s", type=float, default=0.5)
+    parser.add_argument("--retry-429-max-backoff-s", type=float, default=12.0)
+    parser.add_argument("--retry-timeout-max-retries", type=int, default=3)
+    parser.add_argument("--retry-timeout-backoff-s", type=float, default=2.0)
+    parser.add_argument("--retry-timeout-max-backoff-s", type=float, default=20.0)
+    parser.add_argument("--min-request-interval-s", type=float, default=0.0)
+    parser.add_argument("--iou-threshold", type=float, default=0.5)
+    parser.add_argument("--progress-every", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument("--out-json", default=str(_repo_relative("outputs", "benchmark_pid_icons.json")))
+    parser.add_argument(
+        "--records-jsonl",
+        default="",
+        help="Optional JSONL path for per-task benchmark records.",
+    )
+    parser.add_argument(
+        "--run-id",
+        default="",
+        help="Optional run identifier to attach to per-task records.",
+    )
+    option_to_dest: dict[str, str] = {}
+    for action in parser._actions:
+        if not action.option_strings:
+            continue
+        for opt in action.option_strings:
+            option_to_dest[opt] = action.dest
+    overridden_dests = {option_to_dest[arg] for arg in raw_argv if arg in option_to_dest}
+    config_cli_args = _config_to_cli_args(
+        parser,
+        config,
+        config_path=config_path,
+        overridden_dests=overridden_dests,
+    )
+    args = parser.parse_args(config_cli_args + raw_argv)
+    args.config = str(_resolve_config_path(args.config))
+    args.prompt_overrides = _parse_prompt_overrides_json(args.prompt_overrides_json)
+    args.include_classes = _normalize_class_name_list(args.include_classes)
+    args.exclude_classes = _normalize_class_name_list(args.exclude_classes)
+
+    return args
+
+
+def run(args: argparse.Namespace) -> None:
+    args = _resolve_runtime_env(args)
+    if not args.api_key:
+        raise ValueError("MOONDREAM_API_KEY is required")
+    if args.max_samples is not None and args.max_samples <= 0:
+        raise ValueError("--max-samples must be > 0 when provided")
+    if args.max_post_train_eval_samples is not None and args.max_post_train_eval_samples <= 0:
+        raise ValueError("--max-post-train-eval-samples must be > 0 when provided")
+    if (
+        args.max_samples is not None
+        and args.max_post_train_eval_samples is not None
+        and args.max_samples != args.max_post_train_eval_samples
+    ):
+        raise ValueError("--max-samples and --max-post-train-eval-samples disagree; set only one or match values.")
+    if args.max_post_train_eval_samples is not None:
+        args.max_samples = args.max_post_train_eval_samples
+    if args.viz_samples < 0:
+        raise ValueError("--viz-samples must be >= 0")
+    if args.tile_grid_size <= 0:
+        raise ValueError("--tile-grid-size must be > 0")
+    if not (0.0 <= args.tile_overlap < 1.0):
+        raise ValueError("--tile-overlap must be in [0, 1)")
+    if args.tile_point_merge_radius < 0.0:
+        raise ValueError("--tile-point-merge-radius must be >= 0")
+    if not (0.0 <= args.tile_box_merge_iou <= 1.0):
+        raise ValueError("--tile-box-merge-iou must be in [0, 1]")
+    if args.skill != "point" and args.point_prompt_style != "detect_phrase":
+        print("warning: --point-prompt-style is only applied when --skill=point; using detect_phrase.")
+
+    resolved_dataset_path, resolved_dataset_name = _resolve_dataset_source(args.dataset_path, args.dataset_name)
+    args.dataset_path = resolved_dataset_path
+    args.dataset_name = resolved_dataset_name
+
+    all_class_names = _load_class_names(args.class_names_file, args.dataset_path or None)
+    if not all_class_names:
+        all_class_names = _infer_class_names_from_dataset(
+            dataset_path=args.dataset_path,
+            dataset_name=args.dataset_name,
+            split=args.split,
+            token=args.hf_token,
+            max_samples=args.max_samples,
+        )
+        if all_class_names:
+            print(f"discovered {len(all_class_names)} class names from dataset rows")
+    if not all_class_names:
+        raise ValueError(
+            "Could not resolve class names from class file, local metadata, or dataset rows."
+        )
+    all_class_names = _filter_class_names(
+        all_class_names,
+        include_classes=args.include_classes,
+        exclude_classes=args.exclude_classes,
+    )
+    if not all_class_names and args.include_classes:
+        all_class_names = _filter_class_names(
+            list(args.include_classes),
+            include_classes=args.include_classes,
+            exclude_classes=args.exclude_classes,
+        )
+        if all_class_names:
+            print(f"using explicit include_classes fallback ({len(all_class_names)} classes)")
+    if not all_class_names:
+        raise ValueError("No class names remain after applying include/exclude filters.")
+
+    candidate_model = args.model.strip()
+    if not candidate_model and args.finetune_id.strip():
+        if args.checkpoint_step is not None:
+            resolved_checkpoint_step, used_fallback = resolve_checkpoint_step(
+                api_base=str(args.api_base),
+                api_key=str(args.api_key),
+                finetune_id=str(args.finetune_id).strip(),
+                requested_step=int(args.checkpoint_step),
+                fallback_policy=str(args.checkpoint_fallback_policy),
+                ready_max_wait_s=float(args.checkpoint_ready_max_wait_s),
+                ready_poll_interval_s=float(args.checkpoint_ready_poll_interval_s),
+            )
+            if used_fallback:
+                print(
+                    f"warning: requested checkpoint step={int(args.checkpoint_step)} not available; "
+                    f"using nearest saved step={resolved_checkpoint_step}"
+                )
+            candidate_model = (
+                f"{args.base_model.rstrip('/')}/{args.finetune_id.strip()}@{int(resolved_checkpoint_step)}"
+            )
+        else:
+            candidate_model = f"{args.base_model.rstrip('/')}/{args.finetune_id.strip()}"
+
+    if args.skip_baseline and not candidate_model:
+        raise ValueError("Provide --model or (--finetune-id with --checkpoint-step) when using --skip-baseline")
+
+    baseline_metrics = None
+    baseline_records: list[dict[str, Any]] = []
+    if not args.skip_baseline:
+        baseline_metrics, baseline_records = _evaluate_model("baseline", args.baseline_model, args, all_class_names)
+        _print_summary("baseline", baseline_metrics)
+
+    candidate_metrics = None
+    candidate_records: list[dict[str, Any]] = []
+    if candidate_model:
+        candidate_metrics, candidate_records = _evaluate_model("candidate", candidate_model, args, all_class_names)
+        _print_summary("candidate", candidate_metrics)
+
+    if baseline_metrics is not None and candidate_metrics is not None:
+        payload: dict[str, Any] = {
+            "baseline": baseline_metrics,
+            "candidate": candidate_metrics,
+            "config": {
+                "config": args.config,
+                "baseline_model": args.baseline_model,
+                "candidate_model": candidate_model,
+                "dataset_path": args.dataset_path.strip() or None,
+                "dataset_name": args.dataset_name or None,
+                "split": args.split,
+                "include_classes": list(args.include_classes),
+                "exclude_classes": list(args.exclude_classes),
+                "skill": args.skill,
+                "reasoning": bool(args.reasoning),
+                "point_prompt_style": args.point_prompt_style,
+                "max_samples": args.max_samples,
+                "viz_samples": args.viz_samples,
+                "viz_dir": str(Path(args.viz_dir).expanduser().resolve()) if args.viz_dir else None,
+                "seed": args.seed,
+            },
+        }
+    elif baseline_metrics is not None:
+        payload = baseline_metrics
+    else:
+        payload = candidate_metrics or {"error": "No evaluation was run."}
+
+    out_path = Path(args.out_json).expanduser().resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"saved metrics -> {out_path}")
+    if str(args.records_jsonl).strip():
+        records_path = Path(args.records_jsonl).expanduser().resolve()
+        records_path.parent.mkdir(parents=True, exist_ok=True)
+        all_records = [*baseline_records, *candidate_records]
+        with records_path.open("w", encoding="utf-8") as handle:
+            for record in all_records:
+                handle.write(json.dumps(record, sort_keys=True))
+                handle.write("\n")
+        print(f"saved task records -> {records_path}")
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    run(parse_args(argv))
+
+
+if __name__ == "__main__":
+    main()

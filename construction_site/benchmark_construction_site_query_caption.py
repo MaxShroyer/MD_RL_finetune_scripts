@@ -48,6 +48,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--model", default="")
     parser.add_argument("--finetune-id", default="")
     parser.add_argument("--checkpoint-step", type=int, default=-1)
+    parser.add_argument(
+        "--checkpoint-fallback-policy",
+        choices=["nearest_saved", "exact"],
+        default="nearest_saved",
+    )
+    parser.add_argument("--checkpoint-ready-max-wait-s", type=float, default=0.0)
+    parser.add_argument("--checkpoint-ready-poll-interval-s", type=float, default=5.0)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--max-tokens", type=int, default=320)
@@ -122,6 +129,9 @@ def main(argv: Optional[list[str]] = None) -> None:
             finetune_id=args.finetune_id,
             checkpoint_step=args.checkpoint_step,
             timeout=args.timeout,
+            fallback_policy=str(args.checkpoint_fallback_policy),
+            checkpoint_ready_max_wait_s=float(args.checkpoint_ready_max_wait_s),
+            checkpoint_ready_poll_interval_s=float(args.checkpoint_ready_poll_interval_s),
         )
     except ValueError as exc:
         raise SystemExit(str(exc))

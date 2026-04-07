@@ -1601,5 +1601,53 @@ class TrainingSmokeTests(unittest.TestCase):
             )
 
 
+class AsyncCheckpointEvalTests(unittest.TestCase):
+    def test_async_checkpoint_eval_requires_save_on_eval(self) -> None:
+        args = mod.parse_args(["--async-checkpoint-eval", "--no-save-on-eval"])
+        with self.assertRaisesRegex(ValueError, "requires --save-on-eval"):
+            mod._validate_args(args)
+
+    def test_async_checkpoint_eval_rejects_early_stop(self) -> None:
+        args = mod.parse_args(["--async-checkpoint-eval", "--early-stop"])
+        with self.assertRaisesRegex(ValueError, "not compatible with --early-stop"):
+            mod._validate_args(args)
+
+    def test_async_checkpoint_eval_command_uses_aggregate_benchmark(self) -> None:
+        args = mod.parse_args(
+            [
+                "--dataset-source",
+                "local_jsonl",
+                "--dataset-dir",
+                str(_dataset_root()),
+                "--dataset-variant-tag",
+                "mixed_tasks_v1",
+                "--env-file",
+                str(REPO_ROOT / "chess_QA" / ".env"),
+                "--base-url",
+                "https://example.invalid/v1",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cmd = mod._build_async_checkpoint_eval_command(
+                args=args,
+                finetune_id="ft_123",
+                checkpoint_step=23,
+                checkpoint_avg_splits=["val", "test"],
+                dataset_dir=_dataset_root(),
+                eval_temperature=0.0,
+                eval_top_p=1.0,
+                eval_reasoning=False,
+                active_eval_tasks={"list_all_pieces", "count_by_color"},
+                metrics_json_path=tmp_path / "metrics.json",
+                predictions_jsonl_path=tmp_path / "predictions.jsonl",
+            )
+        self.assertTrue(str(Path(cmd[1]).resolve()).endswith("chess_QA/benchmark_chess_checkpoint_average.py"))
+        self.assertIn("--checkpoint-fallback-policy", cmd)
+        self.assertIn("exact", cmd)
+        self.assertIn("--avg-splits", cmd)
+        self.assertIn("--task-types", cmd)
+
+
 if __name__ == "__main__":
     unittest.main()

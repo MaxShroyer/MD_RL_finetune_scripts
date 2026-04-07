@@ -482,6 +482,21 @@ def _build_parser(config: dict[str, Any], config_path: Path) -> argparse.Argumen
         default=_cfg_int(config, "checkpoint_step", -1),
         help="Optional checkpoint step for model id generation with --finetune-id.",
     )
+    parser.add_argument(
+        "--checkpoint-fallback-policy",
+        choices=["nearest_saved", "exact"],
+        default=_cfg_str(config, "checkpoint_fallback_policy", "nearest_saved"),
+    )
+    parser.add_argument(
+        "--checkpoint-ready-max-wait-s",
+        type=float,
+        default=_cfg_float(config, "checkpoint_ready_max_wait_s", 0.0),
+    )
+    parser.add_argument(
+        "--checkpoint-ready-poll-interval-s",
+        type=float,
+        default=_cfg_float(config, "checkpoint_ready_poll_interval_s", 5.0),
+    )
 
     parser.add_argument("--temperature", type=float, default=_cfg_float(config, "temperature", 0.0))
     parser.add_argument("--top-p", type=float, default=_cfg_float(config, "top_p", 1.0))
@@ -625,6 +640,9 @@ def main(argv: Optional[list[str]] = None) -> None:
             finetune_id=args.finetune_id,
             checkpoint_step=args.checkpoint_step,
             timeout=args.timeout,
+            fallback_policy=str(args.checkpoint_fallback_policy),
+            checkpoint_ready_max_wait_s=float(args.checkpoint_ready_max_wait_s),
+            checkpoint_ready_poll_interval_s=float(args.checkpoint_ready_poll_interval_s),
         )
     except ValueError as exc:
         raise SystemExit(str(exc))

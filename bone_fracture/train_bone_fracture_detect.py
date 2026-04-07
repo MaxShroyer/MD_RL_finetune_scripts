@@ -260,6 +260,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     args.prompt_overrides = _base._parse_prompt_overrides_json(args.prompt_overrides_json)
     if not args.finetune_id and not args.finetune_name:
         args.finetune_name = f"bone-fracture-detect-{_base._random_suffix()}"
+    args.async_checkpoint_eval_benchmark_script = str(
+        (SCRIPT_DIR / "benchmark_bone_fracture_detect.py").resolve()
+    )
     return args
 
 

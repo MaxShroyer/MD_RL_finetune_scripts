@@ -7,6 +7,9 @@ logs/
 raw_dataset/
 raw_datasets/
 
+config/
+configs/
+
 .DS_Store
 __pycache__
 *.pyc

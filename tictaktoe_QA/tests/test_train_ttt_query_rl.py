@@ -526,6 +526,33 @@ class ConfigPrecedenceTests(unittest.TestCase):
             args = mod.parse_args(["--config", str(cfg_path)])
             self.assertEqual(args.api_key_env_var, "CICID_GPUB_MOONDREAM_API_KEY_1")
 
+    def test_async_checkpoint_eval_config_parses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text(
+                json.dumps(
+                    {
+                        "dataset_dir": "synth_dataset/outputs/smoke_full_jsonl",
+                        "save_on_eval": True,
+                        "async_checkpoint_eval": True,
+                        "async_checkpoint_eval_dir": "outputs/async_checkpoint_eval/test_cfg",
+                        "async_checkpoint_eval_max_inflight": 2,
+                        "async_checkpoint_eval_drain_on_exit": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            args = mod.parse_args(["--config", str(cfg_path)])
+            self.assertTrue(args.async_checkpoint_eval)
+            self.assertEqual(args.async_checkpoint_eval_dir, "outputs/async_checkpoint_eval/test_cfg")
+            self.assertEqual(args.async_checkpoint_eval_max_inflight, 2)
+            self.assertTrue(args.async_checkpoint_eval_drain_on_exit)
+
+    def test_resolve_path_uses_default_when_raw_path_empty(self) -> None:
+        resolved = mod._resolve_path("", default=Path("outputs/async_checkpoint_eval"))
+        self.assertTrue(str(resolved).endswith("outputs/async_checkpoint_eval"))
+
     def test_off_policy_config_and_cli_override_precedence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = Path(tmp) / "cfg.json"

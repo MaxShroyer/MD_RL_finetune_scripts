@@ -1,0 +1,40 @@
+{
+  "manifest": "inspector_md/cleanup_manifests/cleanup_manifest_20260415_190136.json",
+  "removed_count": 607,
+  "missing_skipped_count": 6,
+  "removed_sample": [
+    "inspector_md/.DS_Store",
+    "inspector_md/__pycache__",
+    "inspector_md/outputs/baseline_eval_test100_v1",
+    "inspector_md/outputs/baseline_eval_test100_v2",
+    "inspector_md/outputs/detect_before_after_best_20260414_111922",
+    "inspector_md/outputs/hf_export_logs",
+    "inspector_md/outputs/inspector_detect_only_sweep_launcher.log",
+    "inspector_md/outputs/inspector_detect_only_sweep_logs",
+    "inspector_md/outputs/inspector_other_tasks_sweep_logs",
+    "inspector_md/outputs/inspector_point_only_sweep_logs",
+    "inspector_md/outputs/inspector_query_only_sweep_logs",
+    "inspector_md/outputs/inspector_query_refresh_logs",
+    "inspector_md/outputs/inspector_query_text_cache_shards",
+    "inspector_md/outputs/inspector_sweep_launch.stdout.log",
+    "inspector_md/outputs/inspector_sweep_logs",
+    "inspector_md/outputs/openrouter_refresh_smoke",
+    "inspector_md/outputs/point_before_after_best_20260414_112423",
+    "inspector_md/outputs/point_detect_report_20260413_123924",
+    "inspector_md/outputs/point_detect_report_smoke",
+    "inspector_md/outputs/query_refresh_batches.summary.json",
+    "inspector_md/outputs/query_refresh_summary.shard_000_of_012.json",
+    "inspector_md/outputs/query_refresh_summary.shard_001_of_012.json",
+    "inspector_md/outputs/query_refresh_summary.shard_002_of_012.json",
+    "inspector_md/outputs/query_refresh_summary.shard_003_of_012.json",
+    "inspector_md/outputs/query_refresh_summary.shard_004_of_012.json"
+  ],
+  "missing_skipped_sample": [
+    "inspector_md/outputs/hf_export_logs/query_hf_push_20260413_194644.log",
+    "inspector_md/outputs/inspector_other_tasks_sweep_logs/point_sft-r24-lr5e-05-g4.log",
+    "inspector_md/outputs/inspector_other_tasks_sweep_logs/point_sft-r24-lr5e-05-g8.log",
+    "inspector_md/outputs/benchmarks/detect_point_best_20260415/override_01KP7TSW0T9K6W3N97MQBC3TH4_step250",
+    "inspector_md/outputs/benchmarks/query_01KP6ET_at40_seed42_n128/.DS_Store",
+    "inspector_md/outputs/train_logs/subset_balanced_1000/full_run.nohup.log"
+  ]
+}

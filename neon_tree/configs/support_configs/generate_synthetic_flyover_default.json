@@ -1,0 +1,16 @@
+{
+  "env_file": ".env.staging",
+  "dataset_source": "hf_hub",
+  "hf_dataset_repo_id": "maxs-m87/neon_tree_detect_v1",
+  "hf_dataset_revision": "main",
+  "source_split": "train",
+  "window_width": 400,
+  "window_height": 400,
+  "step_x": 200,
+  "step_y": 200,
+  "fps": 12,
+  "path_style": "serpentine",
+  "max_source_rasters": 0,
+  "source_selection": "most_boxes",
+  "output_root": "neon_tree/outputs/flyovers"
+}

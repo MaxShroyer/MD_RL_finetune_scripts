@@ -1,0 +1,22 @@
+{
+  "stage": "normalize",
+  "raw_dataset_root": "inspector_md/raw_datasets",
+  "output_dir": "inspector_md/dataset/merged_synth_v1",
+  "env_file": "inspector_md/.env.staging",
+  "api_key": "",
+  "api_key_env_var": "OPENROUTER_API_KEY",
+  "api_base": "https://openrouter.ai/api/v1",
+  "teacher_model_id": "",
+  "seed": 42,
+  "mbdd_train_fraction": 0.7,
+  "mbdd_validation_fraction": 0.15,
+  "max_positive_records": 0,
+  "max_hard_negatives": 512,
+  "temperature": 0.2,
+  "top_p": 1.0,
+  "max_tokens": 700,
+  "timeout": 90.0,
+  "retry_429_max_retries": 3,
+  "retry_429_backoff_s": 1.0,
+  "retry_429_max_backoff_s": 12.0
+}

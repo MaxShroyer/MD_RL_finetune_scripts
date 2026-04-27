@@ -61,6 +61,13 @@ python tictaktoe_QA/train_ttt_query_rl.py \
   --max-tokens-by-task-json '{"available_moves_list":384}'
 ```
 
+Optional SFT bootstrap before RL:
+```bash
+python tictaktoe_QA/train_ttt_query_rl.py \
+  --config tictaktoe_QA/configs/query_rl_default.json \
+  --sft-bootstrap-steps 20
+```
+
 Off-policy replay config:
 ```bash
 python tictaktoe_QA/train_ttt_query_rl.py \
@@ -128,13 +135,16 @@ python tictaktoe_QA/train_ttt_query_rl.py \
 - `dataset_source` (`hf_hub` or `local_jsonl`, default `hf_hub`).
 - `hf_dataset_repo_id` / `hf_dataset_revision` / `hf_token` / `hf_cache_dir`: HF loader controls.
 - `reasoning` (bool): toggles query reasoning mode (default `false`).
+- `sft_bootstrap_steps` (int, default `0`): run an initial SFT-only warmup before RL updates begin.
+- TTT SFT bootstrap uses labeled answers directly. `best_move` rows only participate when the optimal set has exactly one move; tied-optimum rows stay RL-only.
+- In reasoning mode, SFT targets use `final_answer_json` for the answer plus the parsed `Reason:` section from `answer_text` for reasoning supervision.
 - `task_sampling_weights` (object): `task_type -> weight`, missing tasks default to `1.0`. Weights can be `0.0` to disable a task, but effective train-task weights must include at least one positive value.
 - Eval/final-test also respect `task_sampling_weights`: rows whose `task_type` has weight `0.0` are excluded from eval scoring.
 - `max_tokens_by_task` (object): optional `task_type -> max_tokens`; fallback is global `max_tokens`.
 - `off_policy` (bool): enable replay-buffer off-policy group mixing during train updates.
 - Do not combine `off_policy=true` and `reasoning=true`; trainer emits a warning because this setup is unstable.
 - `off_policy_mix_ratio` (float in `[0,1]`): target fraction of train groups sampled from replay.
-- `off_policy_buffer_size` / `off_policy_warmup_steps` / `off_policy_min_buffer_groups`: replay capacity and activation thresholds.
+- `off_policy_buffer_size` / `off_policy_warmup_steps` / `off_policy_min_buffer_groups`: replay capacity and activation thresholds. Replay warmup is keyed off RL update count, so bootstrap steps do not activate replay early.
 - `checkpoint_avg_splits` (list): splits to average during periodic eval/checkpoint ranking.
 - `checkpoint_ranking_output` (path): JSON artifact with all ranked eval checkpoints.
 - `auto_benchmark_best_checkpoint` (bool, default `true`): after training, run benchmark on the best ranked checkpoint.

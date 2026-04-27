@@ -1,0 +1,33 @@
+{
+  "env_file": "inspector_md/.env.staging",
+  "python_executable": "python",
+  "source_manifest": "inspector_md/dataset/subset_balanced_1000/synthetic_manifest.json",
+  "query_text_cache_jsonl": "inspector_md/outputs/inspector_query_text_cache.jsonl",
+  "output_root": "inspector_md/outputs/subset_balanced_1000",
+  "detect_output_dir": "inspector_md/outputs/subset_balanced_1000/inspector_detect_v1",
+  "point_output_dir": "inspector_md/outputs/subset_balanced_1000/inspector_point_v1",
+  "query_output_dir": "inspector_md/outputs/subset_balanced_1000/inspector_query_issues_v2",
+  "readiness_output_json": "inspector_md/outputs/subset_balanced_1000/inspector_finetune_readiness.json",
+  "log_dir": "inspector_md/outputs/train_logs/subset_balanced_1000",
+  "run_output_root": "inspector_md/outputs/runs/subset_balanced_1000",
+  "benchmark_output_root": "inspector_md/outputs/benchmarks/subset_balanced_1000",
+  "summary_json": "inspector_md/outputs/subset_balanced_1000/full_run_summary.json",
+  "run_tag": "subset1k-20260414",
+  "stages": [
+    "build",
+    "readiness",
+    "train",
+    "benchmark"
+  ],
+  "skip_existing": true,
+  "detect_sft_steps": 40,
+  "detect_rl_steps": 80,
+  "point_sft_steps": 40,
+  "point_rl_steps": 80,
+  "query_sft_steps": 60,
+  "query_rl_steps": 120,
+  "eval_every": 5,
+  "save_every": 5,
+  "detect_point_eval_max_samples": 68,
+  "query_eval_max_samples": 64
+}

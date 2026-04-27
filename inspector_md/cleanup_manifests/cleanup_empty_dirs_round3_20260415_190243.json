@@ -1,0 +1,34 @@
+[
+  {
+    "path": "inspector_md/outputs/subset_balanced_1000/async_checkpoint_eval_point_hybrid",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:46"
+  },
+  {
+    "path": "inspector_md/outputs/subset_balanced_1000/async_checkpoint_eval_point",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:46"
+  },
+  {
+    "path": "inspector_md/outputs/subset_balanced_1000/async_checkpoint_eval_detect_hybrid",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:46"
+  },
+  {
+    "path": "inspector_md/outputs/subset_balanced_1000/async_checkpoint_eval_detect",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:46"
+  }
+]

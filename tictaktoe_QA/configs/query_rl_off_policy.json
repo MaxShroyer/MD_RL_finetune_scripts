@@ -1,10 +1,12 @@
 {
   "env_file": ".env",
+  "api_key_env_var": "CICID_GPUB_MOONDREAM_API_KEY_1",
+  "base_url": "https://api-staging.moondream.ai/v1",
   "dataset_source": "hf_hub",
   "hf_dataset_repo_id": "maxs-m87/tictactoe-qa-v1",
   "hf_dataset_revision": "main",
   "hf_cache_dir": "",
-  "dataset_dir": "synth_dataset/outputs/v2",
+  "dataset_dir": "",
   "train_split": "train",
   "val_split": "val",
   "final_eval_splits": [
@@ -28,12 +30,13 @@
     "available_moves_list": 384
   },
   "reasoning": true,
+  "sft_bootstrap_steps": 0,
   "task_sampling_weights": {
     "best_move": 3.0,
     "available_moves_count": 3.0,
     "available_moves_list": 4.0
   },
-  "off_policy": true,
+  "off_policy": false,
   "off_policy_mix_ratio": 0.5,
   "off_policy_buffer_size": 4096,
   "off_policy_warmup_steps": 10,

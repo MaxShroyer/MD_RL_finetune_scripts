@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import importlib
 import itertools
 import io
 import json
+import math
 import os
 import random
 import shlex
@@ -29,11 +31,57 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
+# Ensure repo-root imports work when this file is run directly.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _prime_site_wandb() -> None:
+    if "wandb" in sys.modules:
+        return
+    original_sys_path = list(sys.path)
+    repo_root = REPO_ROOT.resolve()
+    cwd_root = Path.cwd().resolve()
+
+    def _is_repo_or_cwd_path(entry: str) -> bool:
+        try:
+            resolved = Path(entry).resolve()
+        except Exception:
+            return False
+        return (
+            resolved == repo_root
+            or resolved == cwd_root
+            or repo_root in resolved.parents
+            or cwd_root in resolved.parents
+        )
+
+    try:
+        sys.path[:] = [
+            entry
+            for entry in original_sys_path
+            if entry and not _is_repo_or_cwd_path(entry)
+        ]
+        try:
+            importlib.import_module("wandb")
+        except ModuleNotFoundError:
+            return
+    finally:
+        sys.path[:] = original_sys_path
+
+
+_prime_site_wandb()
+
 import numpy as np
 from datasets import Dataset, DatasetDict, get_dataset_split_names, load_dataset, load_from_disk
 from dotenv import load_dotenv
 from PIL import Image, ImageEnhance
 from scipy.optimize import linear_sum_assignment
+try:
+    from tqdm.auto import tqdm as _tqdm
+except ModuleNotFoundError:  # pragma: no cover
+    _tqdm = None
+
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from async_checkpoint_eval import (
     CheckpointEvalResult,
@@ -46,38 +94,83 @@ from finetune_checkpoints import save_checkpoint_step
 os.environ.setdefault("WANDB_START_METHOD", "thread")
 os.environ.setdefault("WANDB__SERVICE_WAIT", "300")
 
+class _WandbRun:
+    def __init__(self) -> None:
+        self.summary: dict[str, Any] = {}
+
+    def finish(self) -> None:
+        return
+
+
+class _WandbShim:
+    @staticmethod
+    def init(*args: Any, **kwargs: Any) -> _WandbRun:
+        print("wandb not installed; continuing without remote logging.")
+        return _WandbRun()
+
+    @staticmethod
+    def log(*args: Any, **kwargs: Any) -> None:
+        return
+
+
 try:
     import wandb  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover
-    class _WandbRun:
-        def __init__(self) -> None:
-            self.summary: dict[str, Any] = {}
-
-        def finish(self) -> None:
-            return
-
-    class _WandbShim:
-        @staticmethod
-        def init(*args: Any, **kwargs: Any) -> _WandbRun:
-            print("wandb not installed; continuing without remote logging.")
-            return _WandbRun()
-
-        @staticmethod
-        def log(*args: Any, **kwargs: Any) -> None:
-            return
-
     wandb = _WandbShim()
+else:  # pragma: no branch
+    if not hasattr(wandb, "init") or not hasattr(wandb, "log"):
+        # Local `wandb/` run directories can shadow the package as an empty namespace.
+        wandb = _WandbShim()
 
-# Ensure repo-root imports (tuna_sdk) work when this file is run directly.
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+
+class _NullProgressBar:
+    def update(self, n: int = 1) -> None:
+        return
+
+    def set_postfix(self, *args: Any, **kwargs: Any) -> None:
+        return
+
+    def close(self) -> None:
+        return
+
+
+def _make_progress_bar(*, total: int, desc: str):
+    if _tqdm is None:
+        return _NullProgressBar()
+    return _tqdm(total=max(0, int(total)), desc=desc, dynamic_ncols=True, mininterval=1.0)
+
+
+def _namespaced_wandb_payload(payload: Mapping[str, Any], *, namespace: str) -> dict[str, Any]:
+    output = dict(payload)
+    normalized_namespace = str(namespace or "").strip().strip("/")
+    if not normalized_namespace:
+        return output
+    for key, value in payload.items():
+        metric_key = str(key)
+        if "/" in metric_key:
+            continue
+        if metric_key.startswith(f"{normalized_namespace}_"):
+            metric_key = metric_key[len(normalized_namespace) + 1 :]
+        elif metric_key.startswith("eval_") and normalized_namespace in {"eval", "baseline_eval", "async_eval", "test"}:
+            metric_key = metric_key[len("eval_") :]
+        elif metric_key.startswith("train_") and normalized_namespace == "train":
+            metric_key = metric_key[len("train_") :]
+        elif metric_key.startswith("baseline_") and normalized_namespace == "baseline_eval":
+            metric_key = metric_key[len("baseline_") :]
+        output[f"{normalized_namespace}/{metric_key}"] = value
+    return output
+
+
+def _wandb_log(payload: Mapping[str, Any], *, step: int, namespace: str) -> None:
+    wandb.log(_namespaced_wandb_payload(payload, namespace=namespace), step=int(step))
 
 from tuna_sdk import (
     DetectAnnotation,
     DetectOutput,
     DetectRequest,
+    DetectSFTTarget,
     DetectSettings,
+    PointSFTTarget,
     Rollout,
     RolloutsRequest,
     TrainStepGroup,
@@ -302,13 +395,17 @@ class UsageStats:
 
 VAL_SPLIT_CANDIDATES = ("validation", "val", "dev", "test", "post_val")
 TEST_SPLIT_CANDIDATES = ("test", "post_val")
-SELECTION_METRIC_CHOICES = ("f1", "f1_macro", "miou")
+SELECTION_METRIC_CHOICES = ("f1", "f1_macro", "miou", "positive_f1", "positive_f1_macro")
 
 
 def _extract_class_catalog(payload: Any) -> list[tuple[str, str]]:
     raw_catalog: Any = None
     if isinstance(payload, dict) and isinstance(payload.get("class_catalog"), list):
         raw_catalog = payload.get("class_catalog")
+    elif isinstance(payload, dict) and isinstance(payload.get("detect_class_catalog"), list):
+        raw_catalog = payload.get("detect_class_catalog")
+    elif isinstance(payload, dict) and isinstance(payload.get("point_class_catalog"), list):
+        raw_catalog = payload.get("point_class_catalog")
     elif isinstance(payload, list) and payload and all(isinstance(item, dict) for item in payload):
         raw_catalog = payload
 
@@ -1072,6 +1169,58 @@ def _micro_f1_from_counts(tp: int, fp: int, fn: int) -> float:
     return (2.0 * float(tp)) / float(denom)
 
 
+def _binary_metrics_from_counts(
+    tp: int,
+    fp: int,
+    fn: int,
+    *,
+    empty_value: float = float("nan"),
+) -> tuple[float, float, float]:
+    precision_denom = int(tp) + int(fp)
+    recall_denom = int(tp) + int(fn)
+    f1_denom = (2 * int(tp)) + int(fp) + int(fn)
+    precision = empty_value if precision_denom == 0 else float(tp) / float(precision_denom)
+    recall = empty_value if recall_denom == 0 else float(tp) / float(recall_denom)
+    f1 = empty_value if f1_denom == 0 else (2.0 * float(tp)) / float(f1_denom)
+    return precision, recall, f1
+
+
+def _resolve_effective_num_steps(
+    *,
+    configured_num_steps: int,
+    train_row_passes: float,
+    total_train_rows: Optional[int],
+    batch_size: int,
+) -> tuple[int, bool]:
+    configured_steps = max(0, int(configured_num_steps))
+    requested_passes = float(train_row_passes or 0.0)
+    if requested_passes <= 0.0:
+        return configured_steps, False
+    if total_train_rows is None or total_train_rows <= 0:
+        return configured_steps, False
+    effective_steps = max(
+        1,
+        int(math.ceil((float(total_train_rows) * requested_passes) / float(max(1, int(batch_size))))),
+    )
+    return effective_steps, True
+
+
+def _should_sample_positive_next(
+    *,
+    consumed_positive: int,
+    consumed_negative: int,
+    target_positive_fraction: float,
+) -> bool:
+    fraction = float(target_positive_fraction)
+    if fraction <= 0.0:
+        return False
+    if fraction >= 1.0:
+        return True
+    total_consumed = max(0, int(consumed_positive) + int(consumed_negative))
+    desired_positive_after_next = int(math.ceil((float(total_consumed) + 1.0) * fraction))
+    return int(consumed_positive) < desired_positive_after_next
+
+
 def _selection_metric_key(selection_metric: str, *, prefix: str = "eval") -> str:
     metric = str(selection_metric or "").strip()
     if metric not in SELECTION_METRIC_CHOICES:
@@ -1081,6 +1230,18 @@ def _selection_metric_key(selection_metric: str, *, prefix: str = "eval") -> str
 
 def _selection_metric_value(metrics: Mapping[str, Any], selection_metric: str, *, prefix: str = "eval") -> float:
     return float(metrics.get(_selection_metric_key(selection_metric, prefix=prefix), 0.0))
+
+
+def _record_best_eval_metrics(run: Any, metrics: Mapping[str, Any], *, metric_key: str) -> None:
+    run.summary["best_metric_key"] = metric_key
+    run.summary["best_eval_f1"] = float(metrics.get("eval_f1", 0.0))
+    run.summary["best_eval_f1_macro"] = float(metrics.get("eval_f1_macro", 0.0))
+    run.summary["best_eval_miou"] = float(metrics.get("eval_miou", 0.0))
+    run.summary["best_eval_positive_f1"] = float(metrics.get("eval_positive_f1", 0.0))
+    run.summary["best_eval_positive_f1_macro"] = float(metrics.get("eval_positive_f1_macro", 0.0))
+    run.summary["best_eval_positive_tasks"] = int(metrics.get("eval_positive_tasks", 0))
+    run.summary["best_eval_negative_tasks"] = int(metrics.get("eval_negative_tasks", 0))
+    run.summary["best_eval_positive_task_shortfall"] = int(metrics.get("eval_positive_task_shortfall", 0))
 
 
 def _prefix_eval_metrics(metrics: Mapping[str, Any], *, prefix: str) -> dict[str, Any]:
@@ -1236,7 +1397,7 @@ def _ingest_async_checkpoint_eval_results(
             numeric_payload[delta_key] = (
                 _selection_metric_value(metrics, args.selection_metric) - baseline_eval_metric
             )
-        wandb.log(numeric_payload, step=arrival_step)
+        _wandb_log(numeric_payload, step=arrival_step, namespace="async_eval")
         latest_checkpoint_step = int(result.checkpoint_step)
         run.summary["latest_checkpoint_step"] = int(result.checkpoint_step)
         if (
@@ -1249,7 +1410,7 @@ def _ingest_async_checkpoint_eval_results(
             recall_gate_eval_tp = float(metrics.get("eval_tp", 0.0))
             recall_gate_min_tp = float(baseline_eval_tp) * (1.0 - float(args.recall_drop_threshold))
             recall_gate_pass = bool(recall_gate_eval_tp >= recall_gate_min_tp)
-            wandb.log(
+            _wandb_log(
                 {
                     "recall_gate_step": recall_gate_eval_step,
                     "recall_gate_eval_tp": recall_gate_eval_tp,
@@ -1259,6 +1420,7 @@ def _ingest_async_checkpoint_eval_results(
                     "async_eval_checkpoint_step": int(result.checkpoint_step),
                 },
                 step=arrival_step,
+                namespace="async_eval",
             )
             print(
                 f"recall gate step {recall_gate_eval_step}: "
@@ -1268,9 +1430,12 @@ def _ingest_async_checkpoint_eval_results(
         print(
             f"async eval step {source_step} checkpoint_step={result.checkpoint_step} "
             f"tasks={int(metrics.get('eval_tasks', 0))} "
+            f"pos_tasks={int(metrics.get('eval_positive_tasks', 0))} "
+            f"neg_tasks={int(metrics.get('eval_negative_tasks', 0))} "
             f"miou={float(metrics.get('eval_miou', 0.0)):.4f} "
             f"f1={float(metrics.get('eval_f1', 0.0)):.4f} "
             f"macro_f1={float(metrics.get('eval_f1_macro', 0.0)):.4f} "
+            f"pos_f1={float(metrics.get('eval_positive_f1', 0.0)):.4f} "
             f"{args.selection_metric}={_selection_metric_value(metrics, args.selection_metric):.4f} "
             f"logged_at_step={arrival_step}"
         )
@@ -1282,11 +1447,8 @@ def _ingest_async_checkpoint_eval_results(
             best_checkpoint_step = int(result.checkpoint_step)
             run.summary["best_step"] = int(best_step)
             run.summary[f"best_{metric_key}"] = float(best_metric)
-            run.summary["best_metric_key"] = metric_key
             run.summary["best_checkpoint_step"] = int(best_checkpoint_step)
-            run.summary["best_eval_f1"] = float(metrics.get("eval_f1", 0.0))
-            run.summary["best_eval_f1_macro"] = float(metrics.get("eval_f1_macro", 0.0))
-            run.summary["best_eval_miou"] = float(metrics.get("eval_miou", 0.0))
+            _record_best_eval_metrics(run, metrics, metric_key=metric_key)
         success_count += 1
     return (
         best_metric,
@@ -1387,6 +1549,22 @@ def _request_from_task(
         ),
         reasoning=bool(reasoning),
     )
+
+
+def _build_sft_group_for_task(
+    task: TaskSample,
+    *,
+    request: DetectRequest | PointRequest,
+    skill: str,
+) -> Optional[TrainStepGroup]:
+    if not task.is_positive or not task.gt_boxes:
+        return None
+    effective_skill = (skill or "detect").strip().lower()
+    if effective_skill == "point":
+        target = PointSFTTarget(boxes=list(task.gt_boxes))
+    else:
+        target = DetectSFTTarget(boxes=list(task.gt_boxes))
+    return TrainStepGroup.from_sft(request=request, targets=[target])
 
 
 def _tile_requests_for_task(
@@ -1638,6 +1816,22 @@ def _is_reasoning_unsupported_error(exc: Exception) -> bool:
     return "reasoning" in lowered and "extra_forbidden" in lowered
 
 
+def _is_sft_bootstrap_unsupported_error(exc: Exception) -> bool:
+    if not isinstance(exc, TunaAPIError):
+        return False
+    if int(getattr(exc, "status_code", 0) or 0) != 422:
+        return False
+    body = getattr(exc, "response_body", None)
+    if isinstance(body, (dict, list)):
+        body_text = json.dumps(body, ensure_ascii=True)
+    else:
+        body_text = str(body if body is not None else exc)
+    lowered = body_text.lower()
+    rl_only_schema = "input should be 'rl'" in lowered or "rlgroup" in lowered
+    missing_rl_request_fields = "finetune_id" in lowered and "field required" in lowered
+    return rl_only_schema and missing_rl_request_fields
+
+
 def _rollouts_batch_with_retry(
     *,
     finetune,
@@ -1680,6 +1874,7 @@ def _evaluate(
     neg_prompts_per_empty: int,
     neg_prompts_per_nonempty: int,
     max_samples: int,
+    eval_min_positive_tasks: int,
     batch_size: int,
     max_workers: int,
     rollout_retries: int,
@@ -1699,6 +1894,8 @@ def _evaluate(
 ) -> dict[str, float]:
     tasks: list[TaskSample] = []
     total = 0
+    scheduled_total = 0
+    scheduled_positive = 0
     total_f1 = 0.0
     total_miou = 0.0
     total_tp = 0
@@ -1715,6 +1912,8 @@ def _evaluate(
     negative_fp = 0
     negative_fn = 0
     effective_skill = (skill or "detect").strip().lower()
+    target_total_tasks = max(0, int(max_samples or 0))
+    target_positive_tasks = max(0, int(eval_min_positive_tasks or 0))
     reasoning_failure_hint_emitted = False
 
     def _drain_batch(batch: list[TaskSample]) -> None:
@@ -1871,16 +2070,22 @@ def _evaluate(
             prompt_style=point_prompt_style,
         )
         for task in task_list:
+            if target_total_tasks > 0 and scheduled_total >= target_total_tasks:
+                if scheduled_positive >= target_positive_tasks or not task.is_positive:
+                    continue
             tasks.append(task)
+            scheduled_total += 1
+            if task.is_positive:
+                scheduled_positive += 1
             if len(tasks) >= batch_size:
                 _drain_batch(tasks)
                 tasks = []
-            if max_samples and total >= max_samples:
+            if target_total_tasks > 0 and scheduled_total >= target_total_tasks and scheduled_positive >= target_positive_tasks:
                 break
-        if max_samples and total >= max_samples:
+        if target_total_tasks > 0 and scheduled_total >= target_total_tasks and scheduled_positive >= target_positive_tasks:
             break
 
-    if tasks and (not max_samples or total < max_samples):
+    if tasks:
         _drain_batch(tasks)
 
     if total == 0:
@@ -1894,14 +2099,18 @@ def _evaluate(
             "eval_fn": 0,
             "eval_positive_tasks": 0,
             "eval_positive_f1": 0.0,
+            "eval_positive_f1_macro": 0.0,
             "eval_positive_tp": 0,
             "eval_positive_fp": 0,
             "eval_positive_fn": 0,
             "eval_negative_tasks": 0,
             "eval_negative_f1": 0.0,
+            "eval_negative_f1_macro": 0.0,
             "eval_negative_tp": 0,
             "eval_negative_fp": 0,
             "eval_negative_fn": 0,
+            "eval_target_min_positive_tasks": target_positive_tasks,
+            "eval_positive_task_shortfall": target_positive_tasks,
         }
 
     micro_f1 = _micro_f1_from_counts(total_tp, total_fp, total_fn)
@@ -1925,6 +2134,8 @@ def _evaluate(
         "eval_negative_tp": negative_tp,
         "eval_negative_fp": negative_fp,
         "eval_negative_fn": negative_fn,
+        "eval_target_min_positive_tasks": target_positive_tasks,
+        "eval_positive_task_shortfall": max(0, target_positive_tasks - positive_tasks),
     }
 
 
@@ -2069,10 +2280,20 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--buffer-size", type=int, default=100)
     parser.add_argument("--num-steps", type=int, default=100)
+    parser.add_argument(
+        "--train-row-passes",
+        type=float,
+        default=0.0,
+        help=(
+            "If >0 and the train split size is known, override --num-steps so the run "
+            "consumes approximately this many full passes over the train rows."
+        ),
+    )
     parser.add_argument("--resume-step", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--group-size", type=int, default=6)
     parser.add_argument("--lr", type=float, default=2e-3)
+    parser.add_argument("--sft-bootstrap-steps", type=int, default=0)
     parser.add_argument("--max-workers", type=int, default=4)
     parser.add_argument("--rollout-retries", type=int, default=2)
     parser.add_argument("--rollout-retry-backoff-s", type=float, default=1.0)
@@ -2187,6 +2408,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--target-positive-fraction",
+        type=float,
+        default=-1.0,
+        help=(
+            "Desired global fraction of positive training tasks among consumed tasks. "
+            "Set to a value in [0, 1] to enable ratio-controlled sampling; negative "
+            "values keep the legacy row-local --pos-task-prob behavior."
+        ),
+    )
+    parser.add_argument(
         "--neg-reward-weight",
         type=float,
         default=0.5,
@@ -2242,6 +2473,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--eval-top-p", type=float, default=1.0)
     parser.add_argument("--eval-every", type=int, default=50)
     parser.add_argument("--eval-max-samples", type=int, default=200)
+    parser.add_argument(
+        "--eval-min-positive-tasks",
+        type=int,
+        default=0,
+        help="Keep sampling eval tasks until at least this many positive tasks are included, even if that slightly exceeds --eval-max-samples.",
+    )
     parser.add_argument("--eval-batch-size", type=int, default=20)
     parser.add_argument(
         "--run-final-test",
@@ -2344,6 +2581,8 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("negative prompt counts must be >= 0")
     if not (0.0 <= args.pos_task_prob <= 1.0):
         raise ValueError("--pos-task-prob must be in [0, 1]")
+    if args.target_positive_fraction > 1.0:
+        raise ValueError("--target-positive-fraction must be <= 1.0")
     if args.neg_reward_weight <= 0.0:
         raise ValueError("--neg-reward-weight must be > 0")
     if args.neg_reward_weight > 1.0:
@@ -2365,8 +2604,14 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--fp-penalty-exponent must be >= 1.0")
     if args.rollout_retries < 0:
         raise ValueError("--rollout-retries must be >= 0")
+    if args.train_row_passes < 0.0:
+        raise ValueError("--train-row-passes must be >= 0")
     if args.rollout_retry_backoff_s <= 0.0:
         raise ValueError("--rollout-retry-backoff-s must be > 0")
+    if args.eval_min_positive_tasks < 0:
+        raise ValueError("--eval-min-positive-tasks must be >= 0")
+    if args.sft_bootstrap_steps < 0:
+        raise ValueError("--sft-bootstrap-steps must be >= 0")
     if args.recall_gate_step < 0:
         raise ValueError("--recall-gate-step must be >= 0")
     if not (0.0 <= args.recall_drop_threshold < 1.0):
@@ -2398,12 +2643,21 @@ def run(args: argparse.Namespace) -> None:
         if args.skill == "point":
             selection_metric = "f1"
         else:
-            selection_metric = "miou" if args.reward_metric == "miou" else "f1"
+            selection_metric = "miou" if args.reward_metric == "miou" else "positive_f1"
     if selection_metric not in SELECTION_METRIC_CHOICES:
         raise ValueError(f"--selection-metric must be one of {SELECTION_METRIC_CHOICES}")
     if args.skill == "point" and selection_metric == "miou":
         print("warning: --selection-metric=miou is not meaningful for point runs; using f1.")
         selection_metric = "f1"
+    if (
+        args.skill == "detect"
+        and selection_metric in {"positive_f1", "positive_f1_macro"}
+        and int(args.eval_min_positive_tasks) <= 0
+    ):
+        args.eval_min_positive_tasks = min(16, max(1, int(args.eval_max_samples or 16)))
+        print(
+            f"applied detect eval positive-task floor: eval_min_positive_tasks={int(args.eval_min_positive_tasks)}"
+        )
     args.selection_metric = selection_metric
     off_policy_injection_allowed = bool(
         args.off_policy and (not args.reasoning or args.allow_off_policy_with_reasoning) and not args.runtime_tiling
@@ -2619,18 +2873,34 @@ def run(args: argparse.Namespace) -> None:
     if not args.finetune_id and not args.finetune_name:
         args.finetune_name = f"pid-icons-{args.skill}-{_random_suffix()}"
 
-    expected_tasks = args.num_steps * args.batch_size
+    configured_num_steps = max(0, int(args.num_steps))
+    effective_num_steps, train_row_passes_applied = _resolve_effective_num_steps(
+        configured_num_steps=configured_num_steps,
+        train_row_passes=float(args.train_row_passes),
+        total_train_rows=total_train_rows,
+        batch_size=int(args.batch_size),
+    )
+    expected_tasks = effective_num_steps * args.batch_size
+    target_positive_fraction = float(args.target_positive_fraction)
+    ratio_control_enabled = 0.0 <= target_positive_fraction <= 1.0
     if total_train_rows is not None:
         print(
             f"dataset usage plan: train_rows_total={total_train_rows} "
-            f"requested_steps={args.num_steps} batch_size={args.batch_size} "
+            f"configured_steps={configured_num_steps} effective_steps={effective_num_steps} "
+            f"batch_size={args.batch_size} "
             f"expected_tasks_consumed={expected_tasks}"
         )
     else:
         print(
             "dataset usage plan: train_rows_total=unknown (streaming) "
-            f"requested_steps={args.num_steps} batch_size={args.batch_size} "
+            f"configured_steps={configured_num_steps} effective_steps={effective_num_steps} "
+            f"batch_size={args.batch_size} "
             f"expected_tasks_consumed={expected_tasks}"
+        )
+    if train_row_passes_applied:
+        print(
+            f"dataset usage plan: train_row_passes={float(args.train_row_passes):.3f} "
+            f"resolved_steps={effective_num_steps}"
         )
     if total_val_rows is not None:
         print(f"dataset usage plan: val_rows_total={total_val_rows}")
@@ -2638,22 +2908,36 @@ def run(args: argparse.Namespace) -> None:
         print(f"dataset usage note: consumed {discovery_train_rows_consumed} training rows for class discovery")
     print(
         "run control: "
-        f"num_steps={args.num_steps} resume_step={args.resume_step} "
+        f"num_steps={effective_num_steps} configured_num_steps={configured_num_steps} "
+        f"resume_step={args.resume_step} "
         f"eval_every={args.eval_every} save_every={args.save_every} "
         f"off_policy={args.off_policy} off_policy_injection_allowed={off_policy_injection_allowed} "
         f"reasoning_train={bool(args.reasoning)} reasoning_eval={eval_reasoning} "
         f"runtime_tiling={bool(args.runtime_tiling)} selection_metric={args.selection_metric} "
         f"run_final_test={bool(args.run_final_test)}"
     )
+    if ratio_control_enabled:
+        print(
+            f"task sampling: target_positive_fraction={target_positive_fraction:.3f} "
+            f"target_negative_fraction={1.0 - target_positive_fraction:.3f}"
+        )
     effective_point_prompt_style = args.point_prompt_style if args.skill == "point" else "detect_phrase"
     if args.skill != "point" and args.point_prompt_style != "detect_phrase":
         print("warning: --point-prompt-style is only applied when --skill=point; using detect_phrase.")
+    effective_sft_bootstrap_steps = int(args.sft_bootstrap_steps)
+    if effective_sft_bootstrap_steps > 0 and bool(args.runtime_tiling):
+        print(
+            "warning: SFT bootstrap is disabled while --runtime-tiling is enabled. "
+            "Falling back to pure RL for this run."
+        )
+        effective_sft_bootstrap_steps = 0
 
     client = TunaClient(api_key=args.api_key, base_url=args.base_url)
     if args.finetune_id:
         finetune = client.get_finetune(args.finetune_id)
     else:
         finetune = client.create_finetune(name=args.finetune_name, rank=args.rank)
+    print(f"resolved_finetune_id={finetune.finetune_id}")
 
     run = wandb.init(
         project=args.wandb_project,
@@ -2676,8 +2960,13 @@ def run(args: argparse.Namespace) -> None:
             "neg_prompts_per_empty": args.neg_prompts_per_empty,
             "neg_prompts_per_nonempty": args.neg_prompts_per_nonempty,
             "augment_prob": args.augment_prob,
-            "num_steps": args.num_steps,
+            "num_steps": effective_num_steps,
+            "configured_num_steps": configured_num_steps,
+            "train_row_passes": float(args.train_row_passes),
+            "train_row_passes_applied": int(train_row_passes_applied),
             "resume_step": args.resume_step,
+            "sft_bootstrap_steps": int(args.sft_bootstrap_steps),
+            "effective_sft_bootstrap_steps": int(effective_sft_bootstrap_steps),
             "batch_size": args.batch_size,
             "group_size": args.group_size,
             "lr": args.lr,
@@ -2709,6 +2998,9 @@ def run(args: argparse.Namespace) -> None:
             "fn_penalty_exponent": args.fn_penalty_exponent,
             "fp_penalty_exponent": args.fp_penalty_exponent,
             "pos_task_prob": args.pos_task_prob,
+            "target_positive_fraction": (
+                target_positive_fraction if ratio_control_enabled else None
+            ),
             "neg_reward_weight": args.neg_reward_weight,
             "use_recall_first_preset": args.use_recall_first_preset,
             "recall_gate_step": args.recall_gate_step,
@@ -2733,7 +3025,8 @@ def run(args: argparse.Namespace) -> None:
         },
     )
 
-    def _next_task() -> TaskSample:
+    def _sample_task(*, require_label: Optional[bool]) -> tuple[TaskSample, int]:
+        skipped_ineligible = 0
         while True:
             row = next(train_row_iter)
             base = _to_base_sample(row)
@@ -2772,15 +3065,28 @@ def run(args: argparse.Namespace) -> None:
                     usage.tasks_generated_negative += 1
             positives = [task for task in new_tasks if task.is_positive]
             negatives = [task for task in new_tasks if not task.is_positive]
-            if positives:
-                if rng.random() < float(args.pos_task_prob):
+            if require_label is True:
+                if positives:
                     selected_task = rng.choice(positives)
-                elif negatives:
+                else:
+                    skipped_ineligible += max(1, len(negatives))
+                    continue
+            elif require_label is False:
+                if negatives:
                     selected_task = rng.choice(negatives)
                 else:
-                    selected_task = rng.choice(positives)
+                    skipped_ineligible += max(1, len(positives))
+                    continue
             else:
-                selected_task = rng.choice(negatives)
+                if positives:
+                    if rng.random() < float(args.pos_task_prob):
+                        selected_task = rng.choice(positives)
+                    elif negatives:
+                        selected_task = rng.choice(negatives)
+                    else:
+                        selected_task = rng.choice(positives)
+                else:
+                    selected_task = rng.choice(negatives)
             usage.tasks_consumed += 1
             usage.source_tasks_consumed[selected_task.source] += 1
             usage.class_tasks_consumed[selected_task.class_name] += 1
@@ -2788,13 +3094,31 @@ def run(args: argparse.Namespace) -> None:
                 usage.tasks_consumed_positive += 1
             else:
                 usage.tasks_consumed_negative += 1
-            return selected_task
+            return selected_task, skipped_ineligible
+
+    def _next_task() -> TaskSample:
+        if ratio_control_enabled:
+            require_positive = _should_sample_positive_next(
+                consumed_positive=usage.tasks_consumed_positive,
+                consumed_negative=usage.tasks_consumed_negative,
+                target_positive_fraction=target_positive_fraction,
+            )
+            task, _ = _sample_task(require_label=require_positive)
+        else:
+            task, _ = _sample_task(require_label=None)
+        return task
+
+    def _next_positive_task() -> tuple[TaskSample, int]:
+        return _sample_task(require_label=True)
 
     best_metric: Optional[float] = None
     best_step: Optional[int] = None
     best_checkpoint_step: Optional[int] = None
     latest_checkpoint_step: Optional[int] = None
     successful_updates = args.resume_step
+    running_train_tp = 0
+    running_train_fp = 0
+    running_train_fn = 0
     baseline_eval_metric: Optional[float] = None
     baseline_eval_tp: Optional[float] = None
     recall_gate_pass: Optional[bool] = None
@@ -2807,6 +3131,11 @@ def run(args: argparse.Namespace) -> None:
     early_stop_reason = ""
     async_eval_jobs: list[Any] = []
     async_eval_success_count = 0
+    bootstrap_steps_completed = min(int(args.resume_step), int(effective_sft_bootstrap_steps))
+    bootstrap_groups_total = 0
+    bootstrap_skipped_ineligible_total = 0
+    sft_bootstrap_disabled_backend_unsupported = False
+    last_phase_label: Optional[str] = None
 
     def _run_and_log_eval(*, trigger: str, step_for_log: int) -> Optional[dict[str, float]]:
         nonlocal eval_events_logged
@@ -2826,6 +3155,7 @@ def run(args: argparse.Namespace) -> None:
                 neg_prompts_per_empty=args.neg_prompts_per_empty,
                 neg_prompts_per_nonempty=args.neg_prompts_per_nonempty,
                 max_samples=args.eval_max_samples,
+                eval_min_positive_tasks=args.eval_min_positive_tasks,
                 batch_size=args.eval_batch_size,
                 max_workers=args.max_workers,
                 rollout_retries=args.rollout_retries,
@@ -2847,12 +3177,12 @@ def run(args: argparse.Namespace) -> None:
             event_payload["eval_event_success"] = 1
             if trigger == "baseline":
                 event_payload.update({f"baseline_{key}": value for key, value in eval_metrics.items()})
-            wandb.log(event_payload, step=step_for_log)
+            _wandb_log(event_payload, step=step_for_log, namespace="baseline_eval" if trigger == "baseline" else "eval")
             return eval_metrics
         except Exception as exc:
             event_payload["eval_event_success"] = 0
             event_payload["eval_event_error"] = f"{type(exc).__name__}: {exc}"
-            wandb.log(event_payload, step=step_for_log)
+            _wandb_log(event_payload, step=step_for_log, namespace="baseline_eval" if trigger == "baseline" else "eval")
             print(f"eval {trigger} failed at step {step_for_log}: {type(exc).__name__}: {exc}")
             return None
 
@@ -2869,13 +3199,24 @@ def run(args: argparse.Namespace) -> None:
             run.summary["baseline_metric_key"] = metric_key
             print(
                 f"baseline eval step {baseline_step} tasks={baseline_metrics['eval_tasks']} "
+                f"pos_tasks={baseline_metrics['eval_positive_tasks']} "
+                f"neg_tasks={baseline_metrics['eval_negative_tasks']} "
                 f"miou={baseline_metrics['eval_miou']:.4f} f1={baseline_metrics['eval_f1']:.4f} "
                 f"macro_f1={baseline_metrics['eval_f1_macro']:.4f} "
                 f"pos_f1={baseline_metrics['eval_positive_f1']:.4f} "
                 f"neg_f1={baseline_metrics['eval_negative_f1']:.4f}"
             )
+            if int(baseline_metrics.get("eval_positive_task_shortfall", 0)) > 0:
+                print(
+                    f"warning: baseline eval positive-task shortfall="
+                    f"{int(baseline_metrics['eval_positive_task_shortfall'])} "
+                    f"(target={int(baseline_metrics.get('eval_target_min_positive_tasks', 0))})"
+                )
 
-    for step in range(args.num_steps):
+    train_progress = _make_progress_bar(total=int(effective_num_steps), desc=f"{args.skill} train")
+    for step in range(effective_num_steps):
+        if step > 0:
+            train_progress.update(1)
         global_step = args.resume_step + step
         step_start = time.monotonic()
 
@@ -2909,14 +3250,32 @@ def run(args: argparse.Namespace) -> None:
             )
             async_eval_success_count += int(completed_successes)
 
-        batch = [_next_task() for _ in range(args.batch_size)]
-        logical_requests: list[DetectRequest | PointRequest] = []
-        task_requests_per_item: list[list[DetectRequest | PointRequest]] = []
-        tile_windows_per_item: list[list[TileWindow]] = []
-        flat_requests: list[DetectRequest | PointRequest] = []
-        for item in batch:
-            logical_requests.append(
-                _request_from_task(
+        is_bootstrap_step = global_step < effective_sft_bootstrap_steps
+        phase_label = "sft" if is_bootstrap_step else "rl"
+        if phase_label != last_phase_label:
+            if last_phase_label == "sft" and phase_label == "rl":
+                print(
+                    f"{args.skill} sft phase complete at step {global_step - 1}; "
+                    f"starting rl phase at step {global_step}"
+                )
+            else:
+                print(f"starting {args.skill} {phase_label} phase at step {global_step}")
+            last_phase_label = phase_label
+        batch: list[TaskSample] = []
+        rows_seen_fraction = (
+            usage.rows_seen / float(total_train_rows)
+            if total_train_rows and total_train_rows > 0
+            else 0.0
+        )
+
+        if is_bootstrap_step:
+            skipped_ineligible_step = 0
+            sft_groups: list[TrainStepGroup] = []
+            for _ in range(args.batch_size):
+                item, skipped = _next_positive_task()
+                batch.append(item)
+                skipped_ineligible_step += skipped
+                request_obj = _request_from_task(
                     item,
                     skill=args.skill,
                     temperature=args.temperature,
@@ -2925,81 +3284,241 @@ def run(args: argparse.Namespace) -> None:
                     max_objects=args.max_objects,
                     reasoning=bool(args.reasoning),
                 )
-            )
-            tile_windows, task_requests = _tile_requests_for_task(
-                item,
-                skill=args.skill,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                max_tokens=args.max_tokens,
-                max_objects=args.max_objects,
-                reasoning=bool(args.reasoning),
-                runtime_tiling=bool(args.runtime_tiling),
-                tile_grid_size=int(args.tile_grid_size),
-                tile_overlap=float(args.tile_overlap),
-            )
-            task_requests_per_item.append(task_requests)
-            tile_windows_per_item.append(tile_windows)
-            flat_requests.extend(task_requests)
+                sft_group = _build_sft_group_for_task(item, request=request_obj, skill=args.skill)
+                if sft_group is not None:
+                    sft_groups.append(sft_group)
 
-        try:
-            rollout_start = time.monotonic()
-            results = _rollouts_batch_with_retry(
-                finetune=finetune,
-                requests=flat_requests,
-                num_rollouts=args.group_size,
-                max_workers=min(args.max_workers, len(flat_requests)),
-                retries=args.rollout_retries,
-                backoff_s=args.rollout_retry_backoff_s,
-                context=f"train step {global_step}",
+            if not sft_groups:
+                print(f"train step {global_step}: no eligible SFT groups for bootstrap; skipping step")
+                continue
+
+            try:
+                train_start = time.monotonic()
+                train_out = finetune.train_step(groups=sft_groups, lr=args.lr)
+                train_end = time.monotonic()
+            except (TunaAPIError, TunaNetworkError) as exc:
+                if _is_sft_bootstrap_unsupported_error(exc):
+                    sft_bootstrap_disabled_backend_unsupported = True
+                    effective_sft_bootstrap_steps = min(int(effective_sft_bootstrap_steps), int(global_step))
+                    print(
+                        "warning: backend rejected SFT bootstrap groups; "
+                        "disabling bootstrap and continuing with RL. "
+                        f"details: {_format_tuna_error(exc)}"
+                    )
+                    continue
+                print(f"train_step failed at step {global_step}: {_format_tuna_error(exc)}. skipping step")
+                continue
+
+            successful_updates += 1
+            bootstrap_steps_completed += 1
+            bootstrap_groups_total += len(sft_groups)
+            bootstrap_skipped_ineligible_total += skipped_ineligible_step
+
+            kl_value = float(train_out.kl or 0.0)
+            kl_consecutive_hits, kl_warning_triggered, kl_stop_triggered = _update_kl_guard(
+                kl_value=kl_value,
+                warning_threshold=float(args.kl_warning_threshold),
+                stop_threshold=float(args.kl_stop_threshold),
+                stop_consecutive=int(args.kl_stop_consecutive),
+                consecutive_hits=kl_consecutive_hits,
             )
-            rollout_end = time.monotonic()
-        except (TunaAPIError, TunaNetworkError) as exc:
-            if bool(args.reasoning) and _is_reasoning_unsupported_error(exc):
-                raise ValueError(
-                    "API rejects request reasoning for tuning rollouts (422 extra_forbidden). "
-                    "Use --no-reasoning --no-eval-reasoning for train/eval rollouts."
-                ) from exc
-            print(f"rollouts_batch failed at step {global_step}: {_format_tuna_error(exc)}. skipping step")
-            continue
-        if len(results) != len(flat_requests):
+
+            _wandb_log(
+                {
+                    "bootstrap_phase": 1,
+                    "sft_group_count": len(sft_groups),
+                    "sft_skipped_ineligible": skipped_ineligible_step,
+                    "sft_loss": float(getattr(train_out, "sft_loss", 0.0) or 0.0),
+                    "batch_positive_tasks": len(batch),
+                    "batch_negative_tasks": 0,
+                    "accepted_groups": len(sft_groups),
+                    "off_policy_injected": 0,
+                    "off_policy_injected_positive": 0,
+                    "off_policy_injected_negative": 0,
+                    "off_policy_considered": 0,
+                    "off_policy_trigger_low_max": 0,
+                    "off_policy_trigger_low_mean": 0,
+                    "off_policy_skipped_high_reward": 0,
+                    "off_policy_skipped_high_variance": 0,
+                    "off_policy_skipped_reasoning_guard": 0,
+                    "kl": kl_value,
+                    "router_kl": train_out.router_kl if train_out.router_kl is not None else 0.0,
+                    "grad_norm": train_out.grad_norm if train_out.grad_norm is not None else 0.0,
+                    "kl_warning_triggered": int(kl_warning_triggered),
+                    "kl_stop_triggered": int(kl_stop_triggered),
+                    "kl_stop_consecutive_hits": kl_consecutive_hits,
+                    "rows_seen": usage.rows_seen,
+                    "rows_seen_fraction": rows_seen_fraction,
+                    "tasks_generated_total": usage.tasks_generated,
+                    "tasks_generated_positive_total": usage.tasks_generated_positive,
+                    "tasks_generated_negative_total": usage.tasks_generated_negative,
+                    "tasks_consumed_total": usage.tasks_consumed,
+                    "tasks_consumed_positive_total": usage.tasks_consumed_positive,
+                    "tasks_consumed_negative_total": usage.tasks_consumed_negative,
+                },
+                step=global_step,
+                namespace="train",
+            )
+
+            total_s = time.monotonic() - step_start
             print(
-                f"warning: train step {global_step} returned {len(results)} results for "
-                f"{len(flat_requests)} requests; only aligned results are used."
+                f"step {global_step} sft groups={len(sft_groups)} "
+                f"skipped={skipped_ineligible_step} kl={kl_value:.4f} "
+                f"sft_loss={float(getattr(train_out, 'sft_loss', 0.0) or 0.0):.4f} "
+                f"train_s={(train_end-train_start):.2f} total_s={total_s:.2f} "
+                f"updates={successful_updates}"
             )
-
-        groups: list[TrainStepGroup] = []
-        all_rewards: list[float] = []
-        off_policy_injected_total = 0
-        off_policy_injected_positive = 0
-        off_policy_injected_negative = 0
-        off_policy_considered = 0
-        off_policy_trigger_low_max = 0
-        off_policy_trigger_low_mean = 0
-        off_policy_skipped_high_reward = 0
-        off_policy_skipped_high_variance = 0
-        off_policy_skipped_reasoning_guard = 0
-        train_tp = 0
-        train_fp = 0
-        train_fn = 0
-        result_index = 0
-        for idx, item in enumerate(batch):
-            task_requests = task_requests_per_item[idx]
-            tile_windows = tile_windows_per_item[idx]
-            task_results = list(results[result_index : result_index + len(task_requests)])
-            result_index += len(task_requests)
-
-            if args.runtime_tiling:
-                merged_rollouts = _merge_rollouts_across_tiles(
-                    tile_results=task_results,
-                    tile_windows=tile_windows,
-                    skill=args.skill,
-                    expected_rollouts=args.group_size,
-                    point_merge_radius=float(args.tile_point_merge_radius),
-                    box_merge_iou=float(args.tile_box_merge_iou),
+            train_progress.set_postfix(
+                {
+                    "step": global_step,
+                    "phase": "sft",
+                    "loss": f"{float(getattr(train_out, 'sft_loss', 0.0) or 0.0):.3f}",
+                    "kl": f"{kl_value:.3f}",
+                },
+                refresh=False,
+            )
+        else:
+            logical_requests: list[DetectRequest | PointRequest] = []
+            task_requests_per_item: list[list[DetectRequest | PointRequest]] = []
+            tile_windows_per_item: list[list[TileWindow]] = []
+            flat_requests: list[DetectRequest | PointRequest] = []
+            for _ in range(args.batch_size):
+                batch.append(_next_task())
+            for item in batch:
+                logical_requests.append(
+                    _request_from_task(
+                        item,
+                        skill=args.skill,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        max_tokens=args.max_tokens,
+                        max_objects=args.max_objects,
+                        reasoning=bool(args.reasoning),
+                    )
                 )
+                tile_windows, task_requests = _tile_requests_for_task(
+                    item,
+                    skill=args.skill,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    max_tokens=args.max_tokens,
+                    max_objects=args.max_objects,
+                    reasoning=bool(args.reasoning),
+                    runtime_tiling=bool(args.runtime_tiling),
+                    tile_grid_size=int(args.tile_grid_size),
+                    tile_overlap=float(args.tile_overlap),
+                )
+                task_requests_per_item.append(task_requests)
+                tile_windows_per_item.append(tile_windows)
+                flat_requests.extend(task_requests)
+
+            try:
+                rollout_start = time.monotonic()
+                results = _rollouts_batch_with_retry(
+                    finetune=finetune,
+                    requests=flat_requests,
+                    num_rollouts=args.group_size,
+                    max_workers=min(args.max_workers, len(flat_requests)),
+                    retries=args.rollout_retries,
+                    backoff_s=args.rollout_retry_backoff_s,
+                    context=f"train step {global_step}",
+                )
+                rollout_end = time.monotonic()
+            except (TunaAPIError, TunaNetworkError) as exc:
+                if bool(args.reasoning) and _is_reasoning_unsupported_error(exc):
+                    raise ValueError(
+                        "API rejects request reasoning for tuning rollouts (422 extra_forbidden). "
+                        "Use --no-reasoning --no-eval-reasoning for train/eval rollouts."
+                    ) from exc
+                print(f"rollouts_batch failed at step {global_step}: {_format_tuna_error(exc)}. skipping step")
+                continue
+            if len(results) != len(flat_requests):
+                print(
+                    f"warning: train step {global_step} returned {len(results)} results for "
+                    f"{len(flat_requests)} requests; only aligned results are used."
+                )
+
+            groups: list[TrainStepGroup] = []
+            all_rewards: list[float] = []
+            off_policy_injected_total = 0
+            off_policy_injected_positive = 0
+            off_policy_injected_negative = 0
+            off_policy_considered = 0
+            off_policy_trigger_low_max = 0
+            off_policy_trigger_low_mean = 0
+            off_policy_skipped_high_reward = 0
+            off_policy_skipped_high_variance = 0
+            off_policy_skipped_reasoning_guard = 0
+            train_tp = 0
+            train_fp = 0
+            train_fn = 0
+            result_index = 0
+            for idx, item in enumerate(batch):
+                task_requests = task_requests_per_item[idx]
+                tile_windows = tile_windows_per_item[idx]
+                task_results = list(results[result_index : result_index + len(task_requests)])
+                result_index += len(task_requests)
+
+                if args.runtime_tiling:
+                    merged_rollouts = _merge_rollouts_across_tiles(
+                        tile_results=task_results,
+                        tile_windows=tile_windows,
+                        skill=args.skill,
+                        expected_rollouts=args.group_size,
+                        point_merge_radius=float(args.tile_point_merge_radius),
+                        box_merge_iou=float(args.tile_box_merge_iou),
+                    )
+                    rewards = _rewards_for_rollouts(
+                        merged_rollouts,
+                        item.gt_boxes,
+                        skill=args.skill,
+                        reward_metric=args.reward_metric,
+                        fn_penalty_exponent=args.fn_penalty_exponent,
+                        fp_penalty_exponent=args.fp_penalty_exponent,
+                        neg_reward_weight=args.neg_reward_weight,
+                    )
+                    if args.skill == "point":
+                        for rollout in merged_rollouts:
+                            output = rollout.output
+                            pred_points = output.points if isinstance(output, PointOutput) else []
+                            tp, fp, fn = _count_tp_fp_fn_points(pred_points, item.gt_boxes)
+                            train_tp += tp
+                            train_fp += fp
+                            train_fn += fn
+                    else:
+                        for rollout in merged_rollouts:
+                            output = rollout.output
+                            pred_boxes = output.objects if isinstance(output, DetectOutput) else []
+                            tp, fp, fn = _count_tp_fp_fn(pred_boxes, item.gt_boxes)
+                            train_tp += tp
+                            train_fp += fp
+                            train_fn += fn
+
+                    for tile_request, tile_result in zip(task_requests, task_results):
+                        rollouts = list(tile_result.rollouts)
+                        if not rollouts:
+                            continue
+                        group_request = RolloutsRequest(
+                            finetune_id=finetune.finetune_id,
+                            num_rollouts=len(rollouts),
+                            request=tile_request,
+                            ground_truth=getattr(tile_result.request, "ground_truth", None),
+                            org_id=getattr(tile_result.request, "org_id", None),
+                        )
+                        groups.append(
+                            TrainStepGroup(
+                                request=group_request,
+                                rollouts=rollouts,
+                                rewards=list(rewards[: len(rollouts)]),
+                            )
+                        )
+                    all_rewards.extend(rewards)
+                    continue
+
+                result = task_results[0] if task_results else None
+                rollouts = list(result.rollouts) if result is not None else []
                 rewards = _rewards_for_rollouts(
-                    merged_rollouts,
+                    rollouts,
                     item.gt_boxes,
                     skill=args.skill,
                     reward_metric=args.reward_metric,
@@ -3007,8 +3526,67 @@ def run(args: argparse.Namespace) -> None:
                     fp_penalty_exponent=args.fp_penalty_exponent,
                     neg_reward_weight=args.neg_reward_weight,
                 )
+
+                if off_policy_injection_allowed and rewards and rollouts:
+                    off_policy_considered += 1
+                    mean_reward = sum(rewards) / len(rewards)
+                    reward_var = sum((value - mean_reward) ** 2 for value in rewards) / len(rewards)
+                    reward_std = reward_var**0.5
+                    max_reward = max(rewards)
+                    low_max_reward = max_reward < args.off_policy_max_reward
+                    low_mean_reward = mean_reward < args.off_policy_max_reward
+                    should_inject = low_max_reward or (
+                        low_mean_reward and reward_std < args.off_policy_std_thresh
+                    )
+
+                    if should_inject:
+                        if low_max_reward:
+                            off_policy_trigger_low_max += 1
+                        else:
+                            off_policy_trigger_low_mean += 1
+                        replace_idx = int(np.argmin(np.asarray(rewards, dtype=np.float32)))
+                        old_rollout = rollouts[replace_idx]
+                        replacement_objects = list(item.gt_boxes)
+                        replacement_points = [
+                            PointAnnotation(x=(box.x_min + box.x_max) / 2.0, y=(box.y_min + box.y_max) / 2.0)
+                            for box in replacement_objects
+                        ]
+                        rollouts[replace_idx] = Rollout(
+                            skill=old_rollout.skill,
+                            finish_reason=old_rollout.finish_reason,
+                            output=(
+                                PointOutput(points=replacement_points)
+                                if args.skill == "point"
+                                else DetectOutput(objects=replacement_objects)
+                            ),
+                            answer_tokens=list(old_rollout.answer_tokens),
+                            thinking_tokens=list(old_rollout.thinking_tokens),
+                            coords=list(old_rollout.coords),
+                            sizes=list(old_rollout.sizes),
+                        )
+                        reward_anchor = max(float(max_reward), float(mean_reward))
+                        injected_reward = max(
+                            float(args.off_policy_min_reward),
+                            min(1.0, float(args.off_policy_reward_scale) * reward_anchor),
+                        )
+                        if not item.gt_boxes:
+                            injected_reward *= float(args.neg_reward_weight)
+                        rewards[replace_idx] = injected_reward
+                        off_policy_injected_total += 1
+                        if item.is_positive:
+                            off_policy_injected_positive += 1
+                        else:
+                            off_policy_injected_negative += 1
+                    else:
+                        if max_reward >= args.off_policy_max_reward:
+                            off_policy_skipped_high_reward += 1
+                        elif reward_std >= args.off_policy_std_thresh:
+                            off_policy_skipped_high_variance += 1
+                elif args.off_policy and rewards and rollouts and not off_policy_injection_allowed:
+                    off_policy_skipped_reasoning_guard += 1
+
                 if args.skill == "point":
-                    for rollout in merged_rollouts:
+                    for rollout in rollouts:
                         output = rollout.output
                         pred_points = output.points if isinstance(output, PointOutput) else []
                         tp, fp, fn = _count_tp_fp_fn_points(pred_points, item.gt_boxes)
@@ -3016,7 +3594,7 @@ def run(args: argparse.Namespace) -> None:
                         train_fp += fp
                         train_fn += fn
                 else:
-                    for rollout in merged_rollouts:
+                    for rollout in rollouts:
                         output = rollout.output
                         pred_boxes = output.objects if isinstance(output, DetectOutput) else []
                         tp, fp, fn = _count_tp_fp_fn(pred_boxes, item.gt_boxes)
@@ -3024,205 +3602,132 @@ def run(args: argparse.Namespace) -> None:
                         train_fp += fp
                         train_fn += fn
 
-                for tile_request, tile_result in zip(task_requests, task_results):
-                    rollouts = list(tile_result.rollouts)
-                    if not rollouts:
-                        continue
-                    group_request = RolloutsRequest(
-                        finetune_id=finetune.finetune_id,
-                        num_rollouts=len(rollouts),
-                        request=tile_request,
-                        ground_truth=getattr(tile_result.request, "ground_truth", None),
-                        org_id=getattr(tile_result.request, "org_id", None),
-                    )
-                    groups.append(TrainStepGroup(request=group_request, rollouts=rollouts, rewards=list(rewards[: len(rollouts)])))
+                request_obj = logical_requests[idx]
+                group_request = RolloutsRequest(
+                    finetune_id=finetune.finetune_id,
+                    num_rollouts=len(rollouts),
+                    request=request_obj,
+                    ground_truth=getattr(result.request, "ground_truth", None) if result is not None else None,
+                    org_id=getattr(result.request, "org_id", None) if result is not None else None,
+                )
+                groups.append(TrainStepGroup(request=group_request, rollouts=rollouts, rewards=rewards))
                 all_rewards.extend(rewards)
+
+            if not groups:
+                print(f"train step {global_step}: no valid rollout groups after alignment; skipping step")
                 continue
 
-            result = task_results[0] if task_results else None
-            rollouts = list(result.rollouts) if result is not None else []
-            rewards = _rewards_for_rollouts(
-                rollouts,
-                item.gt_boxes,
-                skill=args.skill,
-                reward_metric=args.reward_metric,
-                fn_penalty_exponent=args.fn_penalty_exponent,
-                fp_penalty_exponent=args.fp_penalty_exponent,
-                neg_reward_weight=args.neg_reward_weight,
+            try:
+                train_start = time.monotonic()
+                train_out = finetune.train_step(groups=groups, lr=args.lr)
+                train_end = time.monotonic()
+            except (TunaAPIError, TunaNetworkError) as exc:
+                print(f"train_step failed at step {global_step}: {_format_tuna_error(exc)}. skipping step")
+                continue
+            successful_updates += 1
+
+            reward_mean = float(np.mean(all_rewards)) if all_rewards else 0.0
+            reward_var = float(np.var(all_rewards)) if all_rewards else 0.0
+            pos_tasks = sum(1 for item in batch if item.is_positive)
+            neg_tasks = len(batch) - pos_tasks
+            batch_train_precision, batch_train_recall, batch_train_f1 = _binary_metrics_from_counts(
+                train_tp,
+                train_fp,
+                train_fn,
+            )
+            batch_metric_defined = int(((2 * train_tp) + train_fp + train_fn) > 0)
+            running_train_tp += train_tp
+            running_train_fp += train_fp
+            running_train_fn += train_fn
+            train_precision, train_recall, train_f1 = _binary_metrics_from_counts(
+                running_train_tp,
+                running_train_fp,
+                running_train_fn,
+            )
+            running_metric_defined = int(
+                ((2 * running_train_tp) + running_train_fp + running_train_fn) > 0
+            )
+            kl_value = float(train_out.kl or 0.0)
+            kl_consecutive_hits, kl_warning_triggered, kl_stop_triggered = _update_kl_guard(
+                kl_value=kl_value,
+                warning_threshold=float(args.kl_warning_threshold),
+                stop_threshold=float(args.kl_stop_threshold),
+                stop_consecutive=int(args.kl_stop_consecutive),
+                consecutive_hits=kl_consecutive_hits,
             )
 
-            if off_policy_injection_allowed and rewards and rollouts:
-                off_policy_considered += 1
-                mean_reward = sum(rewards) / len(rewards)
-                reward_var = sum((value - mean_reward) ** 2 for value in rewards) / len(rewards)
-                reward_std = reward_var**0.5
-                max_reward = max(rewards)
-                low_max_reward = max_reward < args.off_policy_max_reward
-                low_mean_reward = mean_reward < args.off_policy_max_reward
-                should_inject = low_max_reward or (
-                    low_mean_reward and reward_std < args.off_policy_std_thresh
-                )
-
-                if should_inject:
-                    if low_max_reward:
-                        off_policy_trigger_low_max += 1
-                    else:
-                        off_policy_trigger_low_mean += 1
-                    replace_idx = int(np.argmin(np.asarray(rewards, dtype=np.float32)))
-                    old_rollout = rollouts[replace_idx]
-                    replacement_objects = list(item.gt_boxes)
-                    replacement_points = [
-                        PointAnnotation(x=(box.x_min + box.x_max) / 2.0, y=(box.y_min + box.y_max) / 2.0)
-                        for box in replacement_objects
-                    ]
-                    rollouts[replace_idx] = Rollout(
-                        skill=old_rollout.skill,
-                        finish_reason=old_rollout.finish_reason,
-                        output=(
-                            PointOutput(points=replacement_points)
-                            if args.skill == "point"
-                            else DetectOutput(objects=replacement_objects)
-                        ),
-                        answer_tokens=list(old_rollout.answer_tokens),
-                        thinking_tokens=list(old_rollout.thinking_tokens),
-                        coords=list(old_rollout.coords),
-                        sizes=list(old_rollout.sizes),
-                    )
-                    reward_anchor = max(float(max_reward), float(mean_reward))
-                    injected_reward = max(
-                        float(args.off_policy_min_reward),
-                        min(1.0, float(args.off_policy_reward_scale) * reward_anchor),
-                    )
-                    if not item.gt_boxes:
-                        injected_reward *= float(args.neg_reward_weight)
-                    rewards[replace_idx] = injected_reward
-                    off_policy_injected_total += 1
-                    if item.is_positive:
-                        off_policy_injected_positive += 1
-                    else:
-                        off_policy_injected_negative += 1
-                else:
-                    if max_reward >= args.off_policy_max_reward:
-                        off_policy_skipped_high_reward += 1
-                    elif reward_std >= args.off_policy_std_thresh:
-                        off_policy_skipped_high_variance += 1
-            elif args.off_policy and rewards and rollouts and not off_policy_injection_allowed:
-                off_policy_skipped_reasoning_guard += 1
-
-            if args.skill == "point":
-                for rollout in rollouts:
-                    output = rollout.output
-                    pred_points = output.points if isinstance(output, PointOutput) else []
-                    tp, fp, fn = _count_tp_fp_fn_points(pred_points, item.gt_boxes)
-                    train_tp += tp
-                    train_fp += fp
-                    train_fn += fn
-            else:
-                for rollout in rollouts:
-                    output = rollout.output
-                    pred_boxes = output.objects if isinstance(output, DetectOutput) else []
-                    tp, fp, fn = _count_tp_fp_fn(pred_boxes, item.gt_boxes)
-                    train_tp += tp
-                    train_fp += fp
-                    train_fn += fn
-
-            request_obj = logical_requests[idx]
-            group_request = RolloutsRequest(
-                finetune_id=finetune.finetune_id,
-                num_rollouts=len(rollouts),
-                request=request_obj,
-                ground_truth=getattr(result.request, "ground_truth", None) if result is not None else None,
-                org_id=getattr(result.request, "org_id", None) if result is not None else None,
+            _wandb_log(
+                {
+                    "bootstrap_phase": 0,
+                    "sft_group_count": 0,
+                    "sft_skipped_ineligible": 0,
+                    "sft_loss": float(getattr(train_out, "sft_loss", 0.0) or 0.0),
+                    "reward_mean": reward_mean,
+                    "reward_var": reward_var,
+                    "batch_positive_tasks": pos_tasks,
+                    "batch_negative_tasks": neg_tasks,
+                    "train_tp": train_tp,
+                    "train_fp": train_fp,
+                    "train_fn": train_fn,
+                    "train_batch_precision": batch_train_precision,
+                    "train_batch_recall": batch_train_recall,
+                    "train_batch_f1": batch_train_f1,
+                    "train_batch_metric_defined": batch_metric_defined,
+                    "train_running_tp": running_train_tp,
+                    "train_running_fp": running_train_fp,
+                    "train_running_fn": running_train_fn,
+                    "train_precision": train_precision,
+                    "train_recall": train_recall,
+                    "train_f1": train_f1,
+                    "train_metric_defined": running_metric_defined,
+                    "accepted_groups": len(groups),
+                    "off_policy_injected": off_policy_injected_total,
+                    "off_policy_injected_positive": off_policy_injected_positive,
+                    "off_policy_injected_negative": off_policy_injected_negative,
+                    "off_policy_considered": off_policy_considered,
+                    "off_policy_trigger_low_max": off_policy_trigger_low_max,
+                    "off_policy_trigger_low_mean": off_policy_trigger_low_mean,
+                    "off_policy_skipped_high_reward": off_policy_skipped_high_reward,
+                    "off_policy_skipped_high_variance": off_policy_skipped_high_variance,
+                    "off_policy_skipped_reasoning_guard": off_policy_skipped_reasoning_guard,
+                    "kl": kl_value,
+                    "router_kl": train_out.router_kl if train_out.router_kl is not None else 0.0,
+                    "grad_norm": train_out.grad_norm if train_out.grad_norm is not None else 0.0,
+                    "kl_warning_triggered": int(kl_warning_triggered),
+                    "kl_stop_triggered": int(kl_stop_triggered),
+                    "kl_stop_consecutive_hits": kl_consecutive_hits,
+                    "rows_seen": usage.rows_seen,
+                    "rows_seen_fraction": rows_seen_fraction,
+                    "tasks_generated_total": usage.tasks_generated,
+                    "tasks_generated_positive_total": usage.tasks_generated_positive,
+                    "tasks_generated_negative_total": usage.tasks_generated_negative,
+                    "tasks_consumed_total": usage.tasks_consumed,
+                    "tasks_consumed_positive_total": usage.tasks_consumed_positive,
+                    "tasks_consumed_negative_total": usage.tasks_consumed_negative,
+                },
+                step=global_step,
+                namespace="train",
             )
-            groups.append(TrainStepGroup(request=group_request, rollouts=rollouts, rewards=rewards))
-            all_rewards.extend(rewards)
 
-        if not groups:
-            print(f"train step {global_step}: no valid rollout groups after alignment; skipping step")
-            continue
-
-        try:
-            train_start = time.monotonic()
-            train_out = finetune.train_step(groups=groups, lr=args.lr)
-            train_end = time.monotonic()
-        except (TunaAPIError, TunaNetworkError) as exc:
-            print(f"train_step failed at step {global_step}: {_format_tuna_error(exc)}. skipping step")
-            continue
-        successful_updates += 1
-
-        reward_mean = float(np.mean(all_rewards)) if all_rewards else 0.0
-        reward_var = float(np.var(all_rewards)) if all_rewards else 0.0
-        pos_tasks = sum(1 for item in batch if item.is_positive)
-        neg_tasks = len(batch) - pos_tasks
-        precision_denom = train_tp + train_fp
-        recall_denom = train_tp + train_fn
-        micro_denom = (2 * train_tp) + train_fp + train_fn
-        train_precision = 1.0 if precision_denom == 0 else train_tp / precision_denom
-        train_recall = 1.0 if recall_denom == 0 else train_tp / recall_denom
-        train_f1 = 1.0 if micro_denom == 0 else (2 * train_tp) / micro_denom
-        rows_seen_fraction = (
-            usage.rows_seen / float(total_train_rows)
-            if total_train_rows and total_train_rows > 0
-            else 0.0
-        )
-        kl_value = float(train_out.kl or 0.0)
-        kl_consecutive_hits, kl_warning_triggered, kl_stop_triggered = _update_kl_guard(
-            kl_value=kl_value,
-            warning_threshold=float(args.kl_warning_threshold),
-            stop_threshold=float(args.kl_stop_threshold),
-            stop_consecutive=int(args.kl_stop_consecutive),
-            consecutive_hits=kl_consecutive_hits,
-        )
-
-        wandb.log(
-            {
-                "reward_mean": reward_mean,
-                "reward_var": reward_var,
-                "batch_positive_tasks": pos_tasks,
-                "batch_negative_tasks": neg_tasks,
-                "train_tp": train_tp,
-                "train_fp": train_fp,
-                "train_fn": train_fn,
-                "train_precision": train_precision,
-                "train_recall": train_recall,
-                "train_f1": train_f1,
-                "accepted_groups": len(groups),
-                "off_policy_injected": off_policy_injected_total,
-                "off_policy_injected_positive": off_policy_injected_positive,
-                "off_policy_injected_negative": off_policy_injected_negative,
-                "off_policy_considered": off_policy_considered,
-                "off_policy_trigger_low_max": off_policy_trigger_low_max,
-                "off_policy_trigger_low_mean": off_policy_trigger_low_mean,
-                "off_policy_skipped_high_reward": off_policy_skipped_high_reward,
-                "off_policy_skipped_high_variance": off_policy_skipped_high_variance,
-                "off_policy_skipped_reasoning_guard": off_policy_skipped_reasoning_guard,
-                "kl": kl_value,
-                "router_kl": train_out.router_kl if train_out.router_kl is not None else 0.0,
-                "grad_norm": train_out.grad_norm if train_out.grad_norm is not None else 0.0,
-                "kl_warning_triggered": int(kl_warning_triggered),
-                "kl_stop_triggered": int(kl_stop_triggered),
-                "kl_stop_consecutive_hits": kl_consecutive_hits,
-                "rows_seen": usage.rows_seen,
-                "rows_seen_fraction": rows_seen_fraction,
-                "tasks_generated_total": usage.tasks_generated,
-                "tasks_generated_positive_total": usage.tasks_generated_positive,
-                "tasks_generated_negative_total": usage.tasks_generated_negative,
-                "tasks_consumed_total": usage.tasks_consumed,
-                "tasks_consumed_positive_total": usage.tasks_consumed_positive,
-                "tasks_consumed_negative_total": usage.tasks_consumed_negative,
-            },
-            step=global_step,
-        )
-
-        total_s = time.monotonic() - step_start
-        print(
-            f"step {global_step} reward={reward_mean:.4f} kl={kl_value:.4f} "
-            f"train_p={train_precision:.3f} train_r={train_recall:.3f} "
-            f"pos={pos_tasks} neg={neg_tasks} rollout_s={(rollout_end-rollout_start):.2f} "
-            f"train_s={(train_end-train_start):.2f} total_s={total_s:.2f} "
-            f"offp={off_policy_injected_total}/{off_policy_considered} "
-            f"offp_guarded={off_policy_skipped_reasoning_guard} updates={successful_updates}"
-        )
+            total_s = time.monotonic() - step_start
+            print(
+                f"step {global_step} reward={reward_mean:.4f} kl={kl_value:.4f} "
+                f"batch_f1={batch_train_f1:.3f} run_f1={train_f1:.3f} "
+                f"train_p={train_precision:.3f} train_r={train_recall:.3f} "
+                f"pos={pos_tasks} neg={neg_tasks} rollout_s={(rollout_end-rollout_start):.2f} "
+                f"train_s={(train_end-train_start):.2f} total_s={total_s:.2f} "
+                f"offp={off_policy_injected_total}/{off_policy_considered} "
+                f"offp_guarded={off_policy_skipped_reasoning_guard} updates={successful_updates}"
+            )
+            train_progress.set_postfix(
+                {
+                    "step": global_step,
+                    "reward": f"{reward_mean:.3f}",
+                    "f1": f"{train_f1:.3f}",
+                    "kl": f"{kl_value:.3f}",
+                },
+                refresh=False,
+            )
         if kl_warning_triggered:
             print(
                 f"warning: step {global_step} kl={kl_value:.4f} exceeded "
@@ -3299,7 +3804,7 @@ def run(args: argparse.Namespace) -> None:
                 if baseline_eval_metric is not None:
                     delta_key = f"{metric_key}_delta_vs_baseline"
                     eval_metrics[delta_key] = float(eval_metrics.get(metric_key, 0.0)) - baseline_eval_metric
-                    wandb.log({delta_key: eval_metrics[delta_key]}, step=global_step)
+                    _wandb_log({delta_key: eval_metrics[delta_key]}, step=global_step, namespace="eval")
                 if (
                     args.skill == "point"
                     and baseline_eval_tp is not None
@@ -3310,7 +3815,7 @@ def run(args: argparse.Namespace) -> None:
                     recall_gate_eval_tp = float(eval_metrics.get("eval_tp", 0.0))
                     recall_gate_min_tp = float(baseline_eval_tp) * (1.0 - float(args.recall_drop_threshold))
                     recall_gate_pass = bool(recall_gate_eval_tp >= recall_gate_min_tp)
-                    wandb.log(
+                    _wandb_log(
                         {
                             "recall_gate_step": recall_gate_eval_step,
                             "recall_gate_eval_tp": recall_gate_eval_tp,
@@ -3318,6 +3823,7 @@ def run(args: argparse.Namespace) -> None:
                             "recall_gate_pass": int(recall_gate_pass),
                         },
                         step=global_step,
+                        namespace="eval",
                     )
                     print(
                         f"recall gate step {recall_gate_eval_step}: "
@@ -3326,17 +3832,28 @@ def run(args: argparse.Namespace) -> None:
                     )
                 print(
                     f"eval step {global_step} tasks={eval_metrics['eval_tasks']} "
+                    f"pos_tasks={eval_metrics['eval_positive_tasks']} "
+                    f"neg_tasks={eval_metrics['eval_negative_tasks']} "
                     f"miou={eval_metrics['eval_miou']:.4f} f1={eval_metrics['eval_f1']:.4f} "
                     f"macro_f1={eval_metrics['eval_f1_macro']:.4f} "
                     f"pos_f1={eval_metrics['eval_positive_f1']:.4f} "
                     f"neg_f1={eval_metrics['eval_negative_f1']:.4f} "
+                    f"{args.selection_metric}={_selection_metric_value(eval_metrics, args.selection_metric):.4f} "
                     f"updates={successful_updates}"
                 )
+                if int(eval_metrics.get("eval_positive_task_shortfall", 0)) > 0:
+                    print(
+                        f"warning: eval positive-task shortfall={int(eval_metrics['eval_positive_task_shortfall'])} "
+                        f"(target={int(eval_metrics.get('eval_target_min_positive_tasks', 0))})"
+                    )
 
                 metric = _selection_metric_value(eval_metrics, args.selection_metric)
                 if best_metric is None or metric > best_metric:
                     best_metric = metric
                     best_step = global_step
+                    run.summary["best_step"] = int(best_step)
+                    run.summary[f"best_{metric_key}"] = float(best_metric)
+                    _record_best_eval_metrics(run, eval_metrics, metric_key=metric_key)
                     checkpoint_step = save_checkpoint_step(
                         finetune=finetune,
                         context=f"best metric checkpoint step={global_step}",
@@ -3354,6 +3871,10 @@ def run(args: argparse.Namespace) -> None:
             if checkpoint_step is not None:
                 latest_checkpoint_step = int(checkpoint_step)
                 run.summary["latest_checkpoint_step"] = int(latest_checkpoint_step)
+
+    if effective_num_steps > 0:
+        train_progress.update(1)
+    train_progress.close()
 
     checkpoint_step = save_checkpoint_step(
         finetune=finetune,
@@ -3378,7 +3899,7 @@ def run(args: argparse.Namespace) -> None:
             args=args,
             run=run,
             results=completed_async_results,
-            log_step=int(args.resume_step + args.num_steps),
+            log_step=int(args.resume_step + effective_num_steps),
             baseline_eval_metric=baseline_eval_metric,
             baseline_eval_tp=baseline_eval_tp,
             best_metric=best_metric,
@@ -3436,9 +3957,17 @@ def run(args: argparse.Namespace) -> None:
     run.summary["finetune_id"] = finetune.finetune_id
     run.summary["async_checkpoint_eval_enabled"] = int(bool(args.async_checkpoint_eval))
     run.summary["async_checkpoint_eval_success_count"] = int(async_eval_success_count)
+    run.summary["sft_bootstrap_steps_configured"] = int(args.sft_bootstrap_steps)
+    run.summary["effective_sft_bootstrap_steps"] = int(effective_sft_bootstrap_steps)
+    run.summary["sft_bootstrap_steps_completed"] = int(bootstrap_steps_completed)
+    run.summary["sft_bootstrap_groups_total"] = int(bootstrap_groups_total)
+    run.summary["sft_bootstrap_skipped_ineligible_total"] = int(bootstrap_skipped_ineligible_total)
+    run.summary["sft_bootstrap_disabled_backend_unsupported"] = int(
+        sft_bootstrap_disabled_backend_unsupported
+    )
     if args.run_final_test and has_test_rows:
         print("running final test eval after training...")
-        test_log_step = max(best_step or 0, args.resume_step + int(args.num_steps))
+        test_log_step = max(best_step or 0, args.resume_step + int(effective_num_steps))
         if args.async_checkpoint_eval:
             if best_checkpoint_step is None:
                 print("warning: final test skipped because no best validation checkpoint was saved.")
@@ -3495,7 +4024,7 @@ def run(args: argparse.Namespace) -> None:
                         print(f"final test metrics parse failed: {type(exc).__name__}: {exc}")
                     else:
                         prefixed_test_metrics = _prefix_eval_metrics(test_metrics, prefix="test_")
-                        wandb.log(prefixed_test_metrics, step=test_log_step)
+                        _wandb_log(prefixed_test_metrics, step=test_log_step, namespace="test")
                         for key, value in prefixed_test_metrics.items():
                             run.summary[key] = value
                         run.summary["test_evaluated"] = 1
@@ -3520,6 +4049,7 @@ def run(args: argparse.Namespace) -> None:
                     neg_prompts_per_empty=args.neg_prompts_per_empty,
                     neg_prompts_per_nonempty=args.neg_prompts_per_nonempty,
                     max_samples=args.eval_max_samples,
+                    eval_min_positive_tasks=args.eval_min_positive_tasks,
                     batch_size=args.eval_batch_size,
                     max_workers=args.max_workers,
                     rollout_retries=args.rollout_retries,
@@ -3538,7 +4068,7 @@ def run(args: argparse.Namespace) -> None:
                     tile_box_merge_iou=float(args.tile_box_merge_iou),
                 )
                 prefixed_test_metrics = _prefix_eval_metrics(test_metrics, prefix="test_")
-                wandb.log(prefixed_test_metrics, step=test_log_step)
+                _wandb_log(prefixed_test_metrics, step=test_log_step, namespace="test")
                 for key, value in prefixed_test_metrics.items():
                     run.summary[key] = value
                 run.summary["test_evaluated"] = 1

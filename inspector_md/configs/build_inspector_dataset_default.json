@@ -1,0 +1,25 @@
+{
+  "env_file": "inspector_md/.env.staging",
+  "source_manifest": "inspector_md/dataset/merged_synth_v1/synthetic_manifest.json",
+  "output_root": "inspector_md/outputs",
+  "detect_output_dir": "inspector_md/outputs/inspector_detect_v1",
+  "point_output_dir": "inspector_md/outputs/inspector_point_v1",
+  "query_output_dir": "inspector_md/outputs/inspector_query_issues_v2",
+  "detect_exclude_source_datasets": [
+    "CODEBRIM"
+  ],
+  "query_text_refresh_mode": "openrouter",
+  "query_teacher_model_id": "openai/gpt-4.1-mini",
+  "query_teacher_api_base": "https://openrouter.ai/api/v1",
+  "query_teacher_api_key_env_var": "OPENROUTER_API_KEY",
+  "query_sft_format": "json_issue_list",
+  "query_text_cache_jsonl": "inspector_md/outputs/inspector_query_text_cache.jsonl",
+  "query_teacher_timeout": 90.0,
+  "query_refresh_max_concurrency": 4,
+  "query_refresh_retries": 2,
+  "query_refresh_retry_backoff_s": 2.0,
+  "query_refresh_cache_flush_every": 25,
+  "seed": 42,
+  "val_fraction": 0.2,
+  "test_fraction": 0.5
+}

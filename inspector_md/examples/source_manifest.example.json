@@ -1,0 +1,36 @@
+[
+  {
+    "row_id": "sample-001",
+    "image_path": "/abs/path/to/image.jpg",
+    "split": "train",
+    "inspection_request": "Inspect this exterior image for visible issues.",
+    "asset_context": "Two-story exterior elevation",
+    "hard_example": false,
+    "expected_proposals": [
+      {
+        "issue_code": "roof_cover_damage",
+        "evidence": "Missing shingles are visible near the roof edge."
+      }
+    ],
+    "expected_findings": [
+      {
+        "issue_code": "roof_cover_damage",
+        "title": "Roof Cover Damage",
+        "box": {
+          "x_min": 0.08,
+          "y_min": 0.05,
+          "x_max": 0.72,
+          "y_max": 0.34
+        },
+        "evidence": ["Missing shingles are visible near the roof edge."],
+        "recommended_action": "Repair the damaged roof covering.",
+        "cost_band": "high",
+        "possible_compliance_issue": true,
+        "insufficient_evidence": false,
+        "compliance_note": "Possible compliance issue related to water_intrusion_risk.",
+        "source_detect_labels": ["missing shingle"],
+        "spatial_ref_index": 0
+      }
+    ]
+  }
+]

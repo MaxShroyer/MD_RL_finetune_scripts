@@ -1,0 +1,14 @@
+{
+  "env_file": "disaster_m3/.env.staging",
+  "hf_repo_id": "Kingdrone-Junjue/DisasterM3",
+  "dataset_root": "disaster_m3",
+  "raw_dir": "disaster_m3/raw_dataset",
+  "output_dir": "disaster_m3/dataset/full",
+  "panel_max_side": 1024,
+  "divider_px": 4,
+  "jpeg_quality": 92,
+  "max_samples": 0,
+  "subset_seed": 42,
+  "download": false,
+  "force_download": false
+}

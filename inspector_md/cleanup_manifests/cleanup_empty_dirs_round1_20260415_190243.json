@@ -1,0 +1,178 @@
+[
+  {
+    "path": "inspector_md/outputs/subset_balanced_1000/async_checkpoint_eval_point_hybrid/pid_icons_point/01KP8N7J5J4XFCR2EY856DG84A",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/subset_balanced_1000/async_checkpoint_eval_point_hybrid/pid_icons_point/01KP7TT2C4MP46BZE7DD5AY69E",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/subset_balanced_1000/async_checkpoint_eval_point/pid_icons_point/01KP82JWABE7PSHVY1BJ0RWRXX",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/subset_balanced_1000/async_checkpoint_eval_detect_hybrid/pid_icons_detect/01KP7TSW0T9K6W3N97MQBC3TH4",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/subset_balanced_1000/async_checkpoint_eval_detect/pid_icons_detect/01KP71RTYFF8HGCRBFARKBZVTJ",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/async_checkpoint_eval_query/inspector_query/01KP6BW0S5ZJ6P4HXTQSJ8S665",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/async_checkpoint_eval_query/inspector_query/01KP6BF70J18MM1DAVB4F6S5XR",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/async_checkpoint_eval/pid_icons_point/01KP2AX4SMZHNY66T4RJ2VRKGK",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/async_checkpoint_eval/pid_icons_detect/01KP4DP8WSPPW0RWRBR82XKN9T",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/async_checkpoint_eval/pid_icons_detect/01KP4DP8TZ13FHGAKPAY379G01",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/async_checkpoint_eval/pid_icons_detect/01KP4906JXV3QCSFJ4VD1V0QFF",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/async_checkpoint_eval/pid_icons_detect/01KP28YXRN6RY5A7VYD6EW73HC",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/async_checkpoint_eval/pid_icons_detect/01KP28YXRMFAJPSNTDTPQNMGP5",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/async_checkpoint_eval/pid_icons_detect/01KP28YXRBB7E4EYPQC0P9BWFF",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/async_checkpoint_eval/pid_icons_detect/01KP28YSKPC7DKQX4RSSP99ZTN",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/async_checkpoint_eval/pid_icons_detect/01KP28YSFY92RSME4F3P6WADC2",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/async_checkpoint_eval/pid_icons_detect/01KP28YSFT56F2F2RD7Y0V7PQF",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/async_checkpoint_eval/pid_icons_detect/01KP204EFWB75SC6CPH2209PG7",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/async_checkpoint_eval/pid_icons_detect/01KP1XV5PE1SAZRA4JSWJ533SK",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/async_checkpoint_eval/pid_icons_detect/01KP1XTC6YP0NBZ0N3GJ8J0PCA",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/runs/inspector_query_reasoning",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  },
+  {
+    "path": "inspector_md/outputs/train_logs",
+    "kind": "dir",
+    "status": "remove",
+    "reason": "empty_dir_post_cleanup",
+    "size_bytes": 0,
+    "mtime": "2026-04-15T19:02:06"
+  }
+]

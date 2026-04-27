@@ -1,0 +1,10 @@
+{
+  "env_file": ".env.staging",
+  "dataset_name": "flaviagiammarino/vqa-rad",
+  "hf_token": "",
+  "hf_cache_dir": "",
+  "output_dir": "vqa_rad/outputs/vqa_rad_query_v1",
+  "shared_image_dir": "vqa_rad/outputs/vqa_rad_query_images",
+  "val_fraction": 0.15,
+  "seed": 42
+}

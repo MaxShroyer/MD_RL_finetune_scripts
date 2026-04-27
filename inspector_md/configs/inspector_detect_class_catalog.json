@@ -1,0 +1,29 @@
+{
+  "class_catalog": [
+    {"class_uid": "inspector_md:missing_shingle", "class_name": "missing shingle", "prompt": "missing shingle"},
+    {"class_uid": "inspector_md:roof_puncture", "class_name": "roof puncture", "prompt": "roof puncture"},
+    {"class_uid": "inspector_md:roof_edge_lifting", "class_name": "roof edge lifting", "prompt": "roof edge lifting"},
+    {"class_uid": "inspector_md:detached_gutter", "class_name": "detached gutter", "prompt": "detached gutter"},
+    {"class_uid": "inspector_md:damaged_downspout", "class_name": "damaged downspout", "prompt": "damaged downspout"},
+    {"class_uid": "inspector_md:broken_window_pane", "class_name": "broken window pane", "prompt": "broken window pane"},
+    {"class_uid": "inspector_md:cracked_glazing", "class_name": "cracked glazing", "prompt": "cracked glazing"},
+    {"class_uid": "inspector_md:siding_crack", "class_name": "siding crack", "prompt": "siding crack"},
+    {"class_uid": "inspector_md:facade_crack", "class_name": "facade crack", "prompt": "facade crack"},
+    {"class_uid": "inspector_md:concrete_spalling", "class_name": "concrete spalling", "prompt": "concrete spalling"},
+    {"class_uid": "inspector_md:masonry_spalling", "class_name": "masonry spalling", "prompt": "masonry spalling"},
+    {"class_uid": "inspector_md:water_stain", "class_name": "water stain", "prompt": "water stain"},
+    {"class_uid": "inspector_md:moisture_stain", "class_name": "moisture stain", "prompt": "moisture stain"},
+    {"class_uid": "inspector_md:rusted_metal", "class_name": "rusted metal", "prompt": "rusted metal"},
+    {"class_uid": "inspector_md:corroded_railing", "class_name": "corroded railing", "prompt": "corroded railing"},
+    {"class_uid": "inspector_md:foundation_crack", "class_name": "foundation crack", "prompt": "foundation crack"},
+    {"class_uid": "inspector_md:settlement_crack", "class_name": "settlement crack", "prompt": "settlement crack"},
+    {"class_uid": "inspector_md:trip_hazard", "class_name": "trip hazard", "prompt": "trip hazard"},
+    {"class_uid": "inspector_md:walkway_obstruction", "class_name": "walkway obstruction", "prompt": "walkway obstruction"},
+    {"class_uid": "inspector_md:debris_pile", "class_name": "debris pile", "prompt": "debris pile"},
+    {"class_uid": "inspector_md:construction_debris", "class_name": "construction debris", "prompt": "construction debris"},
+    {"class_uid": "inspector_md:missing_handrail", "class_name": "missing handrail", "prompt": "missing handrail"},
+    {"class_uid": "inspector_md:damaged_guardrail", "class_name": "damaged guardrail", "prompt": "damaged guardrail"},
+    {"class_uid": "inspector_md:blocked_exit_path", "class_name": "blocked exit path", "prompt": "blocked exit path"},
+    {"class_uid": "inspector_md:blocked_access_route", "class_name": "blocked access route", "prompt": "blocked access route"}
+  ]
+}

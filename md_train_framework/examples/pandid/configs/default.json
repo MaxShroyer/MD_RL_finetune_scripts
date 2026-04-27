@@ -1,0 +1,128 @@
+{
+  "backend": {
+    "id": "pandid_point",
+    "train_overrides": {
+      "api_key_env_var": "CICID_GPUB_MOONDREAM_API_KEY_3",
+      "api_key_env_vars": [
+        "CICID_GPUB_MOONDREAM_API_KEY_1",
+        "CICID_GPUB_MOONDREAM_API_KEY_2",
+        "CICID_GPUB_MOONDREAM_API_KEY_3",
+        "CICID_GPUB_MOONDREAM_API_KEY_4"
+      ],
+      "base_url": "https://api-staging.moondream.ai/v1",
+      "client_max_retries": 0,
+      "eval_batch_size": 64,
+      "eval_max_workers": 8,
+      "f1_improvement_target": 0.01,
+      "fn_penalty_exponent": 2.0,
+      "fp_penalty_exponent": 1.0,
+      "max_workers": 8,
+      "neg_reward_weight": 0.1,
+      "neg_prompts_per_empty": 1,
+      "neg_prompts_per_nonempty": 0,
+      "off_policy": true,
+      "off_policy_buffer_size": 4096,
+      "off_policy_max_reward": 0.1,
+      "off_policy_min_buffer_groups": 64,
+      "off_policy_min_reward": 0.05,
+      "off_policy_mix_ratio": 0.1,
+      "off_policy_reward_scale": 1.5,
+      "off_policy_std_thresh": 0.015,
+      "off_policy_warmup_steps": 20,
+      "point_distance_threshold": 0.08,
+      "point_prompt_style": "class_name",
+      "point_sft_target_mode": "boxes_if_available",
+      "pos_task_prob": 0.995,
+      "rank": 32,
+      "recall_drop_threshold": 0.15,
+      "recall_gate_step": 10,
+      "retry_rollout_max_workers": 1,
+      "timeout": 45.0,
+      "use_recall_first_preset": true
+    }
+  },
+  "dataset": {
+    "name": "maxs-m87/pandid_dataset_v2",
+    "source": "hf_hub",
+    "test_split": "post_val",
+    "train_split": "train",
+    "val_split": "val"
+  },
+  "eval": {
+    "async_checkpoint_eval": true,
+    "async_checkpoint_eval_dir": "../../../outputs/async_checkpoint_eval",
+    "eval_every": 10,
+    "final_splits": [
+      "val",
+      "post_val"
+    ],
+    "fixed_subset_seed": 1337,
+    "fixed_subset_size": 400,
+    "max_samples": 400,
+    "max_tokens": 256,
+    "save_every": 10,
+    "temperature": 0.0,
+    "top_p": 1.0
+  },
+  "env_file": "../../../../.env.staging",
+  "logging": {
+    "compact_wandb": true,
+    "enable_wandb": true,
+    "registry_path": "../../../outputs/runs.db",
+    "run_root": "../../../outputs/runs",
+    "wandb_project": "moondream-md-train-framework"
+  },
+  "phases": [
+    {
+      "batch_size": 32,
+      "group_size": 8,
+      "lr": 3e-05,
+      "max_tokens": 256,
+      "mode": "rl",
+      "name": "rl",
+      "steps": 1000,
+      "temperature": 1.0,
+      "top_p": 0.9
+    }
+  ],
+  "recovery": {
+    "api_health_preflight": true,
+    "cooldown_s": 30.0,
+    "quarantine_path": "../../../outputs/recovery/quarantine.jsonl",
+    "resume_queue_path": "../../../outputs/recovery/resume_queue.jsonl",
+    "train_step_max_retries": 6
+  },
+  "reward": {
+    "preset": "point_recall_first"
+  },
+  "skill": {
+    "id": "point"
+  },
+  "sweep": {
+    "continue_top_k": 2,
+    "detect_point_axes": {
+      "backend:off_policy_mix_ratio": [
+        0.1,
+        0.25
+      ],
+      "phase:rl:batch_size": [
+        32,
+        16
+      ],
+      "phase:rl:group_size": [
+        8
+      ],
+      "phase:rl:lr": [
+        3e-05,
+        5e-05
+      ]
+    },
+    "enabled": true,
+    "max_parallel": 2,
+    "stage1_scale": 0.25,
+    "stagger_seconds": 4.0
+  },
+  "task": {
+    "name": "pandid"
+  }
+}

@@ -1,0 +1,79 @@
+{
+  "backend": {
+    "id": "mock_detect",
+    "train_overrides": {
+      "api_key_env_var": "MOONDREAM_API_KEY",
+      "rank": 16
+    }
+  },
+  "dataset": {
+    "image_root": "../examples/data/detect_toy/images",
+    "path": "../examples/data/detect_toy",
+    "source": "local_jsonl",
+    "split_files": {
+      "test": "../examples/data/detect_toy/test.jsonl",
+      "train": "../examples/data/detect_toy/train.jsonl",
+      "validation": "../examples/data/detect_toy/validation.jsonl"
+    },
+    "test_split": "test",
+    "train_split": "train",
+    "val_split": "validation"
+  },
+  "eval": {
+    "async_checkpoint_eval": true,
+    "async_checkpoint_eval_dir": "../outputs/async_checkpoint_eval",
+    "eval_every": 10,
+    "final_splits": [
+      "validation",
+      "test"
+    ],
+    "max_samples": 8,
+    "save_every": 10,
+    "temperature": 0.0,
+    "top_p": 1.0
+  },
+  "logging": {
+    "compact_wandb": true,
+    "enable_wandb": true,
+    "registry_path": "../outputs/runs.db",
+    "run_root": "../outputs/runs",
+    "wandb_project": "moondream-md-train-framework"
+  },
+  "phases": [
+    {
+      "batch_size": 8,
+      "group_size": 4,
+      "lr": 0.0002,
+      "max_tokens": 128,
+      "mode": "rl",
+      "name": "rl",
+      "reasoning": false,
+      "steps": 20,
+      "temperature": 0.8,
+      "top_p": 1.0
+    }
+  ],
+  "recovery": {
+    "api_health_preflight": true,
+    "cooldown_s": 15.0,
+    "quarantine_path": "../outputs/recovery/quarantine.jsonl",
+    "resume_queue_path": "../outputs/recovery/resume_queue.jsonl",
+    "train_step_max_retries": 4
+  },
+  "reward": {
+    "preset": "detect_f1"
+  },
+  "skill": {
+    "id": "detect"
+  },
+  "sweep": {
+    "continue_top_k": 2,
+    "enabled": false,
+    "max_parallel": 2,
+    "stage1_scale": 0.25,
+    "stagger_seconds": 3.0
+  },
+  "task": {
+    "name": "detect_quickstart"
+  }
+}

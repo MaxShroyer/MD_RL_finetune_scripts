@@ -1,0 +1,13 @@
+{
+  "env_file": "inspector_md/.env.staging",
+  "detect_input_dir": "inspector_md/outputs/inspector_detect_v1",
+  "point_input_dir": "inspector_md/outputs/inspector_point_v1",
+  "query_input_dir": "inspector_md/outputs/inspector_query_issues_v2",
+  "output_dir": "inspector_md/outputs/hf_export/inspector_md_full_v1",
+  "repo_id": "",
+  "hf_token_env_var": "HUGGINGFACE_HUB_TOKEN",
+  "push": false,
+  "private": true,
+  "max_shard_size": "500MB",
+  "embed_external_files": true
+}

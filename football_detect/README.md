@@ -70,6 +70,14 @@ python football_detect/train_football_detect.py \
   --config football_detect/configs/train_football_detect_default.json
 ```
 
+Optional SFT warmup before RL:
+
+```bash
+python football_detect/train_football_detect.py \
+  --config football_detect/configs/train_football_detect_default.json \
+  --sft-bootstrap-steps 20
+```
+
 Key behavior:
 
 - Requires a pre-split dataset with `train` plus a validation split.
@@ -78,6 +86,8 @@ Key behavior:
 - Generates one positive task per labeled box and negative tasks from absent classes.
 - Uses football defaults `neg_prompts_per_nonempty=1` and `neg_prompts_per_empty=0`.
 - Applies State Farm-style augmentation per task sample, not per raw row.
+- `sft_bootstrap_steps` runs a positive-only SFT warmup before the RL rollout loop.
+- Football SFT bootstrap targets GT boxes directly with `DetectSFTTarget`; negative tasks stay RL-only.
 - Uses W&B project `moondream-football-detect-rl` by default.
 
 Useful overrides:

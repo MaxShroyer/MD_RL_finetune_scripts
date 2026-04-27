@@ -1,0 +1,11 @@
+{
+  "best_known_default": {
+    "checkpoint_step": 140,
+    "finetune_id": "01KHWBR92JZZ2F4PG090PZMWKX",
+    "selection_metric": "eval_f1"
+  },
+  "notes": [
+    "Config defaults are normalized from train_pid_icons_best_point_recall_primary.json.",
+    "Default training now uses the RL-only parity path; the old SFT bootstrap showcase lives in configs/sft_then_rl.json."
+  ]
+}

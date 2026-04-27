@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Normalize the local Aerial Airport COCO export into an HF DatasetDict."""
+"""Normalize local aerial datasets into an HF DatasetDict."""
 
 from __future__ import annotations
 
@@ -16,6 +16,11 @@ from datasets import Dataset, DatasetDict, Features, Image as HFImage, Value
 from dotenv import load_dotenv
 from PIL import Image
 
+try:
+    import yaml
+except ModuleNotFoundError:
+    yaml = None
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -25,6 +30,11 @@ from aerial_airport.common import (
     DEFAULT_CLASS_UID,
     DEFAULT_HF_DATASET_NAME,
     DEFAULT_RAW_DATASET_DIR,
+    DEFAULT_SOURCE_FORMAT,
+    LEGACY_AIRPORT_RAW_DATASET_DIR,
+    VISDRONE_CATEGORY_ID_TO_NAME,
+    VISDRONE_CLASS_NAMES,
+    VISDRONE_RAW_CATEGORY_ID_TO_NAME,
     build_class_catalog,
     class_uid_for_name,
     clamp,
@@ -47,6 +57,8 @@ OUTPUT_SPLIT_MAP = {
 }
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
 SOURCE_VARIANT_EXPORT = "raw_coco_export"
+SOURCE_VARIANT_VISDRONE_VID = "visdrone_vid_frame"
+SOURCE_VARIANT_YOLO = "yolo_image"
 SOURCE_VARIANT_BACKGROUND_NEGATIVE = "background_negative"
 TILING_CHOICES = ("none", "2x2")
 BACKGROUND_SCALES = (0.35, 0.50)
@@ -54,6 +66,17 @@ BACKGROUND_GRID_POSITIONS = (0.0, 0.5, 1.0)
 BACKGROUND_PADDING = 0.02
 SPLIT_STRATEGIES = ("random_group", "stratified_empty_group")
 EMPTY_FRACTION_TOLERANCE = 0.03
+SOURCE_FORMAT_CHOICES = ("visdrone_vid", "airport_coco", "yolo_dir")
+VISDRONE_SPLIT_TO_OUTPUT = {
+    "VisDrone2019-VID-train": "train",
+    "VisDrone2019-VID-val": "validation",
+    "VisDrone2019-VID-test-dev": "test",
+}
+YOLO_SPLIT_ALIASES = {
+    "train": ("train",),
+    "validation": ("validation", "valid", "val"),
+    "test": ("test", "test-dev", "test_dev"),
+}
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -64,12 +87,19 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     config_path = resolve_config_path(pre_args.config, script_dir=SCRIPT_DIR)
     config = load_json_config(config_path, default_path=DEFAULT_CONFIG_PATH)
 
-    parser = argparse.ArgumentParser(description="Build the local Aerial Airport COCO export into an HF DatasetDict.")
+    parser = argparse.ArgumentParser(description="Build the local aerial dataset into an HF DatasetDict.")
     parser.add_argument("--config", default=str(config_path))
     parser.add_argument("--env-file", "--env", default=str(repo_relative(".env.staging")))
     parser.add_argument("--raw-dataset-dir", default=str(DEFAULT_RAW_DATASET_DIR))
-    parser.add_argument("--output-dir", default=str(repo_relative("outputs", "maxs-m87_aerial_airport_point_v2")))
+    parser.add_argument("--source-format", choices=SOURCE_FORMAT_CHOICES, default=DEFAULT_SOURCE_FORMAT)
+    parser.add_argument(
+        "--output-dir",
+        default=str(repo_relative("outputs", "maxs-m87_visdrone_vid_frames_car_van_merged_v2")),
+    )
     parser.add_argument("--tiling", choices=TILING_CHOICES, default="none")
+    parser.add_argument("--frame-stride-train", type=int, default=5)
+    parser.add_argument("--frame-stride-validation", type=int, default=1)
+    parser.add_argument("--frame-stride-test", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--val-fraction", type=float, default=0.10)
     parser.add_argument("--test-fraction", type=float, default=0.10)
@@ -78,7 +108,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         choices=SPLIT_STRATEGIES,
         default="stratified_empty_group",
     )
-    parser.add_argument("--target-empty-fraction", type=float, default=0.10)
+    parser.add_argument("--target-empty-fraction", type=float, default=0.0)
+    parser.add_argument(
+        "--require-output-splits",
+        nargs="*",
+        choices=("train", "validation", "test"),
+        default=[],
+    )
     parser.add_argument("--push-to-hub", default=DEFAULT_HF_DATASET_NAME)
     parser.add_argument("--hub-val-split", default="validation")
     parser.add_argument("--hub-post-val-split", default="test")
@@ -117,6 +153,9 @@ def _features() -> Features:
             "source_split": Value("string"),
             "source_image_id": Value("string"),
             "source_base_id": Value("string"),
+            "source_sequence_name": Value("string"),
+            "source_frame_name": Value("string"),
+            "source_frame_index": Value("int32"),
             "split_group_id": Value("string"),
             "class_count": Value("int32"),
         }
@@ -145,6 +184,32 @@ def _find_coco_annotation_file(split_dir: Path) -> Optional[Path]:
 def _has_coco_split(split_dir: Path) -> bool:
     annotation_path = _find_coco_annotation_file(split_dir)
     return split_dir.exists() and annotation_path is not None
+
+
+def _iter_image_files(root_dir: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in root_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+    )
+
+
+def _find_yolo_images_dir(split_dir: Path) -> Optional[Path]:
+    for candidate_name in ("images", "imgs", "JPEGImages"):
+        candidate = split_dir / candidate_name
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    if _iter_image_files(split_dir):
+        return split_dir
+    return None
+
+
+def _find_yolo_labels_dir(split_dir: Path) -> Path:
+    for candidate_name in ("labels", "label"):
+        candidate = split_dir / candidate_name
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    return split_dir
 
 
 def _resolve_image_path(split_dir: Path, file_name: str) -> Path:
@@ -204,8 +269,9 @@ def _normalized_box_from_coco_bbox(
 
 
 def _answer_boxes_payload(boxes: Iterable[Mapping[str, Any]]) -> str:
-    payload = [
-        {
+    payload: list[dict[str, Any]] = []
+    for box in boxes:
+        item = {
             "x_min": float(box["x_min"]),
             "y_min": float(box["y_min"]),
             "x_max": float(box["x_max"]),
@@ -214,8 +280,22 @@ def _answer_boxes_payload(boxes: Iterable[Mapping[str, Any]]) -> str:
             "class_name": str(box["class_name"]),
             "source_class_name": str(box["source_class_name"]),
         }
-        for box in boxes
-    ]
+        for extra_key in (
+            "track_id",
+            "truncation",
+            "occlusion",
+            "source_category_id",
+            "sequence_name",
+            "frame_name",
+            "frame_index",
+        ):
+            if extra_key not in box:
+                continue
+            value = box.get(extra_key)
+            if value is None or value == "":
+                continue
+            item[extra_key] = value
+        payload.append(item)
     return json.dumps(payload, separators=(",", ":"))
 
 
@@ -230,6 +310,9 @@ def _build_row(
     source_is_synthetic: bool,
     source_image_id: str,
     source_base_id: str,
+    source_sequence_name: str = "",
+    source_frame_name: str = "",
+    source_frame_index: int = -1,
     split_group_id: str,
 ) -> dict[str, Any]:
     return {
@@ -242,6 +325,9 @@ def _build_row(
         "source_split": source_split,
         "source_image_id": source_image_id,
         "source_base_id": source_base_id,
+        "source_sequence_name": str(source_sequence_name),
+        "source_frame_name": str(source_frame_name),
+        "source_frame_index": int(source_frame_index),
         "split_group_id": split_group_id,
         "class_count": len(boxes),
     }
@@ -342,6 +428,9 @@ def _tile_row_2x2(
                         source_is_synthetic=bool(row["source_is_synthetic"]),
                         source_image_id=tile_source_image_id,
                         source_base_id=str(row["source_base_id"]),
+                        source_sequence_name=str(row.get("source_sequence_name") or ""),
+                        source_frame_name=str(row.get("source_frame_name") or image_path.name),
+                        source_frame_index=int(row.get("source_frame_index", -1) or -1),
                         split_group_id=str(row["split_group_id"]),
                     )
                 )
@@ -441,9 +530,350 @@ def _rows_from_coco_split(
                 source_is_synthetic=False,
                 source_image_id=source_image_id,
                 source_base_id=source_base_id,
+                source_sequence_name="",
+                source_frame_name=Path(file_name).name,
+                source_frame_index=-1,
                 split_group_id=f"group:{source_base_id}",
             )
         )
+    return rows
+
+
+def _load_yolo_class_names(raw_dataset_dir: Path) -> dict[int, str]:
+    search_roots = [raw_dataset_dir]
+    if raw_dataset_dir.parent != raw_dataset_dir:
+        search_roots.append(raw_dataset_dir.parent)
+
+    candidate_paths: list[Path] = []
+    preferred_names = ("data.yaml", "data.yml", "dataset.yaml", "dataset.yml")
+    for search_root in search_roots:
+        for preferred_name in preferred_names:
+            candidate = search_root / preferred_name
+            if candidate.exists() and candidate.is_file():
+                candidate_paths.append(candidate)
+        candidate_paths.extend(sorted(search_root.glob("*.yaml")))
+        candidate_paths.extend(sorted(search_root.glob("*.yml")))
+
+    seen_paths: set[Path] = set()
+    for candidate_path in candidate_paths:
+        resolved = candidate_path.resolve()
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        if yaml is None:
+            break
+        payload = yaml.safe_load(candidate_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            continue
+        names = payload.get("names")
+        if isinstance(names, list):
+            return {
+                index: normalize_class_name(name) or str(name).strip()
+                for index, name in enumerate(names)
+                if str(name).strip()
+            }
+        if isinstance(names, dict):
+            out: dict[int, str] = {}
+            for key, value in names.items():
+                try:
+                    class_id = int(key)
+                except (TypeError, ValueError):
+                    continue
+                normalized = normalize_class_name(value) or str(value).strip()
+                if normalized:
+                    out[class_id] = normalized
+            if out:
+                return out
+
+    return {0: DEFAULT_CLASS_NAME}
+
+
+def _discover_yolo_split_dirs(raw_dataset_dir: Path) -> tuple[dict[str, Path], list[str]]:
+    split_dirs: dict[str, Path] = {}
+    source_split_names: list[str] = []
+    for output_split, aliases in YOLO_SPLIT_ALIASES.items():
+        for alias in aliases:
+            candidate = raw_dataset_dir / alias
+            if not candidate.exists() or not candidate.is_dir():
+                continue
+            images_dir = _find_yolo_images_dir(candidate)
+            if images_dir is None:
+                continue
+            split_dirs[output_split] = candidate
+            source_split_names.append(candidate.name)
+            break
+
+    if split_dirs:
+        return split_dirs, source_split_names
+
+    images_dir = _find_yolo_images_dir(raw_dataset_dir)
+    if images_dir is not None:
+        inferred_split = "test" if "test" in raw_dataset_dir.name.lower() else "train"
+        return {inferred_split: raw_dataset_dir}, [raw_dataset_dir.name]
+
+    raise FileNotFoundError(
+        f"Could not find any YOLO split directories or image payload under {raw_dataset_dir}"
+    )
+
+
+def _resolve_yolo_label_path(
+    *,
+    image_path: Path,
+    images_dir: Path,
+    labels_dir: Path,
+) -> Optional[Path]:
+    try:
+        relative_image_path = image_path.relative_to(images_dir)
+    except ValueError:
+        relative_image_path = image_path.name
+
+    candidate_paths = [
+        labels_dir / Path(relative_image_path).with_suffix(".txt"),
+        image_path.with_suffix(".txt"),
+    ]
+    for candidate_path in candidate_paths:
+        if candidate_path.exists() and candidate_path.is_file():
+            return candidate_path
+    return None
+
+
+def _normalized_box_from_yolo_row(row: list[str]) -> Optional[dict[str, float]]:
+    if len(row) < 5:
+        return None
+    try:
+        center_x = float(row[1])
+        center_y = float(row[2])
+        box_width = float(row[3])
+        box_height = float(row[4])
+    except (TypeError, ValueError):
+        return None
+    x_min = clamp(center_x - (box_width / 2.0))
+    y_min = clamp(center_y - (box_height / 2.0))
+    x_max = clamp(center_x + (box_width / 2.0))
+    y_max = clamp(center_y + (box_height / 2.0))
+    if x_max <= x_min or y_max <= y_min:
+        return None
+    return {
+        "x_min": x_min,
+        "y_min": y_min,
+        "x_max": x_max,
+        "y_max": y_max,
+    }
+
+
+def _boxes_from_yolo_label_file(
+    label_path: Optional[Path],
+    *,
+    class_names_by_id: Mapping[int, str],
+) -> list[dict[str, Any]]:
+    if label_path is None or not label_path.exists():
+        return []
+
+    boxes: list[dict[str, Any]] = []
+    with label_path.open(encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            try:
+                class_id = int(float(parts[0]))
+            except (IndexError, TypeError, ValueError):
+                continue
+            normalized_box = _normalized_box_from_yolo_row(parts)
+            if normalized_box is None:
+                continue
+            raw_class_name = class_names_by_id.get(
+                class_id,
+                DEFAULT_CLASS_NAME if class_id == 0 else f"class_{class_id}",
+            )
+            class_name = normalize_class_name(raw_class_name) or str(raw_class_name).strip()
+            if not class_name:
+                continue
+            boxes.append(
+                {
+                    **normalized_box,
+                    "class_uid": class_uid_for_name(class_name),
+                    "class_name": class_name,
+                    "source_class_name": str(raw_class_name),
+                    "source_category_id": class_id,
+                }
+            )
+    return boxes
+
+
+def _rows_from_yolo_split(
+    *,
+    split_dir: Path,
+    source_dataset: str,
+    source_collection: str,
+    source_split: str,
+    class_names_by_id: Mapping[int, str],
+) -> list[dict[str, Any]]:
+    images_dir = _find_yolo_images_dir(split_dir)
+    if images_dir is None:
+        raise FileNotFoundError(f"Could not find YOLO images under {split_dir}")
+    labels_dir = _find_yolo_labels_dir(split_dir)
+
+    rows: list[dict[str, Any]] = []
+    for image_path in _iter_image_files(images_dir):
+        label_path = _resolve_yolo_label_path(
+            image_path=image_path,
+            images_dir=images_dir,
+            labels_dir=labels_dir,
+        )
+        boxes = _boxes_from_yolo_label_file(label_path, class_names_by_id=class_names_by_id)
+        relative_stem = image_path.relative_to(images_dir).with_suffix("")
+        source_image_id = "__".join(relative_stem.parts)
+        source_sequence_name = "" if len(relative_stem.parts) <= 1 else "/".join(relative_stem.parts[:-1])
+        rows.append(
+            _build_row(
+                image_path=image_path,
+                boxes=boxes,
+                source_dataset=source_dataset,
+                source_collection=source_collection,
+                source_split=source_split,
+                source_variant=SOURCE_VARIANT_YOLO,
+                source_is_synthetic=False,
+                source_image_id=source_image_id,
+                source_base_id=source_image_id,
+                source_sequence_name=source_sequence_name,
+                source_frame_name=image_path.name,
+                source_frame_index=-1,
+                split_group_id=f"group:{source_image_id}",
+            )
+        )
+    return rows
+
+
+def _sorted_frame_paths(sequence_dir: Path) -> list[Path]:
+    return sorted(
+        (path for path in sequence_dir.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES),
+        key=lambda path: int(path.stem),
+    )
+
+
+def _parse_visdrone_annotation_file(annotation_path: Path) -> dict[int, list[dict[str, Any]]]:
+    by_frame: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    with annotation_path.open(encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) != 10:
+                continue
+            try:
+                frame_index = int(parts[0])
+                track_id = int(parts[1])
+                bbox_left = float(parts[2])
+                bbox_top = float(parts[3])
+                bbox_width = float(parts[4])
+                bbox_height = float(parts[5])
+                category_id = int(parts[7])
+                truncation = int(parts[8])
+                occlusion = int(parts[9])
+            except (TypeError, ValueError):
+                continue
+            if category_id not in VISDRONE_RAW_CATEGORY_ID_TO_NAME:
+                continue
+            by_frame[frame_index].append(
+                {
+                    "track_id": track_id,
+                    "bbox": [bbox_left, bbox_top, bbox_width, bbox_height],
+                    "category_id": category_id,
+                    "truncation": truncation,
+                    "occlusion": occlusion,
+                }
+            )
+    return by_frame
+
+
+def _frame_stride_for_output_split(
+    output_split: str,
+    *,
+    frame_stride_train: int,
+    frame_stride_validation: int,
+    frame_stride_test: int,
+) -> int:
+    stride = {
+        "train": frame_stride_train,
+        "validation": frame_stride_validation,
+        "test": frame_stride_test,
+    }[output_split]
+    if stride <= 0:
+        raise ValueError("Frame stride values must be > 0.")
+    return stride
+
+
+def _rows_from_visdrone_sequence_split(
+    *,
+    split_dir: Path,
+    source_dataset: str,
+    source_collection: str,
+    output_split: str,
+    frame_stride: int,
+) -> list[dict[str, Any]]:
+    sequences_dir = split_dir / "sequences"
+    annotations_dir = split_dir / "annotations"
+    if not sequences_dir.exists() or not annotations_dir.exists():
+        raise FileNotFoundError(f"Expected sequences/ and annotations/ under {split_dir}")
+
+    rows: list[dict[str, Any]] = []
+    for sequence_dir in sorted(path for path in sequences_dir.iterdir() if path.is_dir()):
+        sequence_name = sequence_dir.name
+        annotation_path = annotations_dir / f"{sequence_name}.txt"
+        if not annotation_path.exists():
+            raise FileNotFoundError(f"Missing VisDrone annotation file for sequence {sequence_name}: {annotation_path}")
+        annotations_by_frame = _parse_visdrone_annotation_file(annotation_path)
+        frame_paths = _sorted_frame_paths(sequence_dir)
+        for frame_path in frame_paths[::frame_stride]:
+            frame_index = int(frame_path.stem)
+            with Image.open(frame_path) as image:
+                width, height = image.size
+            boxes: list[dict[str, Any]] = []
+            for annotation in annotations_by_frame.get(frame_index, []):
+                category_id = int(annotation["category_id"])
+                class_name = VISDRONE_CATEGORY_ID_TO_NAME.get(category_id, "")
+                source_class_name = VISDRONE_RAW_CATEGORY_ID_TO_NAME.get(category_id, class_name)
+                if not class_name:
+                    continue
+                normalized_box = _normalized_box_from_coco_bbox(annotation["bbox"], width=width, height=height)
+                if normalized_box is None:
+                    continue
+                boxes.append(
+                    {
+                        **normalized_box,
+                        "class_uid": class_uid_for_name(class_name),
+                        "class_name": class_name,
+                        "source_class_name": source_class_name,
+                        "track_id": int(annotation["track_id"]),
+                        "truncation": int(annotation["truncation"]),
+                        "occlusion": int(annotation["occlusion"]),
+                        "source_category_id": category_id,
+                        "sequence_name": sequence_name,
+                        "frame_name": frame_path.name,
+                        "frame_index": frame_index,
+                    }
+                )
+            source_image_id = f"{sequence_name}__{frame_path.stem}"
+            rows.append(
+                _build_row(
+                    image_path=frame_path,
+                    boxes=boxes,
+                    source_dataset=source_dataset,
+                    source_collection=source_collection,
+                    source_split=split_dir.name,
+                    source_variant=SOURCE_VARIANT_VISDRONE_VID,
+                    source_is_synthetic=False,
+                    source_image_id=source_image_id,
+                    source_base_id=source_image_id,
+                    source_sequence_name=sequence_name,
+                    source_frame_name=frame_path.name,
+                    source_frame_index=frame_index,
+                    split_group_id=f"sequence:{sequence_name}",
+                )
+            )
     return rows
 
 
@@ -912,6 +1342,9 @@ def _augment_with_background_negatives(
                 source_is_synthetic=True,
                 source_image_id=f"{row['source_image_id']}__bgneg",
                 source_base_id=str(row["source_base_id"]),
+                source_sequence_name=str(row.get("source_sequence_name") or ""),
+                source_frame_name=str(row.get("source_frame_name") or image_path.name),
+                source_frame_index=int(row.get("source_frame_index", -1) or -1),
                 split_group_id=str(row["split_group_id"]),
             )
         )
@@ -923,78 +1356,137 @@ def _augment_with_background_negatives(
 def _load_source_rows(
     raw_dataset_dir: Path,
     *,
+    source_format: str,
     output_dir: Path,
     tiling: str,
     seed: int,
     val_fraction: float,
     test_fraction: float,
     split_strategy: str,
+    frame_stride_train: int,
+    frame_stride_validation: int,
+    frame_stride_test: int,
 ) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
-    source_dataset = f"local_coco:{raw_dataset_dir.name}"
-    source_collection = f"local_coco:{raw_dataset_dir.name}"
+    if source_format == "airport_coco":
+        source_dataset = f"local_coco:{raw_dataset_dir.name}"
+        source_collection = f"local_coco:{raw_dataset_dir.name}"
 
-    explicit_source_splits = {
-        split_name: _rows_from_coco_split(
-            split_dir=raw_dataset_dir / split_name,
-            source_dataset=source_dataset,
-            source_collection=source_collection,
-            source_split=split_name,
-        )
-        for split_name in SOURCE_SPLITS
-        if _has_coco_split(raw_dataset_dir / split_name)
-    }
-    explicit_source_splits = {
-        split_name: _apply_tiling(
-            rows,
-            output_dir=output_dir,
-            tiling=tiling,
-        )
-        for split_name, rows in explicit_source_splits.items()
-    }
-    source_split_names = sorted(explicit_source_splits)
-
-    if set(source_split_names) == {"train", "valid", "test"}:
-        split_rows = {
-            OUTPUT_SPLIT_MAP[source_split]: rows
-            for source_split, rows in explicit_source_splits.items()
+        explicit_source_splits = {
+            split_name: _rows_from_coco_split(
+                split_dir=raw_dataset_dir / split_name,
+                source_dataset=source_dataset,
+                source_collection=source_collection,
+                source_split=split_name,
+            )
+            for split_name in SOURCE_SPLITS
+            if _has_coco_split(raw_dataset_dir / split_name)
         }
-        return split_rows, source_split_names
+        explicit_source_splits = {
+            split_name: _apply_tiling(
+                rows,
+                output_dir=output_dir,
+                tiling=tiling,
+            )
+            for split_name, rows in explicit_source_splits.items()
+        }
+        source_split_names = sorted(explicit_source_splits)
 
-    if set(source_split_names) == {"train"}:
-        split_rows = _split_rows_by_group(
-            explicit_source_splits["train"],
-            seed=seed,
-            val_fraction=val_fraction,
-            test_fraction=test_fraction,
-            split_strategy=split_strategy,
+        if set(source_split_names) == {"train", "valid", "test"}:
+            split_rows = {
+                OUTPUT_SPLIT_MAP[source_split]: rows
+                for source_split, rows in explicit_source_splits.items()
+            }
+            return split_rows, source_split_names
+
+        if set(source_split_names) == {"train"}:
+            split_rows = _split_rows_by_group(
+                explicit_source_splits["train"],
+                seed=seed,
+                val_fraction=val_fraction,
+                test_fraction=test_fraction,
+                split_strategy=split_strategy,
+            )
+            return split_rows, source_split_names
+
+        raise ValueError(
+            "Expected either a single COCO source split at raw_dataset_dir/train "
+            "or explicit train/valid/test COCO directories."
         )
+
+    if source_format == "visdrone_vid":
+        source_dataset = f"local_visdrone_vid:{raw_dataset_dir.name}"
+        source_collection = f"local_visdrone_vid:{raw_dataset_dir.name}"
+        split_rows: dict[str, list[dict[str, Any]]] = {}
+        source_split_names: list[str] = []
+        for source_split_name, output_split in VISDRONE_SPLIT_TO_OUTPUT.items():
+            split_dir = raw_dataset_dir / source_split_name
+            if not split_dir.exists():
+                raise FileNotFoundError(f"Expected VisDrone source split under raw dataset dir: {split_dir}")
+            stride = _frame_stride_for_output_split(
+                output_split,
+                frame_stride_train=frame_stride_train,
+                frame_stride_validation=frame_stride_validation,
+                frame_stride_test=frame_stride_test,
+            )
+            rows = _rows_from_visdrone_sequence_split(
+                split_dir=split_dir,
+                source_dataset=source_dataset,
+                source_collection=source_collection,
+                output_split=output_split,
+                frame_stride=stride,
+            )
+            split_rows[output_split] = _apply_tiling(rows, output_dir=output_dir, tiling=tiling)
+            source_split_names.append(source_split_name)
         return split_rows, source_split_names
 
-    raise ValueError(
-        "Expected either a single COCO source split at raw_dataset_dir/train "
-        "or explicit train/valid/test COCO directories."
-    )
+    if source_format == "yolo_dir":
+        source_dataset = f"local_yolo:{raw_dataset_dir.name}"
+        source_collection = f"local_yolo:{raw_dataset_dir.name}"
+        class_names_by_id = _load_yolo_class_names(raw_dataset_dir)
+        split_dir_map, source_split_names = _discover_yolo_split_dirs(raw_dataset_dir)
+        split_rows: dict[str, list[dict[str, Any]]] = {}
+        for output_split, split_dir in split_dir_map.items():
+            rows = _rows_from_yolo_split(
+                split_dir=split_dir,
+                source_dataset=source_dataset,
+                source_collection=source_collection,
+                source_split=split_dir.name,
+                class_names_by_id=class_names_by_id,
+            )
+            split_rows[output_split] = _apply_tiling(rows, output_dir=output_dir, tiling=tiling)
+        return split_rows, source_split_names
+
+    raise ValueError(f"Unsupported source format: {source_format}")
 
 
 def build_dataset_dict_from_raw_dir(
     raw_dataset_dir: Path,
     *,
     output_dir: Path,
+    source_format: str,
     seed: int,
     val_fraction: float,
     test_fraction: float,
     target_empty_fraction: float,
     split_strategy: str = "stratified_empty_group",
     tiling: str = "none",
+    frame_stride_train: int = 5,
+    frame_stride_validation: int = 1,
+    frame_stride_test: int = 1,
+    required_output_splits: Optional[Iterable[str]] = None,
 ) -> tuple[DatasetDict, dict[str, list[dict[str, Any]]], dict[str, int], list[str], dict[str, int]]:
     split_rows, source_split_names = _load_source_rows(
         raw_dataset_dir,
+        source_format=source_format,
         output_dir=output_dir,
         tiling=tiling,
         seed=seed,
         val_fraction=val_fraction,
         test_fraction=test_fraction,
         split_strategy=split_strategy,
+        frame_stride_train=frame_stride_train,
+        frame_stride_validation=frame_stride_validation,
+        frame_stride_test=frame_stride_test,
     )
     features = _features()
     raw_empty_row_counts = {
@@ -1003,7 +1495,22 @@ def build_dataset_dict_from_raw_dir(
     }
     synthetic_negative_counts: dict[str, int] = {}
     dataset_splits: dict[str, Dataset] = {}
-    for split_name in ("train", "validation", "test"):
+    available_output_splits = [
+        split_name for split_name in ("train", "validation", "test") if split_name in split_rows
+    ]
+    if not available_output_splits:
+        raise ValueError("No output splits were generated from the raw dataset.")
+    required_split_names = [str(split_name) for split_name in (required_output_splits or [])]
+    missing_required_splits = [
+        split_name for split_name in required_split_names if split_name not in available_output_splits
+    ]
+    if missing_required_splits:
+        raise ValueError(
+            "Missing required output split(s): "
+            f"{missing_required_splits}. Available splits: {available_output_splits}. "
+            "Make sure the raw dataset contains the corresponding source split directories."
+        )
+    for split_name in available_output_splits:
         rows, synthetic_count = _augment_with_background_negatives(
             split_rows[split_name],
             output_dir=output_dir,
@@ -1017,10 +1524,17 @@ def build_dataset_dict_from_raw_dir(
     class_names = discover_class_names(row for rows in split_rows.values() for row in rows)
     if not class_names:
         raise ValueError("No classes discovered in raw dataset.")
-    if DEFAULT_CLASS_NAME not in class_names:
-        raise ValueError(f"Expected class '{DEFAULT_CLASS_NAME}' in dataset but found {class_names}.")
-    if any(class_name != DEFAULT_CLASS_NAME for class_name in class_names):
-        raise ValueError(f"Unexpected class names in aerial airport dataset: {class_names}")
+    if source_format == "airport_coco":
+        if DEFAULT_CLASS_NAME not in class_names:
+            raise ValueError(f"Expected class '{DEFAULT_CLASS_NAME}' in dataset but found {class_names}.")
+        if any(class_name != DEFAULT_CLASS_NAME for class_name in class_names):
+            raise ValueError(f"Unexpected class names in aerial airport dataset: {class_names}")
+    elif source_format == "visdrone_vid":
+        unexpected = sorted(class_name for class_name in class_names if class_name not in set(VISDRONE_CLASS_NAMES))
+        if unexpected:
+            raise ValueError(f"Unexpected class names in VisDrone VID dataset: {unexpected}")
+    elif source_format == "yolo_dir":
+        pass
 
     return DatasetDict(dataset_splits), split_rows, synthetic_negative_counts, source_split_names, raw_empty_row_counts
 
@@ -1031,6 +1545,10 @@ def _build_stats(
     raw_empty_row_counts: Mapping[str, int],
     target_empty_fraction: float,
     tiling: str,
+    source_format: str,
+    frame_stride_train: int,
+    frame_stride_validation: int,
+    frame_stride_test: int,
 ) -> dict[str, Any]:
     class_names = discover_class_names(row for rows in split_rows.values() for row in rows)
     split_sizes: dict[str, int] = {}
@@ -1076,7 +1594,11 @@ def _build_stats(
     }
 
     return {
+        "source_format": source_format,
         "tiling": tiling,
+        "frame_stride_train": int(frame_stride_train),
+        "frame_stride_validation": int(frame_stride_validation),
+        "frame_stride_test": int(frame_stride_test),
         "split_sizes": split_sizes,
         "pre_synthetic_split_sizes": pre_synthetic_split_sizes,
         "class_catalog": list(class_names),
@@ -1105,14 +1627,18 @@ def _build_metadata(
         "config": args.config,
         "env_file": args.env_file,
         "raw_dataset_dir": str(raw_dataset_dir),
-        "source_format": "coco",
+        "source_format": str(args.source_format),
         "source_split_names": source_split_names,
         "seed": args.seed,
         "val_fraction": args.val_fraction,
         "test_fraction": args.test_fraction,
         "split_strategy": args.split_strategy,
         "tiling": args.tiling,
+        "frame_stride_train": args.frame_stride_train,
+        "frame_stride_validation": args.frame_stride_validation,
+        "frame_stride_test": args.frame_stride_test,
         "target_empty_fraction": args.target_empty_fraction,
+        "require_output_splits": list(args.require_output_splits),
         "output_dir": str(output_dir),
         "push_to_hub": bool(args.push_to_hub),
         "hub_repo_id": args.push_to_hub or "",
@@ -1158,17 +1684,27 @@ def main(argv: Optional[list[str]] = None) -> None:
     raw_dataset_dir = Path(args.raw_dataset_dir).expanduser().resolve()
     if not raw_dataset_dir.exists():
         raise FileNotFoundError(f"Raw dataset dir not found: {raw_dataset_dir}")
-    output_dir = _resolve_dir(args.output_dir, fallback_name="maxs-m87_aerial_airport_point_v2")
+    default_output_name = (
+        "maxs-m87_visdrone_vid_frames_car_van_merged_v2"
+        if str(args.source_format) == "visdrone_vid"
+        else "maxs-m87_aerial_airport_point_v2"
+    )
+    output_dir = _resolve_dir(args.output_dir, fallback_name=default_output_name)
 
     dataset_dict, split_rows, synthetic_negative_counts, source_split_names, raw_empty_row_counts = build_dataset_dict_from_raw_dir(
         raw_dataset_dir,
         output_dir=output_dir,
+        source_format=args.source_format,
         seed=args.seed,
         val_fraction=args.val_fraction,
         test_fraction=args.test_fraction,
         target_empty_fraction=args.target_empty_fraction,
         split_strategy=args.split_strategy,
         tiling=args.tiling,
+        frame_stride_train=args.frame_stride_train,
+        frame_stride_validation=args.frame_stride_validation,
+        frame_stride_test=args.frame_stride_test,
+        required_output_splits=args.require_output_splits,
     )
     stats = _build_stats(
         split_rows,
@@ -1176,6 +1712,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         raw_empty_row_counts,
         args.target_empty_fraction,
         args.tiling,
+        args.source_format,
+        args.frame_stride_train,
+        args.frame_stride_validation,
+        args.frame_stride_test,
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1190,10 +1730,12 @@ def main(argv: Optional[list[str]] = None) -> None:
     write_json(output_dir / "metadata.json", metadata)
     write_json(output_dir / "stats.json", stats)
 
-    print(
-        f"saved normalized dataset to {output_dir} "
-        f"(train={len(dataset_dict['train'])}, validation={len(dataset_dict['validation'])}, test={len(dataset_dict['test'])})"
+    split_summary = ", ".join(
+        f"{split_name}={len(dataset_dict[split_name])}"
+        for split_name in ("train", "validation", "test")
+        if split_name in dataset_dict
     )
+    print(f"saved normalized dataset to {output_dir} ({split_summary})")
 
     if args.split_strategy == "stratified_empty_group" and source_split_names == ["train"]:
         max_empty_delta = max(float(value) for value in stats["empty_fraction_abs_delta"].values())

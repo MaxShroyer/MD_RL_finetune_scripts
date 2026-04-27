@@ -30,6 +30,7 @@
     "available_moves_list": 384
   },
   "reasoning": false,
+  "sft_bootstrap_steps": 0,
   "task_sampling_weights": {
     "best_move": 3.0,
     "available_moves_count": 3.0,

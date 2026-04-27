@@ -1,0 +1,22 @@
+{
+  "env_file": "disaster_m3/.env.staging",
+  "dataset_dir": "disaster_m3/dataset/full",
+  "split": "test",
+  "seed": 42,
+  "max_samples": 0,
+  "base_url": "https://api-staging.moondream.ai/v1",
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "max_tokens": 384,
+  "reasoning": false,
+  "image_quality": 92,
+  "detect_max_objects": 64,
+  "timeout": 120.0,
+  "retry_429_max_retries": 2,
+  "retry_429_backoff_s": 1.0,
+  "retry_429_max_backoff_s": 8.0,
+  "retry_5xx_max_retries": 2,
+  "retry_5xx_backoff_s": 2.0,
+  "retry_5xx_max_backoff_s": 16.0,
+  "benchmark_output_dir": "outputs/benchmarks/disaster_m3"
+}

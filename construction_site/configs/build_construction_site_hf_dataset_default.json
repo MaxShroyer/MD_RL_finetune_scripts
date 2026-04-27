@@ -1,0 +1,12 @@
+{
+  "env_file": "construction_site/.env.staging",
+  "dataset_name": "LouisChen15/ConstructionSite",
+  "hf_token": "",
+  "hf_cache_dir": "",
+  "detect_output_dir": "construction_site/outputs/construction_site_detect_v1",
+  "caption_output_dir": "construction_site/outputs/construction_site_query_caption_v1",
+  "rule_vqa_output_dir": "construction_site/outputs/construction_site_query_rule_vqa_v1",
+  "shared_image_dir": "construction_site/outputs/construction_site_query_images",
+  "val_fraction": 0.1,
+  "seed": 42
+}

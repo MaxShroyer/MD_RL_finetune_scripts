@@ -12,6 +12,8 @@ from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
+from tuna_sdk import DetectRequest, DetectSFTTarget
+from tuna_sdk.errors import TunaAPIError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -488,6 +490,38 @@ class ConfigPrecedenceTests(unittest.TestCase):
                     self.assertEqual(args.pos_task_prob, expected["pos_task_prob"])
                     self.assertEqual(args.neg_reward_weight, expected["neg_reward_weight"])
 
+    def test_best_general_async_sft_config_parses_with_expected_overrides(self) -> None:
+        config_path = (
+            REPO_ROOT
+            / "football_detect"
+            / "configs"
+            / "cicd"
+            / "cicd_train_football_detect_best_general_async_sft.json"
+        )
+
+        args = mod.parse_args(["--config", str(config_path)])
+
+        self.assertEqual(args.dataset_path, "football_detect/outputs/maxs-m87_football_detect_v2_splits")
+        self.assertEqual(args.dataset_name, "maxs-m87/football_detect_v2")
+        self.assertEqual(args.val_split, "val")
+        self.assertEqual(args.test_split, "post_val")
+        self.assertEqual(args.rank, 32)
+        self.assertEqual(args.lr, 0.0001)
+        self.assertEqual(args.group_size, 2)
+        self.assertEqual(args.reward_metric, "f1")
+        self.assertEqual(args.selection_metric, "f1")
+        self.assertEqual(args.sft_bootstrap_steps, 20)
+        self.assertTrue(args.off_policy)
+        self.assertTrue(args.async_checkpoint_eval)
+        self.assertEqual(
+            args.async_checkpoint_eval_dir,
+            "football_detect/outputs/async_checkpoint_eval/best_general_async_sft",
+        )
+        self.assertEqual(args.async_checkpoint_eval_max_inflight, 1)
+        self.assertTrue(args.async_checkpoint_eval_drain_on_exit)
+        self.assertTrue(args.run_final_test)
+        self.assertEqual(args.wandb_run_name, "football-best-general-async-sft")
+
 
 class AuthHeaderTests(unittest.TestCase):
     def test_build_auth_headers_adds_accept_and_browser_user_agent_by_default(self) -> None:
@@ -753,6 +787,53 @@ class TaskGenerationTests(unittest.TestCase):
         self.assertEqual([_box_tuple(box) for box in tasks[0].gt_boxes], [(0.2, 0.2, 0.4, 0.4)])
 
 
+class SFTBootstrapHelperTests(unittest.TestCase):
+    def _task(self, *, is_positive: bool) -> mod.TaskSample:
+        gt_boxes = [mod._box_from_normalized(0.1, 0.2, 0.3, 0.4)] if is_positive else []
+        return mod.TaskSample(
+            image=Image.new("RGB", (32, 32), color=(255, 255, 255)),
+            prompt="ball carrier",
+            gt_boxes=gt_boxes,
+            class_name="ball holder",
+            is_positive=is_positive,
+            source="football-unit-test",
+        )
+
+    def test_detect_bootstrap_uses_gt_boxes(self) -> None:
+        task = self._task(is_positive=True)
+        request = DetectRequest(object_name=task.prompt, image_url="data:image/jpeg;base64,abc")
+
+        group = mod._build_sft_group_for_task(task, request=request)
+
+        self.assertIsNotNone(group)
+        assert group is not None
+        self.assertEqual(group.mode, "sft")
+        self.assertIsInstance(group.targets[0], DetectSFTTarget)
+        self.assertEqual(group.targets[0].boxes, task.gt_boxes)
+
+    def test_negative_task_is_excluded_from_bootstrap(self) -> None:
+        task = self._task(is_positive=False)
+        request = DetectRequest(object_name=task.prompt, image_url="data:image/jpeg;base64,abc")
+
+        group = mod._build_sft_group_for_task(task, request=request)
+
+        self.assertIsNone(group)
+
+    def test_detects_backend_rl_only_schema_rejection_for_sft(self) -> None:
+        exc = TunaAPIError(
+            "Request failed",
+            status_code=422,
+            response_body={
+                "detail": [
+                    {"msg": "Input should be 'rl'", "loc": ["body", "groups", 0, "mode"]},
+                    {"msg": "Field required", "loc": ["body", "groups", 0, "request", "finetune_id"]},
+                ]
+            },
+            request_id="req_test",
+        )
+        self.assertTrue(mod._is_sft_bootstrap_unsupported_error(exc))
+
+
 class AugmentationTests(unittest.TestCase):
     def _augment_config(self) -> mod.AugmentConfig:
         return mod.AugmentConfig(
@@ -883,7 +964,7 @@ class MainFlowTests(unittest.TestCase):
             self.saved_steps: list[int] = []
 
         def train_step(self, *, groups: object, lr: float) -> SimpleNamespace:
-            return SimpleNamespace(kl=0.0, router_kl=0.0, grad_norm=0.0)
+            return SimpleNamespace(kl=0.0, router_kl=0.0, grad_norm=0.0, sft_loss=0.0)
 
         def save_checkpoint(self) -> SimpleNamespace:
             step = len(self.saved_steps) + 10
@@ -1236,3 +1317,78 @@ class MainFlowTests(unittest.TestCase):
         self.assertEqual(hf_once_calls.count("validation"), 1)
         self.assertEqual(hf_once_calls.count("test"), 1)
         self.assertEqual(summary["test_eval_failures"], 0)
+
+    def test_main_sft_bootstrap_skips_rollouts_and_logs_bootstrap_metrics(self) -> None:
+        dataset = {
+            "train": [_sample_row_for_split("ball holder", split_name="train")],
+            "validation": [_sample_row_for_split("ball holder", split_name="validation")],
+        }
+        mock_wandb = self._MockWandb()
+        mock_finetune = self._MockFinetune()
+        mock_client = self._MockClient(mock_finetune)
+        train_groups_seen: list[object] = []
+
+        def _fake_iter_dataset_rows(ds: list[dict[str, object]], seed: int) -> object:
+            def _iterator() -> object:
+                while True:
+                    for row in ds:
+                        yield row
+
+            return _iterator()
+
+        def _fake_train_step(*, groups: object, lr: float) -> SimpleNamespace:
+            train_groups_seen.extend(list(groups))
+            return SimpleNamespace(kl=0.01, router_kl=0.0, grad_norm=0.0, sft_loss=0.25)
+
+        mock_finetune.train_step = _fake_train_step  # type: ignore[method-assign]
+
+        argv = [
+            "--api-key",
+            "test-key",
+            "--dataset-path",
+            str(REPO_ROOT / "football_detect"),
+            "--num-steps",
+            "1",
+            "--sft-bootstrap-steps",
+            "1",
+            "--batch-size",
+            "1",
+            "--group-size",
+            "1",
+            "--eval-every",
+            "0",
+            "--save-every",
+            "0",
+            "--augment-prob",
+            "0.0",
+            "--selection-metric",
+            "f1",
+            "--val-split",
+            "validation",
+        ]
+
+        with patch.object(mod, "wandb", mock_wandb), patch.object(mod, "TunaClient", return_value=mock_client), patch.object(
+            mod, "_load_local_dataset_dict", return_value=dataset
+        ), patch.object(mod, "_iter_dataset_rows", side_effect=_fake_iter_dataset_rows), patch.object(
+            mod,
+            "_rollouts_batch_with_retry",
+            side_effect=AssertionError("rollouts should not run during pure SFT bootstrap"),
+        ):
+            mod.main(argv)
+
+        self.assertEqual(len(train_groups_seen), 1)
+        group = train_groups_seen[0]
+        self.assertEqual(group.mode, "sft")
+        self.assertEqual(len(group.targets), 1)
+        self.assertIsInstance(group.targets[0], DetectSFTTarget)
+        self.assertEqual(mock_wandb.run.summary["sft_bootstrap_steps_completed"], 1)
+        self.assertEqual(mock_wandb.run.summary["effective_sft_bootstrap_steps"], 1)
+        self.assertEqual(mock_wandb.run.summary["sft_bootstrap_groups_total"], 1)
+        self.assertTrue(
+            any(
+                entry["payload"].get("bootstrap_phase") == 1
+                and entry["payload"].get("sft_group_count") == 1
+                and entry["payload"].get("sft_loss") == 0.25
+                for entry in mock_wandb.logged
+            )
+        )

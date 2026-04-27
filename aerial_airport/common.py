@@ -8,15 +8,57 @@ from typing import Any, Iterable, Mapping, Optional
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_ROOT = Path(__file__).resolve().parent
 
-DEFAULT_RAW_DATASET_DIR = MODULE_ROOT / "raw_dataset" / "Aerial Airport.coco"
-DEFAULT_HF_DATASET_NAME = "maxs-m87/aerial_airport_point_v2"
-DEFAULT_WANDB_PROJECT = "moondream-aerial-airport-point-rl"
+DEFAULT_RAW_DATASET_DIR = MODULE_ROOT / "raw_dataset"
+DEFAULT_SOURCE_FORMAT = "visdrone_vid"
+DEFAULT_HF_DATASET_NAME = "maxs-m87/visdrone_vid_frames_car_van_merged_v2"
+DEFAULT_WANDB_PROJECT = "moondream-visdrone-vid-point-rl"
 DEFAULT_STAGING_API_BASE = "https://api-staging.moondream.ai/v1"
+LEGACY_AIRPORT_RAW_DATASET_DIR = MODULE_ROOT / "raw_dataset" / "Aerial Airport.coco"
+LEGACY_AIRPORT_HF_DATASET_NAME = "maxs-m87/aerial_airport_point_v2"
 DEFAULT_CLASS_NAME = "airplane"
 DEFAULT_CLASS_UID = "aerial_airport:airplane"
 DEFAULT_SKILL = "point"
 DEFAULT_POINT_PROMPT_STYLE = "class_name"
 DEFAULT_REWARD_METRIC = "f1"
+DETECT_PROMPT_OVERRIDES: dict[str, str] = {}
+VISDRONE_RAW_CATEGORY_ID_TO_NAME = {
+    1: "pedestrian",
+    2: "people",
+    3: "bicycle",
+    4: "car",
+    5: "van",
+    6: "truck",
+    7: "tricycle",
+    8: "awning-tricycle",
+    9: "bus",
+    10: "motor",
+}
+# Merge raw "van" annotations into "car" for training and evaluation because
+# the two labels are not consistently separated in the local VisDrone bundle.
+VISDRONE_CATEGORY_ID_TO_NAME = {
+    1: "pedestrian",
+    2: "people",
+    3: "bicycle",
+    4: "car",
+    5: "car",
+    6: "truck",
+    7: "tricycle",
+    8: "awning-tricycle",
+    9: "bus",
+    10: "motor",
+}
+VISDRONE_CLASS_NAMES = [
+    "pedestrian",
+    "people",
+    "bicycle",
+    "car",
+    "truck",
+    "tricycle",
+    "awning-tricycle",
+    "bus",
+    "motor",
+]
+VISDRONE_IGNORED_CATEGORY_IDS = {0, 11}
 
 
 def repo_relative(*parts: str) -> Path:
@@ -122,14 +164,27 @@ def clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
 
 def normalize_class_name(value: Any) -> str:
     text = " ".join(str(value or "").strip().replace("_", " ").split()).lower()
-    if text in {"plane", "planes"}:
+    if text in {"plane", "planes", "aircraft", "aircrafts"}:
         return DEFAULT_CLASS_NAME
+    if text in {"awning tricycle", "awningtricycle"}:
+        return "awning-tricycle"
+    if text == "motorbike":
+        return "motor"
+    if text == "van":
+        return "car"
     return text
 
 
 def default_prompt_for_class(class_name: str) -> str:
     normalized = normalize_class_name(class_name)
     return normalized or DEFAULT_CLASS_NAME
+
+
+def detect_prompt_for_class(class_name: str, *, prompt_overrides: Optional[Mapping[str, str]] = None) -> str:
+    override = str((prompt_overrides or {}).get(class_name, "") or "").strip()
+    if override:
+        return override
+    return normalize_class_name(class_name) or class_name
 
 
 def class_uid_for_name(class_name: str) -> str:

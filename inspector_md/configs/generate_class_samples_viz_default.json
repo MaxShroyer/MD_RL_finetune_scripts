@@ -1,0 +1,11 @@
+{
+  "source_manifest": "inspector_md/dataset/merged_synth_v1/synthetic_manifest.json",
+  "output_dir": "inspector_md/outputs/class_samples_viz_merged_synth_v1",
+  "samples_per_class": 6,
+  "columns": 3,
+  "tile_width": 480,
+  "tile_height": 420,
+  "margin": 16,
+  "max_evidence_chars": 120,
+  "issue_codes": []
+}

@@ -1,0 +1,11 @@
+{
+  "best_known_default": {
+    "checkpoint_step": 139,
+    "finetune_id": "01KFYJ3T93RST3147ANRCJ8VA2",
+    "selection_metric": "eval_miou"
+  },
+  "notes": [
+    "This is the public checkpoint with a fully anchored compare artifact in-repo.",
+    "Stronger private or W&B-only runs are intentionally not used as the default client-facing target."
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "env_file": "inspector_md/.env.staging",
+  "api_key": "",
+  "api_key_env_vars": [
+    "CICID_GPUB_MOONDREAM_API_KEY_1",
+    "CICID_GPUB_MOONDREAM_API_KEY_2",
+    "CICID_GPUB_MOONDREAM_API_KEY_3",
+    "CICID_GPUB_MOONDREAM_API_KEY_4"
+  ],
+  "base_url": "https://api-staging.moondream.ai/v1",
+  "dataset_manifest": "inspector_md/dataset/merged_synth_v1/smoke_manifest.json",
+  "split": "all",
+  "max_samples": 0,
+  "seed": 42,
+  "detect_finetune_id": "",
+  "query_finetune_id": "",
+  "base_model": "moondream3-preview",
+  "reasoning": true,
+  "detect_max_objects": 24,
+  "proposal_prompt_style": "request_only",
+  "finding_prompt_style": "minimal",
+  "query_response_mode": "text",
+  "grading_mode": "openrouter",
+  "grader_api_key_env_var": "OPENROUTER_API_KEY",
+  "grader_api_base": "https://openrouter.ai/api/v1",
+  "grader_model_id": "openai/gpt-4.1-mini",
+  "grader_profile": "balanced",
+  "grader_rubric_version": "query_issues_v2",
+  "grader_timeout": 60.0,
+  "coarse_iou_threshold": 0.1,
+  "detect_exclude_source_datasets": [
+    "CODEBRIM"
+  ],
+  "iou_threshold": 0.5,
+  "output_dir": "inspector_md/outputs/baseline_eval_smoke_v1",
+  "save_viz": true,
+  "max_viz_dim": 1280,
+  "timeout": 120.0
+}

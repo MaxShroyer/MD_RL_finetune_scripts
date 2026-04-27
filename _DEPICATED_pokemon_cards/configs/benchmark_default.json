@@ -1,0 +1,21 @@
+{
+  "env_file": "pokemon_cards/.env.staging",
+  "api_key_env_var": "CICID_GPUB_MOONDREAM_API_KEY_1",
+  "base_url": "https://api-staging.moondream.ai/v1",
+  "dataset_source": "local_jsonl",
+  "dataset_dir": "pokemon_cards/outputs/thefusion21_pokemoncards_v1_teacher",
+  "split": "test",
+  "model": "",
+  "finetune_id": "",
+  "checkpoint_step": -1,
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "max_tokens": 256,
+  "timeout": 90.0,
+  "reasoning": true,
+  "max_samples": 0,
+  "seed": 42,
+  "output_json": "pokemon_cards/outputs/benchmark_pokemon_query.json",
+  "predictions_jsonl": "pokemon_cards/outputs/benchmark_pokemon_query_predictions.jsonl",
+  "no_progress": false
+}

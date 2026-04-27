@@ -1,0 +1,44 @@
+{
+  "verified_at": "2026-04-15T19:03:25",
+  "manifest": "inspector_md/cleanup_manifests/cleanup_manifest_20260415_190136.json",
+  "keep_paths_exist": {
+    "inspector_md/dataset": true,
+    "inspector_md/outputs/source_manifest.normalized.json": true,
+    "inspector_md/outputs/build_summary.json": true,
+    "inspector_md/outputs/inspector_finetune_readiness.json": true,
+    "inspector_md/outputs/inspector_detect_v1": true,
+    "inspector_md/outputs/inspector_point_v1": true,
+    "inspector_md/outputs/inspector_query_finding_v1": true,
+    "inspector_md/outputs/inspector_query_proposal_v1": true,
+    "inspector_md/outputs/inspector_query_reasoning_hard_v1": true,
+    "inspector_md/outputs/subset_balanced_1000": true,
+    "inspector_md/outputs/inspector_query_text_cache.jsonl": true,
+    "inspector_md/outputs/hf_export/inspector_md_full_v1": true,
+    "inspector_md/.env.staging": true,
+    "inspector_md/outputs/benchmarks/inspector_detect.metrics.json": true,
+    "inspector_md/outputs/benchmarks/inspector_detect.records.jsonl": true
+  },
+  "all_keep_paths_present": true,
+  "manifest_target_count": 613,
+  "manifest_targets_absent": 613,
+  "manifest_targets_still_present": [],
+  "running_async_jobs_kept_count": 6,
+  "running_async_jobs_kept": [
+    "inspector_md/outputs/async_checkpoint_eval/pid_icons_detect/01KP28YXRK9J324VC6AGPZGHX7/step000060_20260413_090450",
+    "inspector_md/outputs/async_checkpoint_eval/pid_icons_detect/01KP28YSKM12YGBC7Z1HDDX9BQ/step000098_20260412_224347",
+    "inspector_md/outputs/async_checkpoint_eval/pid_icons_point/01KP2AX4VTSH36PBHRRE7PAPJV/step000075_20260412_224347",
+    "inspector_md/outputs/async_checkpoint_eval_query/inspector_query/01KP2AYHKXZ5D4VSZA9KJQXX6K/step000315_20260415_123331",
+    "inspector_md/outputs/async_checkpoint_eval_query/inspector_query/01KP2AYHKXZ5D4VSZA9KJQXX6K/step000015_20260414_064302",
+    "inspector_md/outputs/subset_balanced_1000/async_checkpoint_eval_query/inspector_query/01KP8DNC6CTTXKZB9AHCHQCQZA/step000331_20260415_082459"
+  ],
+  "succeeded_async_jobs_kept_count": 57,
+  "failed_async_jobs_remaining_count": 0,
+  "failed_async_jobs_remaining": [],
+  "remaining_ds_store": [],
+  "remaining_empty_dirs": [],
+  "zero_byte_files_remaining": [
+    "inspector_md/dataset/merged_synth_v1/openrouter_cache.jsonl"
+  ],
+  "outputs_bytes_after": 536756450,
+  "targeted_bytes_before_delete": 894120688
+}

@@ -20,6 +20,7 @@
   "buffer_size": 100,
   "num_steps": 100,
   "resume_step": 0,
+  "sft_bootstrap_steps": 0,
   "batch_size": 32,
   "group_size": 6,
   "lr": 0.002,

@@ -1,0 +1,7 @@
+{
+  "env_file": ".env.staging",
+  "raw_root": "neon_tree/raw/neon_tree_evaluation",
+  "output_dir": "neon_tree/outputs/dataset/neon_tree_detect_v1",
+  "push_to_hub": "maxs-m87/neon_tree_detect_v1"
+}
+

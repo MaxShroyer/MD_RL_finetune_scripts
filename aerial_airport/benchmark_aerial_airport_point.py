@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Thin wrapper around the shared point benchmark for the Aerial Airport dataset."""
+"""Thin wrapper around the shared point benchmark for local aerial datasets."""
 
 from __future__ import annotations
 
@@ -12,7 +12,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from MDpi_and_d import benchmark_pid_icons as _base
+try:
+    from MDpi_and_d import benchmark_pid_icons as _base
+except ModuleNotFoundError:
+    from _DEPICATED_MDpi_and_d import benchmark_pid_icons as _base
 
 from aerial_airport.common import DEFAULT_STAGING_API_BASE, repo_relative
 

@@ -1,0 +1,14 @@
+{
+  "builder_config": "inspector_md/configs/build_inspector_dataset_default.json",
+  "output_root": "inspector_md/outputs",
+  "query_text_cache_jsonl": "inspector_md/outputs/inspector_query_text_cache.jsonl",
+  "shard_cache_dir": "inspector_md/outputs/inspector_query_text_cache_shards",
+  "log_dir": "inspector_md/outputs/inspector_query_refresh_logs",
+  "num_shards": 8,
+  "max_parallel_jobs": 4,
+  "per_worker_concurrency": 1,
+  "max_shard_attempts": 2,
+  "resume": true,
+  "finalize": true,
+  "progress": true
+}

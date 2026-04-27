@@ -1,0 +1,11 @@
+{
+  "best_known_default": {
+    "checkpoint_step": 200,
+    "finetune_id": "01KHQ1H5BBP3G74PKFTER45F5Q",
+    "selection_metric": "eval_f1"
+  },
+  "notes": [
+    "Framework default is seeded from the strongest in-repo BallHolder run family.",
+    "This manifest is for replay and comparison examples, not for hardcoded training behavior."
+  ]
+}

@@ -76,7 +76,7 @@ from async_checkpoint_eval import (
     drain_checkpoint_eval_jobs,
     poll_checkpoint_eval_jobs,
 )
-from tuna_sdk import QueryRequest, QuerySettings, TunaClient  # noqa: E402
+from tuna_sdk import QueryRequest, QuerySettings, QuerySFTTarget, TrainStepGroup, TunaClient  # noqa: E402
 from tuna_sdk.errors import TunaAPIError, TunaNetworkError  # noqa: E402
 
 DEFAULT_BASE_URL = "https://api.moondream.ai/v1"
@@ -147,6 +147,10 @@ WANDB_TRAIN_KEYS = (
     "train_json_parse_rate",
     "train_best_move_valid_prediction_count",
     "train_best_move_valid_prediction_rate",
+    "bootstrap_phase",
+    "sft_group_count",
+    "sft_skipped_ineligible",
+    "sft_loss",
     "off_policy_group_fraction",
     "replay_buffer_size",
     "kl",
@@ -178,6 +182,7 @@ class QAExample:
     best_move_optimal_set: frozenset[int]
     best_move_scores: tuple[tuple[int, int, int], ...] = tuple()
     best_move_legal_moves: frozenset[int] = frozenset()
+    answer_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -1023,6 +1028,7 @@ def _build_example(
         best_move_optimal_set=_move_set_from_json(str(row["best_move_optimal_set_json"])),
         best_move_scores=best_move_scores,
         best_move_legal_moves=best_move_legal_moves,
+        answer_text=str(row.get("answer_text", "")),
     )
 
 
@@ -1101,6 +1107,87 @@ def _prepare_requests(
     return requests, active_examples
 
 
+def _extract_sft_reasoning_text(answer_text: str) -> Optional[str]:
+    text = str(answer_text or "").strip()
+    if not text:
+        return None
+    if text.lower().startswith("reason:"):
+        reason_body = text[len("reason:") :].strip()
+        marker_idx = reason_body.find("\nFinal:")
+        if marker_idx >= 0:
+            reason_body = reason_body[:marker_idx].strip()
+        return reason_body or None
+    return None
+
+
+def _sft_answer_payload_for_example(example: QAExample) -> Optional[dict[str, Any]]:
+    if example.task_type == "best_move":
+        return dict(example.expected_answer) if isinstance(example.expected_answer, dict) else None
+    normalized = _normalize_non_best_answer(example.task_type, example.expected_answer)
+    if isinstance(normalized, dict):
+        return normalized
+    return None
+
+
+def _supports_sft_bootstrap(example: QAExample, *, reasoning: bool) -> bool:
+    payload = _sft_answer_payload_for_example(example)
+    if not isinstance(payload, dict):
+        return False
+    if example.task_type == "best_move" and len(example.best_move_optimal_set) != 1:
+        return False
+    if reasoning and not _extract_sft_reasoning_text(example.answer_text):
+        return False
+    return True
+
+
+def _build_sft_group_for_example(example: QAExample, request: QueryRequest) -> Optional[TrainStepGroup]:
+    answer_payload = _sft_answer_payload_for_example(example)
+    if not isinstance(answer_payload, dict):
+        return None
+    target_kwargs: dict[str, Any] = {
+        "answer": json.dumps(answer_payload, separators=(",", ":"), sort_keys=True),
+    }
+    if bool(request.reasoning):
+        reasoning_text = _extract_sft_reasoning_text(example.answer_text)
+        if not reasoning_text:
+            return None
+        target_kwargs["reasoning"] = reasoning_text
+    return TrainStepGroup.from_sft(
+        request=request,
+        targets=[QuerySFTTarget(**target_kwargs)],
+    )
+
+
+def _sample_sft_bootstrap_batch(
+    *,
+    batch_size: int,
+    sampling_tasks: list[str],
+    sampling_weights: list[float],
+    train_examples_by_task: dict[str, list[QAExample]],
+    intra_task_sampling_groups: dict[str, dict[str, Any]],
+    reasoning: bool,
+    rng: random.Random,
+) -> tuple[list[QAExample], int]:
+    selected: list[QAExample] = []
+    skipped_ineligible = 0
+    attempts = 0
+    max_attempts = max(64, int(batch_size) * 12)
+    while len(selected) < int(batch_size) and attempts < max_attempts:
+        task_name = rng.choices(sampling_tasks, weights=sampling_weights, k=1)[0]
+        candidate = _sample_training_example(
+            task_name=task_name,
+            train_examples_by_task=train_examples_by_task,
+            intra_task_sampling_groups=intra_task_sampling_groups,
+            rng=rng,
+        )
+        attempts += 1
+        if not _supports_sft_bootstrap(candidate, reasoning=reasoning):
+            skipped_ineligible += 1
+            continue
+        selected.append(candidate)
+    return selected, skipped_ineligible
+
+
 def _error_message(exc: Exception) -> str:
     if isinstance(exc, TunaAPIError):
         request_id = f" request_id={exc.request_id}" if exc.request_id else ""
@@ -1110,6 +1197,22 @@ def _error_message(exc: Exception) -> str:
         if cause is not None:
             return f"TunaNetworkError message={exc} cause={type(cause).__name__}: {cause}"
     return f"{type(exc).__name__}: {exc}"
+
+
+def _is_sft_bootstrap_unsupported_error(exc: Exception) -> bool:
+    if not isinstance(exc, TunaAPIError):
+        return False
+    if int(getattr(exc, "status_code", 0) or 0) != 422:
+        return False
+    body = getattr(exc, "response_body", None)
+    if isinstance(body, (dict, list)):
+        body_text = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+    else:
+        body_text = str(body if body is not None else exc)
+    lowered = body_text.lower()
+    rl_only_schema = "input should be 'rl'" in lowered or "rlgroup" in lowered
+    missing_rl_request_fields = "finetune_id" in lowered and "field required" in lowered
+    return rl_only_schema and missing_rl_request_fields
 
 
 def _rollouts_batch_with_retry(
@@ -1550,6 +1653,7 @@ def _build_parser() -> argparse.ArgumentParser:
     add("--off-policy-buffer-size", type=int, default=4096)
     add("--off-policy-warmup-steps", type=int, default=10)
     add("--off-policy-min-buffer-groups", type=int, default=64)
+    add("--sft-bootstrap-steps", type=int, default=0)
 
     reasoning_group = parser.add_mutually_exclusive_group()
     reasoning_group.add_argument("--reasoning", dest="reasoning", action="store_true")
@@ -1703,6 +1807,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--off-policy-warmup-steps must be >= 0")
     if args.off_policy_min_buffer_groups <= 0:
         raise ValueError("--off-policy-min-buffer-groups must be > 0")
+    if args.sft_bootstrap_steps < 0:
+        raise ValueError("--sft-bootstrap-steps must be >= 0")
     if args.off_policy_min_buffer_groups > args.off_policy_buffer_size:
         raise ValueError("--off-policy-min-buffer-groups must be <= --off-policy-buffer-size")
     if not 0.0 <= args.best_move_optimal_reward <= 1.0:
@@ -1901,6 +2007,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                 "off_policy_buffer_size": args.off_policy_buffer_size,
                 "off_policy_warmup_steps": args.off_policy_warmup_steps,
                 "off_policy_min_buffer_groups": args.off_policy_min_buffer_groups,
+                "sft_bootstrap_steps": args.sft_bootstrap_steps,
                 "eval_every": args.eval_every,
                 "save_every": args.save_every,
                 "save_on_eval": args.save_on_eval,
@@ -1927,6 +2034,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         rng = random.Random(args.seed)
         async_eval_jobs: list[DispatchHandle] = []
         async_eval_success_count = 0
+        active_sft_bootstrap_steps = int(args.sft_bootstrap_steps)
+        bootstrap_steps_completed = min(int(args.resume_step), int(active_sft_bootstrap_steps))
+        rl_updates_completed = max(0, int(args.resume_step) - int(active_sft_bootstrap_steps))
+        bootstrap_groups_total = 0
+        bootstrap_skipped_ineligible_total = 0
+        sft_bootstrap_disabled_backend_unsupported = False
 
         if args.eval_every > 0:
             baseline_metrics = _evaluate_split(
@@ -2002,135 +2115,218 @@ def main(argv: Optional[list[str]] = None) -> None:
                     latest_checkpoint_step=latest_checkpoint_step,
                 )
                 async_eval_success_count += int(completed_successes)
-            sampled_tasks = rng.choices(sampling_tasks, weights=sampling_weights, k=args.batch_size)
-            batch = [
-                _sample_training_example(
-                    task_name=task,
+            is_bootstrap_step = int(global_step) < int(active_sft_bootstrap_steps)
+            if is_bootstrap_step:
+                batch, skipped_ineligible = _sample_sft_bootstrap_batch(
+                    batch_size=int(args.batch_size),
+                    sampling_tasks=sampling_tasks,
+                    sampling_weights=sampling_weights,
                     train_examples_by_task=train_examples_by_task,
                     intra_task_sampling_groups=intra_task_sampling_groups,
+                    reasoning=bool(args.reasoning),
                     rng=rng,
                 )
-                for task in sampled_tasks
-            ]
-            requests, active_examples = _prepare_requests(
-                batch,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                max_tokens=args.max_tokens,
-                max_tokens_by_task=args.max_tokens_by_task,
-                reasoning=args.reasoning,
-            )
-            if not requests:
-                print(f"step {global_step}: no valid requests in batch; skipping")
-                continue
-            try:
-                results = _rollouts_batch_with_retry(
-                    finetune=finetune,
-                    requests=requests,
-                    num_rollouts=args.group_size,
-                    max_workers=min(args.max_workers, len(requests)),
-                    retries=args.rollout_retries,
-                    backoff_s=args.rollout_retry_backoff_s,
-                    context=f"train step {global_step}",
-                )
-            except (TunaAPIError, TunaNetworkError) as exc:
-                print(f"step {global_step}: rollouts_batch failed; skipping. details={_error_message(exc)}")
-                continue
-            if len(results) != len(active_examples):
-                print(
-                    f"warning: step {global_step} got {len(results)} rollout results for {len(active_examples)} requests"
-                )
-            on_policy_groups: list[Any] = []
-            rewards_all: list[float] = []
-            object_parses = 0
-            parse_successes = 0
-            best_move_rollout_count = 0
-            best_move_valid_prediction_count = 0
-            for example, result in zip(active_examples, results):
-                rollouts = list(getattr(result, "rollouts", []) or [])
-                if not rollouts:
+                bootstrap_skipped_ineligible_total += int(skipped_ineligible)
+                if not batch:
+                    print(f"step {global_step}: no SFT-eligible examples found for bootstrap; skipping")
                     continue
-                rewards: list[float] = []
-                for rollout in rollouts:
-                    outcome = _score_rollout_for_example(
-                        rollout,
-                        example,
-                        best_move_optimal_reward=args.best_move_optimal_reward,
-                        best_move_reward_mode=args.best_move_reward_mode,
-                        best_move_wrong_rank_scale=args.best_move_wrong_rank_scale,
-                    )
-                    rewards.append(float(outcome.reward))
-                    rewards_all.append(float(outcome.reward))
-                    if outcome.json_object_parsed:
-                        object_parses += 1
-                    if outcome.parse_success:
-                        parse_successes += 1
-                    if example.task_type == "best_move":
-                        best_move_rollout_count += 1
-                        if outcome.best_move_valid_prediction:
-                            best_move_valid_prediction_count += 1
-                if rewards:
-                    on_policy_groups.append(result.to_group(rewards=rewards))
-            if not on_policy_groups:
-                print(f"step {global_step}: no train groups produced; skipping")
-                continue
-
-            train_groups, off_policy_count = _compose_train_groups(
-                on_policy_groups=on_policy_groups,
-                replay_groups=list(replay_buffer),
-                off_policy=bool(args.off_policy),
-                off_policy_mix_ratio=float(args.off_policy_mix_ratio),
-                off_policy_warmup_steps=int(args.off_policy_warmup_steps),
-                off_policy_min_buffer_groups=int(args.off_policy_min_buffer_groups),
-                global_step=int(global_step),
-                rng=rng,
-            )
-            replay_buffer.extend(on_policy_groups)
-            if not train_groups:
-                print(f"step {global_step}: no train groups selected; skipping")
-                continue
-            try:
-                train_out = finetune.train_step(groups=train_groups, lr=args.lr)
-            except (TunaAPIError, TunaNetworkError) as exc:
-                print(f"step {global_step}: train_step failed; skipping. details={_error_message(exc)}")
-                continue
-
-            reward_mean = fmean(rewards_all) if rewards_all else 0.0
-            reward_var = pvariance(rewards_all) if len(rewards_all) > 1 else 0.0
-            train_metrics = {
-                "reward_mean": reward_mean,
-                "reward_var": reward_var,
-                "train_json_object_rate": object_parses / max(1, len(rewards_all)),
-                "train_json_parse_rate": parse_successes / max(1, len(rewards_all)),
-                "train_best_move_valid_prediction_count": float(best_move_valid_prediction_count),
-                "train_best_move_valid_prediction_rate": (
-                    best_move_valid_prediction_count / max(1, best_move_rollout_count)
-                ),
-                "accepted_groups": float(len(train_groups)),
-                "on_policy_groups": float(len(train_groups) - off_policy_count),
-                "off_policy_groups": float(off_policy_count),
-                "off_policy_group_fraction": off_policy_count / max(1, len(train_groups)),
-                "replay_buffer_size": float(len(replay_buffer)),
-                "kl": float(getattr(train_out, "kl", 0.0) or 0.0),
-                "router_kl": float(getattr(train_out, "router_kl", 0.0) or 0.0),
-                "grad_norm": float(getattr(train_out, "grad_norm", 0.0) or 0.0),
-            }
-            wandb.log({key: train_metrics[key] for key in WANDB_TRAIN_KEYS if key in train_metrics}, step=global_step)
-            print(
-                f"step {global_step} reward={reward_mean:.4f} "
-                f"obj_parse_rate={train_metrics['train_json_object_rate']:.4f} "
-                f"parse_rate={train_metrics['train_json_parse_rate']:.4f} "
-                f"best_move_valid={best_move_valid_prediction_count}/{best_move_rollout_count} "
-                f"({train_metrics['train_best_move_valid_prediction_rate']:.4f}) "
-                f"offp={off_policy_count}/{len(train_groups)} replay={len(replay_buffer)} "
-                f"kl={train_metrics['kl']:.4f}"
-            )
-            if show_progress:
-                step_iter.set_postfix(
-                    reward=f"{reward_mean:.3f}",
-                    parse=f"{train_metrics['train_json_parse_rate']:.3f}",
-                    kl=f"{train_metrics['kl']:.3f}",
+                requests, active_examples = _prepare_requests(
+                    batch,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    max_tokens=args.max_tokens,
+                    max_tokens_by_task=args.max_tokens_by_task,
+                    reasoning=args.reasoning,
                 )
+                if not requests:
+                    print(f"step {global_step}: no valid bootstrap requests in batch; skipping")
+                    continue
+                sft_groups: list[TrainStepGroup] = []
+                target_build_skips = 0
+                for example, request in zip(active_examples, requests):
+                    group = _build_sft_group_for_example(example, request)
+                    if group is None:
+                        target_build_skips += 1
+                        continue
+                    sft_groups.append(group)
+                bootstrap_skipped_ineligible_total += int(target_build_skips)
+                if not sft_groups:
+                    print(f"step {global_step}: no SFT groups produced for bootstrap; skipping")
+                    continue
+                try:
+                    train_out = finetune.train_step(groups=sft_groups, lr=args.lr)
+                except (TunaAPIError, TunaNetworkError) as exc:
+                    if _is_sft_bootstrap_unsupported_error(exc):
+                        sft_bootstrap_disabled_backend_unsupported = True
+                        active_sft_bootstrap_steps = min(int(active_sft_bootstrap_steps), int(global_step))
+                        print(
+                            f"step {global_step}: backend rejected SFT bootstrap groups; "
+                            "disabling bootstrap and continuing with RL. "
+                            f"details={_error_message(exc)}"
+                        )
+                        continue
+                    print(f"step {global_step}: SFT bootstrap train_step failed; skipping. details={_error_message(exc)}")
+                    continue
+
+                bootstrap_steps_completed += 1
+                bootstrap_groups_total += len(sft_groups)
+                train_metrics = {
+                    "bootstrap_phase": 1.0,
+                    "sft_group_count": float(len(sft_groups)),
+                    "sft_skipped_ineligible": float(skipped_ineligible + target_build_skips),
+                    "sft_loss": float(getattr(train_out, "sft_loss", 0.0) or 0.0),
+                    "off_policy_group_fraction": 0.0,
+                    "replay_buffer_size": float(len(replay_buffer)),
+                    "kl": float(getattr(train_out, "kl", 0.0) or 0.0),
+                }
+                wandb.log({key: train_metrics[key] for key in WANDB_TRAIN_KEYS if key in train_metrics}, step=global_step)
+                print(
+                    f"step {global_step} bootstrap_sft groups={len(sft_groups)} "
+                    f"skipped={skipped_ineligible + target_build_skips} "
+                    f"sft_loss={train_metrics['sft_loss']:.4f} kl={train_metrics['kl']:.4f}"
+                )
+                if show_progress:
+                    step_iter.set_postfix(
+                        phase="sft",
+                        sft_loss=f"{train_metrics['sft_loss']:.3f}",
+                        groups=f"{len(sft_groups)}",
+                    )
+            else:
+                sampled_tasks = rng.choices(sampling_tasks, weights=sampling_weights, k=args.batch_size)
+                batch = [
+                    _sample_training_example(
+                        task_name=task,
+                        train_examples_by_task=train_examples_by_task,
+                        intra_task_sampling_groups=intra_task_sampling_groups,
+                        rng=rng,
+                    )
+                    for task in sampled_tasks
+                ]
+                requests, active_examples = _prepare_requests(
+                    batch,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    max_tokens=args.max_tokens,
+                    max_tokens_by_task=args.max_tokens_by_task,
+                    reasoning=args.reasoning,
+                )
+                if not requests:
+                    print(f"step {global_step}: no valid requests in batch; skipping")
+                    continue
+                try:
+                    results = _rollouts_batch_with_retry(
+                        finetune=finetune,
+                        requests=requests,
+                        num_rollouts=args.group_size,
+                        max_workers=min(args.max_workers, len(requests)),
+                        retries=args.rollout_retries,
+                        backoff_s=args.rollout_retry_backoff_s,
+                        context=f"train step {global_step}",
+                    )
+                except (TunaAPIError, TunaNetworkError) as exc:
+                    print(f"step {global_step}: rollouts_batch failed; skipping. details={_error_message(exc)}")
+                    continue
+                if len(results) != len(active_examples):
+                    print(
+                        f"warning: step {global_step} got {len(results)} rollout results for {len(active_examples)} requests"
+                    )
+                on_policy_groups: list[Any] = []
+                rewards_all: list[float] = []
+                object_parses = 0
+                parse_successes = 0
+                best_move_rollout_count = 0
+                best_move_valid_prediction_count = 0
+                for example, result in zip(active_examples, results):
+                    rollouts = list(getattr(result, "rollouts", []) or [])
+                    if not rollouts:
+                        continue
+                    rewards: list[float] = []
+                    for rollout in rollouts:
+                        outcome = _score_rollout_for_example(
+                            rollout,
+                            example,
+                            best_move_optimal_reward=args.best_move_optimal_reward,
+                            best_move_reward_mode=args.best_move_reward_mode,
+                            best_move_wrong_rank_scale=args.best_move_wrong_rank_scale,
+                        )
+                        rewards.append(float(outcome.reward))
+                        rewards_all.append(float(outcome.reward))
+                        if outcome.json_object_parsed:
+                            object_parses += 1
+                        if outcome.parse_success:
+                            parse_successes += 1
+                        if example.task_type == "best_move":
+                            best_move_rollout_count += 1
+                            if outcome.best_move_valid_prediction:
+                                best_move_valid_prediction_count += 1
+                    if rewards:
+                        on_policy_groups.append(result.to_group(rewards=rewards))
+                if not on_policy_groups:
+                    print(f"step {global_step}: no train groups produced; skipping")
+                    continue
+
+                train_groups, off_policy_count = _compose_train_groups(
+                    on_policy_groups=on_policy_groups,
+                    replay_groups=list(replay_buffer),
+                    off_policy=bool(args.off_policy),
+                    off_policy_mix_ratio=float(args.off_policy_mix_ratio),
+                    off_policy_warmup_steps=int(args.off_policy_warmup_steps),
+                    off_policy_min_buffer_groups=int(args.off_policy_min_buffer_groups),
+                    global_step=int(rl_updates_completed),
+                    rng=rng,
+                )
+                replay_buffer.extend(on_policy_groups)
+                if not train_groups:
+                    print(f"step {global_step}: no train groups selected; skipping")
+                    continue
+                try:
+                    train_out = finetune.train_step(groups=train_groups, lr=args.lr)
+                except (TunaAPIError, TunaNetworkError) as exc:
+                    print(f"step {global_step}: train_step failed; skipping. details={_error_message(exc)}")
+                    continue
+
+                rl_updates_completed += 1
+                reward_mean = fmean(rewards_all) if rewards_all else 0.0
+                reward_var = pvariance(rewards_all) if len(rewards_all) > 1 else 0.0
+                train_metrics = {
+                    "bootstrap_phase": 0.0,
+                    "sft_group_count": 0.0,
+                    "sft_skipped_ineligible": 0.0,
+                    "sft_loss": float(getattr(train_out, "sft_loss", 0.0) or 0.0),
+                    "reward_mean": reward_mean,
+                    "reward_var": reward_var,
+                    "train_json_object_rate": object_parses / max(1, len(rewards_all)),
+                    "train_json_parse_rate": parse_successes / max(1, len(rewards_all)),
+                    "train_best_move_valid_prediction_count": float(best_move_valid_prediction_count),
+                    "train_best_move_valid_prediction_rate": (
+                        best_move_valid_prediction_count / max(1, best_move_rollout_count)
+                    ),
+                    "accepted_groups": float(len(train_groups)),
+                    "on_policy_groups": float(len(train_groups) - off_policy_count),
+                    "off_policy_groups": float(off_policy_count),
+                    "off_policy_group_fraction": off_policy_count / max(1, len(train_groups)),
+                    "replay_buffer_size": float(len(replay_buffer)),
+                    "kl": float(getattr(train_out, "kl", 0.0) or 0.0),
+                    "router_kl": float(getattr(train_out, "router_kl", 0.0) or 0.0),
+                    "grad_norm": float(getattr(train_out, "grad_norm", 0.0) or 0.0),
+                }
+                wandb.log({key: train_metrics[key] for key in WANDB_TRAIN_KEYS if key in train_metrics}, step=global_step)
+                print(
+                    f"step {global_step} reward={reward_mean:.4f} "
+                    f"obj_parse_rate={train_metrics['train_json_object_rate']:.4f} "
+                    f"parse_rate={train_metrics['train_json_parse_rate']:.4f} "
+                    f"best_move_valid={best_move_valid_prediction_count}/{best_move_rollout_count} "
+                    f"({train_metrics['train_best_move_valid_prediction_rate']:.4f}) "
+                    f"offp={off_policy_count}/{len(train_groups)} replay={len(replay_buffer)} "
+                    f"kl={train_metrics['kl']:.4f}"
+                )
+                if show_progress:
+                    step_iter.set_postfix(
+                        phase="rl",
+                        reward=f"{reward_mean:.3f}",
+                        parse=f"{train_metrics['train_json_parse_rate']:.3f}",
+                        kl=f"{train_metrics['kl']:.3f}",
+                    )
 
             if args.eval_every > 0 and (global_step + 1) % args.eval_every == 0:
                 if args.async_checkpoint_eval:
@@ -2313,6 +2509,15 @@ def main(argv: Optional[list[str]] = None) -> None:
         run.summary["val_rows"] = len(val_examples)
         run.summary["completed_steps"] = int(completed_steps)
         run.summary["target_steps"] = int(args.num_steps)
+        run.summary["sft_bootstrap_steps_configured"] = int(args.sft_bootstrap_steps)
+        run.summary["effective_sft_bootstrap_steps"] = int(active_sft_bootstrap_steps)
+        run.summary["sft_bootstrap_steps_completed"] = int(bootstrap_steps_completed)
+        run.summary["sft_bootstrap_groups_total"] = int(bootstrap_groups_total)
+        run.summary["sft_bootstrap_skipped_ineligible_total"] = int(bootstrap_skipped_ineligible_total)
+        run.summary["rl_updates_completed"] = int(rl_updates_completed)
+        run.summary["sft_bootstrap_disabled_backend_unsupported"] = int(
+            sft_bootstrap_disabled_backend_unsupported
+        )
         run.summary["save_on_eval"] = bool(args.save_on_eval)
         run.summary["async_checkpoint_eval_enabled"] = bool(args.async_checkpoint_eval)
         run.summary["async_checkpoint_eval_success_count"] = int(async_eval_success_count)

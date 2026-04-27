@@ -1,0 +1,31 @@
+{
+  "env_file": "inspector_md/.env.staging",
+  "python_executable": "python",
+  "base_url": "https://api-staging.moondream.ai/v1",
+  "api_key_env_vars": [
+    "CICID_GPUB_MOONDREAM_API_KEY_1",
+    "CICID_GPUB_MOONDREAM_API_KEY_2",
+    "CICID_GPUB_MOONDREAM_API_KEY_3",
+    "CICID_GPUB_MOONDREAM_API_KEY_4"
+  ],
+  "ranks": [32, 48, 64],
+  "lrs": [0.00005, 0.00002],
+  "groups_per_step": [4, 8],
+  "families": [
+    "detect_sft",
+    "detect_rl"
+  ],
+  "manifest_path": "inspector_md/outputs/inspector_detect_only_sweep_manifest.json",
+  "log_dir": "inspector_md/outputs/inspector_detect_only_sweep_logs",
+  "summary_path": "inspector_md/outputs/inspector_detect_only_sweep_launch.summary.json",
+  "readiness_config": "inspector_md/configs/check_inspector_finetune_readiness_default.json",
+  "skip_readiness_check": false,
+  "max_parallel_jobs": 4,
+  "query_max_parallel_jobs": 1,
+  "poll_interval_s": 5.0,
+  "query_run_max_retries": 2,
+  "query_run_retry_backoff_base_s": 30.0,
+  "query_run_retry_backoff_max_s": 180.0,
+  "dry_run": false,
+  "launch": false
+}

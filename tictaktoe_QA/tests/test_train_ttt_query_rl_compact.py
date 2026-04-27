@@ -11,6 +11,7 @@ from unittest.mock import patch
 from PIL import Image
 
 from tictaktoe_QA import train_ttt_query_rl_compact as mod
+from tuna_sdk.errors import TunaAPIError
 
 
 def _eval_metrics(reward: float) -> dict[str, float]:
@@ -208,6 +209,80 @@ class CompactHelperTests(unittest.TestCase):
         self.assertEqual(sum(1 for item in train_groups if str(item).startswith("r")), 2)
 
 
+class CompactSFTBootstrapHelperTests(unittest.TestCase):
+    def _example(
+        self,
+        *,
+        row_id: str,
+        task_type: str = "available_moves_count",
+        expected_answer: dict[str, object] | None = None,
+        answer_text: str = "",
+        optimal_set: frozenset[int] = frozenset(),
+    ) -> mod.QAExample:
+        return mod.QAExample(
+            row_id=row_id,
+            split="train",
+            task_type=task_type,
+            question="q",
+            image_path=Path("/tmp/unused.png"),
+            expected_answer=expected_answer or {"available_move_count": 1},
+            best_move_canonical=1 if task_type == "best_move" else None,
+            best_move_optimal_set=optimal_set,
+            answer_text=answer_text,
+        )
+
+    def test_build_sft_group_for_reasoning_uses_parsed_reason_text(self) -> None:
+        example = self._example(
+            row_id="reasoning_ok",
+            answer_text='Reason: count the open squares.\nFinal: {"available_move_count":1}',
+        )
+        request = mod.QueryRequest(question=example.question, reasoning=True)
+
+        group = mod._build_sft_group_for_example(example, request)
+
+        self.assertIsNotNone(group)
+        assert group is not None
+        self.assertEqual(group.targets[0].answer, '{"available_move_count":1}')
+        self.assertEqual(group.targets[0].reasoning, "count the open squares.")
+
+    def test_sample_sft_bootstrap_batch_skips_tied_best_move(self) -> None:
+        tied_best_move = self._example(
+            row_id="best_tied",
+            task_type="best_move",
+            expected_answer={"row": 1, "col": 1},
+            optimal_set=frozenset({1, 5}),
+        )
+        eligible = self._example(row_id="count_ok")
+
+        with patch.object(mod, "_sample_training_example", side_effect=[tied_best_move, eligible]):
+            selected, skipped = mod._sample_sft_bootstrap_batch(
+                batch_size=1,
+                sampling_tasks=["best_move"],
+                sampling_weights=[1.0],
+                train_examples_by_task={"best_move": [tied_best_move, eligible]},
+                intra_task_sampling_groups={},
+                reasoning=False,
+                rng=random.Random(7),
+            )
+
+        self.assertEqual([item.row_id for item in selected], ["count_ok"])
+        self.assertEqual(skipped, 1)
+
+    def test_detects_backend_rl_only_schema_rejection_for_sft(self) -> None:
+        exc = TunaAPIError(
+            "Request failed",
+            status_code=422,
+            response_body={
+                "detail": [
+                    {"msg": "Input should be 'rl'", "loc": ["body", "groups", 0, "mode"]},
+                    {"msg": "Field required", "loc": ["body", "groups", 0, "request", "finetune_id"]},
+                ]
+            },
+            request_id="req_test",
+        )
+        self.assertTrue(mod._is_sft_bootstrap_unsupported_error(exc))
+
+
 class CompactScoreOutcomeTests(unittest.TestCase):
     def _best_move_example(self) -> mod.QAExample:
         return mod.QAExample(
@@ -260,12 +335,13 @@ class CompactMainFlowTests(unittest.TestCase):
             self.answer = answer
             self.train_steps = 0
             self.saved_checkpoints = 0
+            self.train_groups_history: list[list[object]] = []
 
         def train_step(self, *, groups: list[object], lr: float) -> SimpleNamespace:
-            _ = groups
             _ = lr
             self.train_steps += 1
-            return SimpleNamespace(kl=0.01, router_kl=0.0, grad_norm=1.0)
+            self.train_groups_history.append(list(groups))
+            return SimpleNamespace(kl=0.01, router_kl=0.0, grad_norm=1.0, sft_loss=0.25)
 
         def save_checkpoint(self) -> SimpleNamespace:
             self.saved_checkpoints += 1
@@ -330,6 +406,8 @@ class CompactMainFlowTests(unittest.TestCase):
         *,
         argv: list[str],
         eval_metrics: list[dict[str, float]],
+        rollouts_side_effect: object | None = None,
+        compose_train_groups_side_effect: object | None = None,
     ) -> tuple[
         "CompactMainFlowTests._FakeClient",
         "CompactMainFlowTests._FakeFinetune",
@@ -367,12 +445,25 @@ class CompactMainFlowTests(unittest.TestCase):
                 eval_calls.append(split_name)
                 return eval_queue.pop(0)
 
+            active_rollouts_side_effect = (
+                rollouts_side_effect
+                if rollouts_side_effect is not None
+                else _fake_rollouts_batch_with_retry
+            )
+            compose_side_effect = (
+                compose_train_groups_side_effect
+                if compose_train_groups_side_effect is not None
+                else mod._compose_train_groups
+            )
+
             with patch.object(mod, "wandb", fake_wandb), patch.object(
                 mod, "TunaClient", return_value=fake_client
             ), patch.object(mod, "_load_split_examples", side_effect=_fake_load_split_examples), patch.object(
-                mod, "_rollouts_batch_with_retry", side_effect=_fake_rollouts_batch_with_retry
+                mod, "_rollouts_batch_with_retry", side_effect=active_rollouts_side_effect
             ), patch.object(
                 mod, "_evaluate_split", side_effect=_fake_evaluate_split
+            ), patch.object(
+                mod, "_compose_train_groups", side_effect=compose_side_effect
             ):
                 mod.main(argv)
 
@@ -484,6 +575,96 @@ class CompactMainFlowTests(unittest.TestCase):
         self.assertEqual(client.got_finetune_ids, [])
         self.assertEqual(finetune.saved_checkpoints, 6)
         self.assertTrue(fake_wandb.run.finished)
+
+    def test_main_sft_bootstrap_skips_rollouts_and_logs_bootstrap_metrics(self) -> None:
+        def _rollouts_should_not_run(**kwargs: object) -> list[object]:
+            _ = kwargs
+            raise AssertionError("rollouts should not run during pure SFT bootstrap")
+
+        client, finetune, fake_wandb, eval_calls = self._run_main_with_mocks(
+            argv=[
+                "--api-key",
+                "test-key",
+                "--base-url",
+                "https://example.invalid/v1",
+                "--num-steps",
+                "1",
+                "--batch-size",
+                "1",
+                "--group-size",
+                "1",
+                "--sft-bootstrap-steps",
+                "1",
+                "--eval-every",
+                "0",
+                "--save-every",
+                "0",
+                "--skip-final-eval",
+                "--no-progress",
+            ],
+            eval_metrics=[],
+            rollouts_side_effect=_rollouts_should_not_run,
+        )
+
+        assert fake_wandb.run is not None
+        self.assertEqual(eval_calls, [])
+        self.assertEqual(client.got_finetune_ids, [])
+        self.assertEqual(finetune.train_steps, 1)
+        self.assertEqual(len(finetune.train_groups_history), 1)
+        first_groups = finetune.train_groups_history[0]
+        self.assertEqual(len(first_groups), 1)
+        self.assertEqual(getattr(first_groups[0], "mode", None), "sft")
+        self.assertEqual(fake_wandb.run.summary["sft_bootstrap_steps_completed"], 1)
+        self.assertEqual(fake_wandb.run.summary["rl_updates_completed"], 0)
+        self.assertTrue(
+            any(
+                payload.get("bootstrap_phase") == 1 and payload.get("sft_group_count") == 1
+                for payload, _step in fake_wandb.logs
+            )
+        )
+
+    def test_bootstrap_step_does_not_advance_replay_warmup_counter(self) -> None:
+        compose_global_steps: list[int] = []
+        original_compose_train_groups = mod._compose_train_groups
+
+        def _record_compose_train_groups(**kwargs: object) -> tuple[list[object], int]:
+            compose_global_steps.append(int(kwargs["global_step"]))
+            return original_compose_train_groups(**kwargs)
+
+        _client, _finetune, fake_wandb, _eval_calls = self._run_main_with_mocks(
+            argv=[
+                "--api-key",
+                "test-key",
+                "--base-url",
+                "https://example.invalid/v1",
+                "--num-steps",
+                "2",
+                "--batch-size",
+                "1",
+                "--group-size",
+                "1",
+                "--sft-bootstrap-steps",
+                "1",
+                "--off-policy",
+                "--off-policy-warmup-steps",
+                "1",
+                "--off-policy-min-buffer-groups",
+                "1",
+                "--eval-every",
+                "0",
+                "--save-every",
+                "0",
+                "--skip-final-eval",
+                "--no-progress",
+            ],
+            eval_metrics=[],
+            compose_train_groups_side_effect=_record_compose_train_groups,
+        )
+
+        assert fake_wandb.run is not None
+        self.assertEqual(compose_global_steps, [0])
+        self.assertEqual(fake_wandb.run.summary["sft_bootstrap_steps_completed"], 1)
+        self.assertEqual(fake_wandb.run.summary["rl_updates_completed"], 1)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,124 @@
+{
+  "backend": {
+    "id": "statefarm_detect",
+    "train_overrides": {
+      "api_key_env_var": "CICID_GPUB_MOONDREAM_API_KEY_2",
+      "api_key_env_vars": [
+        "CICID_GPUB_MOONDREAM_API_KEY_1",
+        "CICID_GPUB_MOONDREAM_API_KEY_2",
+        "CICID_GPUB_MOONDREAM_API_KEY_3",
+        "CICID_GPUB_MOONDREAM_API_KEY_4"
+      ],
+      "base_url": "https://api-staging.moondream.ai/v1",
+      "augment_prob": 0.5,
+      "brightness_max": 1.3,
+      "brightness_min": 0.7,
+      "client_max_retries": 0,
+      "color_p": 0.5,
+      "contrast_max": 1.3,
+      "contrast_min": 0.7,
+      "crop_p": 0.5,
+      "crop_scale_max": 1.0,
+      "crop_scale_min": 0.6,
+      "detect_f1_guard_enabled": true,
+      "detect_f1_guard_min_ratio": 0.35,
+      "detect_miou_guard_min_gain": 0.05,
+      "eval_batch_size": 32,
+      "eval_max_workers": 32,
+      "flip_p": 0.5,
+      "hue_p": 0.5,
+      "hue_shift_max": 0.08,
+      "hue_shift_min": -0.08,
+      "iou_threshold": 0.5,
+      "jpeg_quality_max": 100,
+      "jpeg_quality_min": 50,
+      "max_workers": 32,
+      "max_objects": 50,
+      "noise_p": 0.3,
+      "noise_std_max": 12.0,
+      "noise_std_min": 3.0,
+      "object_name": "statefarm logo",
+      "off_policy": false,
+      "prompt_variants": [
+        "statefarm logo",
+        "State Farm logo",
+        "state farm logo",
+        "StateFarm logo"
+      ],
+      "rank": 8,
+      "saturation_max": 1.3,
+      "saturation_min": 0.7,
+      "stretch_p": 0.5,
+      "stretch_max": 1.2,
+      "stretch_min": 0.8,
+      "train_image_format": "JPEG",
+      "timeout": 45.0,
+      "retry_rollout_max_workers": 1
+    }
+  },
+  "dataset": {
+    "name": "maxs-m87/NBA_StateFarm_Splits_01",
+    "source": "hf_hub",
+    "test_split": "validation",
+    "train_split": "train",
+    "val_split": "validation"
+  },
+  "eval": {
+    "async_checkpoint_eval": true,
+    "async_checkpoint_eval_dir": "../../../outputs/async_checkpoint_eval",
+    "eval_every": 20,
+    "final_splits": [
+      "validation"
+    ],
+    "max_samples": null,
+    "max_tokens": 256,
+    "save_every": 20,
+    "temperature": 0.0,
+    "top_p": 1.0
+  },
+  "env_file": "../../../../.env.staging",
+  "logging": {
+    "compact_wandb": true,
+    "enable_wandb": true,
+    "registry_path": "../../../outputs/runs.db",
+    "run_root": "../../../outputs/runs",
+    "wandb_project": "moondream-md-train-framework"
+  },
+  "phases": [
+    {
+      "batch_size": 8,
+      "group_size": 4,
+      "lr": 0.0025,
+      "max_tokens": 256,
+      "mode": "rl",
+      "name": "rl",
+      "steps": 200,
+      "temperature": 1.0,
+      "top_p": 0.9
+    }
+  ],
+  "recovery": {
+    "api_health_preflight": true,
+    "cooldown_s": 15.0,
+    "quarantine_path": "../../../outputs/recovery/quarantine.jsonl",
+    "resume_queue_path": "../../../outputs/recovery/resume_queue.jsonl",
+    "train_step_max_retries": 4
+  },
+  "reward": {
+    "preset": "detect_miou",
+    "selection_metric": "eval_miou"
+  },
+  "skill": {
+    "id": "detect"
+  },
+  "sweep": {
+    "continue_top_k": 2,
+    "enabled": true,
+    "max_parallel": 2,
+    "stage1_scale": 0.25,
+    "stagger_seconds": 4.0
+  },
+  "task": {
+    "name": "statefarm"
+  }
+}

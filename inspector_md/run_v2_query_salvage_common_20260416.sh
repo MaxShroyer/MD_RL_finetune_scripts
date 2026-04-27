@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/run_v2_parallel_fast_common_20260416.sh"
+
+LOG_DIR="$RUN_ROOT/logs_query_sync_eval_20260416"
+mkdir -p "$LOG_DIR"
+
+FULL_QUERY_RESUME_FINETUNE_ID="01KPAG63ZAAHYN075HF3R68192"
+SUBSET_QUERY_RL_RESUME_FINETUNE_ID="01KPAG61NYS729VG77T9926N49"
+FULL_QUERY_RESUME_STEP=77
+SUBSET_QUERY_RL_RESUME_STEP=64

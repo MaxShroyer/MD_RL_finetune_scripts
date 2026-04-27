@@ -1,0 +1,136 @@
+{
+  "backend": {
+    "id": "ballholder_detect",
+    "train_overrides": {
+      "api_key_env_var": "CICID_GPUB_MOONDREAM_API_KEY_1",
+      "api_key_env_vars": [
+        "CICID_GPUB_MOONDREAM_API_KEY_1",
+        "CICID_GPUB_MOONDREAM_API_KEY_2",
+        "CICID_GPUB_MOONDREAM_API_KEY_3",
+        "CICID_GPUB_MOONDREAM_API_KEY_4"
+      ],
+      "base_url": "https://api-staging.moondream.ai/v1",
+      "detect_f1_guard_enabled": true,
+      "detect_f1_guard_min_ratio": 0.35,
+      "detect_fn_penalty_weight": 0.35,
+      "detect_fp_penalty_weight": 0.15,
+      "detect_miou_guard_min_gain": 0.05,
+      "empty_keep_prob": 0.5,
+      "augment_prob": 0.9,
+      "eval_batch_size": 32,
+      "eval_max_workers": 8,
+      "brightness_max": 1.25,
+      "brightness_min": 0.75,
+      "client_max_retries": 0,
+      "color_p": 0.4,
+      "contrast_max": 1.25,
+      "contrast_min": 0.75,
+      "crop_p": 0.5,
+      "crop_scale_max": 1.0,
+      "crop_scale_min": 0.75,
+      "eval_object_name": "Player with ball in hand",
+      "flip_p": 0.5,
+      "hue_p": 0.2,
+      "hue_shift_deg_max": 10.0,
+      "hue_shift_deg_min": -10.0,
+      "iou_threshold": 0.45,
+      "jpeg_quality_max": 98,
+      "jpeg_quality_min": 55,
+      "max_workers": 8,
+      "max_boxes": 1,
+      "max_objects": 1,
+      "min_box_area_keep_ratio": 0.7,
+      "noise_p": 0.25,
+      "noise_std_max": 10.0,
+      "noise_std_min": 2.0,
+      "object_name": "Player with ball in hand",
+      "off_policy": false,
+      "prompt_variants": [
+        "Player with ball in hand",
+        "ball holder",
+        "player with the ball",
+        "person with the ball",
+        "ballhandler",
+        "ball handler",
+        "player in possession",
+        "player holding the basketball",
+        "offensive player with the ball"
+      ],
+      "rank": 8,
+      "saturation_max": 1.25,
+      "saturation_min": 0.75,
+      "stretch_p": 0.3,
+      "stretch_max": 1.1,
+      "stretch_min": 0.9,
+      "train_image_format": "JPEG",
+      "timeout": 45.0,
+      "retry_rollout_max_workers": 1
+    }
+  },
+  "dataset": {
+    "name": "maxs-m87/Ball-Holder-splits-v1",
+    "source": "hf_hub",
+    "test_split": "test",
+    "train_split": "train",
+    "val_split": "validation"
+  },
+  "eval": {
+    "async_checkpoint_eval": true,
+    "async_checkpoint_eval_dir": "../../../outputs/async_checkpoint_eval",
+    "eval_every": 25,
+    "final_splits": [
+      "validation",
+      "test"
+    ],
+    "max_samples": 2000,
+    "max_tokens": 500,
+    "save_every": 25,
+    "temperature": 0.0,
+    "top_p": 1.0
+  },
+  "env_file": "../../../../.env.staging",
+  "logging": {
+    "compact_wandb": true,
+    "enable_wandb": true,
+    "registry_path": "../../../outputs/runs.db",
+    "run_root": "../../../outputs/runs",
+    "wandb_project": "moondream-md-train-framework"
+  },
+  "phases": [
+    {
+      "batch_size": 8,
+      "group_size": 4,
+      "lr": 0.002,
+      "max_tokens": 500,
+      "mode": "rl",
+      "name": "rl",
+      "steps": 200,
+      "temperature": 1.0,
+      "top_p": 0.9
+    }
+  ],
+  "recovery": {
+    "api_health_preflight": true,
+    "cooldown_s": 15.0,
+    "quarantine_path": "../../../outputs/recovery/quarantine.jsonl",
+    "resume_queue_path": "../../../outputs/recovery/resume_queue.jsonl",
+    "train_step_max_retries": 4
+  },
+  "reward": {
+    "preset": "detect_miou",
+    "selection_metric": "eval_miou"
+  },
+  "skill": {
+    "id": "detect"
+  },
+  "sweep": {
+    "continue_top_k": 2,
+    "enabled": true,
+    "max_parallel": 2,
+    "stage1_scale": 0.25,
+    "stagger_seconds": 4.0
+  },
+  "task": {
+    "name": "ballholder"
+  }
+}

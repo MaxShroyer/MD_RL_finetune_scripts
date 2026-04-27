@@ -104,6 +104,7 @@ from tuna_sdk import (
     DetectAnnotation,
     DetectOutput,
     DetectRequest,
+    DetectSFTTarget,
     DetectSettings,
     Rollout,
     RolloutsRequest,
@@ -1065,6 +1066,35 @@ def _is_reasoning_unsupported_error(exc: Exception) -> bool:
     return "reasoning" in lowered and "extra_forbidden" in lowered
 
 
+def _build_sft_group_for_task(
+    task: TaskSample,
+    *,
+    request: DetectRequest,
+) -> Optional[TrainStepGroup]:
+    if not task.is_positive or not task.gt_boxes:
+        return None
+    return TrainStepGroup.from_sft(
+        request=request,
+        targets=[DetectSFTTarget(boxes=list(task.gt_boxes))],
+    )
+
+
+def _is_sft_bootstrap_unsupported_error(exc: Exception) -> bool:
+    if not isinstance(exc, TunaAPIError):
+        return False
+    if int(getattr(exc, "status_code", 0) or 0) != 422:
+        return False
+    body = getattr(exc, "response_body", None)
+    if isinstance(body, (dict, list)):
+        body_text = json.dumps(body, ensure_ascii=True)
+    else:
+        body_text = str(body if body is not None else exc)
+    lowered = body_text.lower()
+    rl_only_schema = "input should be 'rl'" in lowered or "rlgroup" in lowered
+    missing_rl_request_fields = "finetune_id" in lowered and "field required" in lowered
+    return rl_only_schema and missing_rl_request_fields
+
+
 def _rollouts_batch_with_retry(
     *,
     finetune,
@@ -1661,6 +1691,12 @@ def _build_arg_parser(config_path: Path) -> argparse.ArgumentParser:
     )
     train_group.add_argument("--num-steps", type=int, default=100)
     train_group.add_argument("--resume-step", type=int, default=0)
+    train_group.add_argument(
+        "--sft-bootstrap-steps",
+        type=int,
+        default=0,
+        help="Number of initial train steps to run as positive-only SFT bootstrap before RL.",
+    )
     train_group.add_argument("--batch-size", type=int, default=32)
     train_group.add_argument("--group-size", type=int, default=6, help="Rollouts per sampled task.")
     train_group.add_argument("--lr", type=float, default=2e-3, help="Learning rate passed to train_step.")
@@ -1888,6 +1924,8 @@ def _validate_args(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("--num-steps must be > 0")
     if args.resume_step < 0:
         raise ValueError("--resume-step must be >= 0")
+    if args.sft_bootstrap_steps < 0:
+        raise ValueError("--sft-bootstrap-steps must be >= 0")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be > 0")
     if args.group_size <= 0:
@@ -2226,6 +2264,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     print(
         "run control: "
         f"num_steps={args.num_steps} resume_step={args.resume_step} "
+        f"sft_bootstrap_steps={args.sft_bootstrap_steps} "
         f"eval_every={args.eval_every} save_every={args.save_every} "
         f"off_policy={args.off_policy} off_policy_injection_allowed={off_policy_injection_allowed} "
         f"reasoning_train={bool(args.reasoning)} reasoning_eval={eval_reasoning} "
@@ -2261,6 +2300,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             "augment_prob": args.augment_prob,
             "num_steps": args.num_steps,
             "resume_step": args.resume_step,
+            "sft_bootstrap_steps": args.sft_bootstrap_steps,
             "batch_size": args.batch_size,
             "group_size": args.group_size,
             "lr": args.lr,
@@ -2297,7 +2337,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     run.summary["finetune_id"] = finetune.finetune_id
     run.summary["finetune_name"] = getattr(finetune, "name", "") or ""
 
-    def _next_task() -> TaskSample:
+    def _sample_task(*, require_positive: bool) -> tuple[TaskSample, int]:
+        skipped_ineligible = 0
         while True:
             row = next(train_row_iter)
             base = _to_base_sample(row)
@@ -2331,15 +2372,22 @@ def main(argv: Optional[list[str]] = None) -> None:
 
             positives = [task for task in task_candidates if task.is_positive]
             negatives = [task for task in task_candidates if not task.is_positive]
-            if positives:
-                if rng.random() < float(args.pos_task_prob):
+            if require_positive:
+                if positives:
                     selected_task = rng.choice(positives)
-                elif negatives:
-                    selected_task = rng.choice(negatives)
                 else:
-                    selected_task = rng.choice(positives)
+                    skipped_ineligible += max(1, len(negatives))
+                    continue
             else:
-                selected_task = rng.choice(negatives)
+                if positives:
+                    if rng.random() < float(args.pos_task_prob):
+                        selected_task = rng.choice(positives)
+                    elif negatives:
+                        selected_task = rng.choice(negatives)
+                    else:
+                        selected_task = rng.choice(positives)
+                else:
+                    selected_task = rng.choice(negatives)
 
             usage.tasks_consumed += 1
             usage.source_tasks_consumed[selected_task.source] += 1
@@ -2348,13 +2396,23 @@ def main(argv: Optional[list[str]] = None) -> None:
                 usage.tasks_consumed_positive += 1
             else:
                 usage.tasks_consumed_negative += 1
-            return augment_task_sample(
-                selected_task,
-                rng,
-                rng_np,
-                augment_config,
-                augment_prob=args.augment_prob,
+            return (
+                augment_task_sample(
+                    selected_task,
+                    rng,
+                    rng_np,
+                    augment_config,
+                    augment_prob=args.augment_prob,
+                ),
+                skipped_ineligible,
             )
+
+    def _next_task() -> TaskSample:
+        task, _ = _sample_task(require_positive=False)
+        return task
+
+    def _next_positive_task() -> tuple[TaskSample, int]:
+        return _sample_task(require_positive=True)
 
     best_metric: Optional[float] = None
     best_step: Optional[int] = None
@@ -2370,6 +2428,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     early_stop_reason = ""
     async_eval_jobs: list[DispatchHandle] = []
     async_eval_success_count = 0
+    active_sft_bootstrap_steps = int(args.sft_bootstrap_steps)
+    bootstrap_steps_completed = min(int(args.resume_step), int(active_sft_bootstrap_steps))
+    bootstrap_groups_total = 0
+    bootstrap_skipped_ineligible_total = 0
+    sft_bootstrap_disabled_backend_unsupported = False
 
     def _run_and_log_eval(*, trigger: str, step_for_log: int) -> Optional[dict[str, Any]]:
         nonlocal eval_events_logged
@@ -2412,6 +2475,126 @@ def main(argv: Optional[list[str]] = None) -> None:
             wandb.log(event_payload, step=step_for_log)
             print(f"eval {trigger} failed at step {step_for_log}: {type(exc).__name__}: {exc}")
             return None
+
+    def _maybe_run_periodic_eval_and_save(
+        *,
+        global_step: int,
+        kl_value: float,
+        kl_warning_triggered: bool,
+        kl_stop_triggered: bool,
+    ) -> bool:
+        nonlocal stopped_early, early_stop_reason
+        nonlocal best_metric, best_step, best_checkpoint_step, latest_checkpoint_step, best_eval_metrics
+        nonlocal async_eval_success_count, async_eval_jobs
+        if kl_warning_triggered:
+            print(
+                f"warning: step {global_step} kl={kl_value:.4f} exceeded "
+                f"warning threshold {float(args.kl_warning_threshold):.4f}"
+            )
+        if kl_stop_triggered:
+            stopped_early = True
+            early_stop_reason = (
+                f"kl={kl_value:.4f} reached stop threshold {float(args.kl_stop_threshold):.4f} "
+                f"for {kl_consecutive_hits} consecutive update(s)"
+            )
+            print(f"stopping early at step {global_step}: {early_stop_reason}")
+            return True
+
+        if args.usage_report_every > 0 and (global_step + 1) % args.usage_report_every == 0:
+            usage_summary = _usage_snapshot(usage, total_train_rows=total_train_rows, top_k=args.usage_top_k)
+            _print_usage_snapshot(usage_summary, prefix=f"usage step {global_step}")
+
+        if args.eval_every > 0 and successful_updates % args.eval_every == 0:
+            if args.async_checkpoint_eval:
+                saved_checkpoint = finetune.save_checkpoint()
+                checkpoint = getattr(saved_checkpoint, "checkpoint", None)
+                checkpoint_step_raw = getattr(checkpoint, "step", global_step)
+                latest_checkpoint_step = int(checkpoint_step_raw)
+                run.summary["latest_checkpoint_step"] = int(latest_checkpoint_step)
+                job = dispatch_checkpoint_eval(
+                    trainer="football_detect",
+                    finetune_id=str(finetune.finetune_id),
+                    checkpoint_step=int(latest_checkpoint_step),
+                    selection_metric=str(args.selection_metric),
+                    base_dir=str(args.async_checkpoint_eval_dir),
+                    command_builder=lambda metrics_json_path, predictions_jsonl_path, _stdout_log_path: _build_async_checkpoint_eval_command(
+                        args=args,
+                        finetune_id=str(finetune.finetune_id),
+                        split_name=str(val_split),
+                        checkpoint_step=int(latest_checkpoint_step),
+                        metrics_json_path=metrics_json_path,
+                        predictions_jsonl_path=predictions_jsonl_path,
+                    ),
+                    metadata={
+                        "step_for_log": int(global_step),
+                        "split_name": str(val_split),
+                    },
+                    env_overrides={
+                        "MOONDREAM_API_KEY": str(args.api_key),
+                        "HF_TOKEN": str(args.hf_token),
+                    },
+                    max_inflight=int(args.async_checkpoint_eval_max_inflight),
+                    inflight_jobs=async_eval_jobs,
+                )
+                if job is None:
+                    print(
+                        f"async checkpoint eval skipped step={global_step} checkpoint_step={latest_checkpoint_step} "
+                        f"reason=max_inflight"
+                    )
+                else:
+                    async_eval_jobs.append(job)
+                    print(
+                        f"async checkpoint eval dispatched step={global_step} checkpoint_step={latest_checkpoint_step} "
+                        f"job_dir={job.job_dir}"
+                    )
+            else:
+                eval_metrics = _run_and_log_eval(trigger="periodic", step_for_log=global_step)
+                if eval_metrics is None:
+                    return False
+                delta_payload: dict[str, Any] = {}
+                if baseline_eval_metrics is not None:
+                    delta_payload["eval_miou_delta_vs_baseline"] = (
+                        float(eval_metrics.get("eval_miou", 0.0)) - float(baseline_eval_metrics.get("eval_miou", 0.0))
+                    )
+                if baseline_selection_metric is not None:
+                    delta_payload["eval_selection_metric_delta_vs_baseline"] = (
+                        _selection_metric_value(eval_metrics, args.selection_metric) - baseline_selection_metric
+                    )
+                if delta_payload:
+                    wandb.log(delta_payload, step=global_step)
+                print(
+                    f"eval step {global_step} tasks={eval_metrics['eval_tasks']} "
+                    f"miou={eval_metrics['eval_miou']:.4f} f1={eval_metrics['eval_f1']:.4f} "
+                    f"macro_f1={eval_metrics['eval_f1_macro']:.4f} "
+                    f"{args.selection_metric}={_selection_metric_value(eval_metrics, args.selection_metric):.4f} "
+                    f"updates={successful_updates}"
+                )
+
+                metric = _selection_metric_value(eval_metrics, args.selection_metric)
+                if best_metric is None or metric > best_metric:
+                    best_metric = metric
+                    best_step = global_step
+                    best_eval_metrics = dict(eval_metrics)
+                    saved_checkpoint = finetune.save_checkpoint()
+                    checkpoint = getattr(saved_checkpoint, "checkpoint", None)
+                    checkpoint_step_raw = getattr(checkpoint, "step", global_step)
+                    best_checkpoint_step = int(checkpoint_step_raw)
+                    latest_checkpoint_step = int(checkpoint_step_raw)
+                    run.summary["best_selection_metric_name"] = args.selection_metric
+                    run.summary["best_selection_metric"] = float(best_metric)
+                    run.summary["best_step"] = int(best_step)
+                    run.summary["best_checkpoint_step"] = int(best_checkpoint_step)
+                    run.summary["latest_checkpoint_step"] = int(latest_checkpoint_step)
+                    run.summary["best_eval_f1"] = float(eval_metrics.get("eval_f1", 0.0))
+                    run.summary["best_eval_f1_macro"] = float(eval_metrics.get("eval_f1_macro", 0.0))
+                    run.summary["best_eval_miou"] = float(eval_metrics.get("eval_miou", 0.0))
+
+        if args.save_every > 0 and (global_step + 1) % args.save_every == 0:
+            saved_checkpoint = finetune.save_checkpoint()
+            checkpoint = getattr(saved_checkpoint, "checkpoint", None)
+            checkpoint_step_raw = getattr(checkpoint, "step", global_step)
+            latest_checkpoint_step = int(checkpoint_step_raw)
+        return False
 
     if args.eval_every > 0:
         baseline_step = max(0, args.resume_step - 1)
@@ -2457,6 +2640,125 @@ def main(argv: Optional[list[str]] = None) -> None:
                 latest_checkpoint_step=latest_checkpoint_step,
             )
             async_eval_success_count += int(completed_successes)
+
+        is_bootstrap_step = global_step < int(active_sft_bootstrap_steps)
+        if is_bootstrap_step:
+            batch: list[TaskSample] = []
+            skipped_ineligible_step = 0
+            sft_groups: list[TrainStepGroup] = []
+            for _ in range(args.batch_size):
+                item, skipped = _next_positive_task()
+                batch.append(item)
+                skipped_ineligible_step += skipped
+                request_obj = _ReasoningDetectRequest(
+                    object_name=item.prompt,
+                    image_url=_to_data_url(item.image, quality=92),
+                    settings=DetectSettings(
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        max_tokens=args.max_tokens,
+                        max_objects=args.max_objects,
+                    ),
+                    reasoning=bool(args.reasoning),
+                )
+                sft_group = _build_sft_group_for_task(item, request=request_obj)
+                if sft_group is not None:
+                    sft_groups.append(sft_group)
+
+            if not sft_groups:
+                print(f"step {global_step}: no eligible SFT groups for bootstrap; skipping step")
+                continue
+
+            try:
+                train_start = time.monotonic()
+                train_out = finetune.train_step(groups=sft_groups, lr=args.lr)
+                train_end = time.monotonic()
+            except (TunaAPIError, TunaNetworkError) as exc:
+                if _is_sft_bootstrap_unsupported_error(exc):
+                    sft_bootstrap_disabled_backend_unsupported = True
+                    active_sft_bootstrap_steps = min(int(active_sft_bootstrap_steps), int(global_step))
+                    print(
+                        "warning: backend rejected SFT bootstrap groups; "
+                        "disabling bootstrap and continuing with RL. "
+                        f"details: {_format_tuna_error(exc)}"
+                    )
+                    continue
+                print(f"train_step failed at step {global_step}: {_format_tuna_error(exc)}. skipping step")
+                continue
+
+            successful_updates += 1
+            bootstrap_steps_completed += 1
+            bootstrap_groups_total += len(sft_groups)
+            bootstrap_skipped_ineligible_total += skipped_ineligible_step
+
+            rows_seen_fraction = (
+                usage.rows_seen / float(total_train_rows)
+                if total_train_rows and total_train_rows > 0
+                else 0.0
+            )
+            kl_value = float(train_out.kl or 0.0)
+            kl_consecutive_hits, kl_warning_triggered, kl_stop_triggered = _update_kl_guard(
+                kl_value=kl_value,
+                warning_threshold=float(args.kl_warning_threshold),
+                stop_threshold=float(args.kl_stop_threshold),
+                stop_consecutive=int(args.kl_stop_consecutive),
+                consecutive_hits=kl_consecutive_hits,
+            )
+
+            wandb.log(
+                {
+                    "bootstrap_phase": 1,
+                    "sft_group_count": len(sft_groups),
+                    "sft_skipped_ineligible": skipped_ineligible_step,
+                    "sft_loss": float(getattr(train_out, "sft_loss", 0.0) or 0.0),
+                    "batch_positive_tasks": len(batch),
+                    "batch_negative_tasks": 0,
+                    "accepted_groups": len(sft_groups),
+                    "off_policy_injected": 0,
+                    "off_policy_injected_positive": 0,
+                    "off_policy_injected_negative": 0,
+                    "off_policy_considered": 0,
+                    "off_policy_trigger_low_max": 0,
+                    "off_policy_trigger_low_mean": 0,
+                    "off_policy_skipped_high_reward": 0,
+                    "off_policy_skipped_high_variance": 0,
+                    "off_policy_skipped_reasoning_guard": 0,
+                    "fully_off_policy_injection_step": 0,
+                    "kl": kl_value,
+                    "router_kl": train_out.router_kl if train_out.router_kl is not None else 0.0,
+                    "grad_norm": train_out.grad_norm if train_out.grad_norm is not None else 0.0,
+                    "kl_warning_triggered": int(kl_warning_triggered),
+                    "kl_stop_triggered": int(kl_stop_triggered),
+                    "kl_stop_consecutive_hits": kl_consecutive_hits,
+                    "rows_seen": usage.rows_seen,
+                    "rows_seen_fraction": rows_seen_fraction,
+                    "tasks_generated_total": usage.tasks_generated,
+                    "tasks_generated_positive_total": usage.tasks_generated_positive,
+                    "tasks_generated_negative_total": usage.tasks_generated_negative,
+                    "tasks_consumed_total": usage.tasks_consumed,
+                    "tasks_consumed_positive_total": usage.tasks_consumed_positive,
+                    "tasks_consumed_negative_total": usage.tasks_consumed_negative,
+                },
+                step=global_step,
+            )
+
+            total_s = time.monotonic() - step_start
+            print(
+                f"step {global_step} bootstrap_sft groups={len(sft_groups)} "
+                f"skipped={skipped_ineligible_step} "
+                f"sft_loss={float(getattr(train_out, 'sft_loss', 0.0) or 0.0):.4f} "
+                f"kl={kl_value:.4f} train_s={(train_end-train_start):.2f} "
+                f"total_s={total_s:.2f} updates={successful_updates}"
+            )
+
+            if _maybe_run_periodic_eval_and_save(
+                global_step=global_step,
+                kl_value=kl_value,
+                kl_warning_triggered=kl_warning_triggered,
+                kl_stop_triggered=kl_stop_triggered,
+            ):
+                break
+            continue
 
         batch = [_next_task() for _ in range(args.batch_size)]
         requests = [
@@ -2628,6 +2930,8 @@ def main(argv: Optional[list[str]] = None) -> None:
 
         wandb.log(
             {
+                "bootstrap_phase": 0,
+                "sft_loss": float(getattr(train_out, "sft_loss", 0.0) or 0.0),
                 "reward_mean": reward_mean,
                 "reward_var": reward_var,
                 "batch_positive_tasks": pos_tasks,
@@ -2681,113 +2985,13 @@ def main(argv: Optional[list[str]] = None) -> None:
                 f"warning: step {global_step} fully off-policy injected "
                 f"({off_policy_injected_total}/{off_policy_considered} tasks)"
             )
-        if kl_warning_triggered:
-            print(
-                f"warning: step {global_step} kl={kl_value:.4f} exceeded "
-                f"warning threshold {float(args.kl_warning_threshold):.4f}"
-            )
-        if kl_stop_triggered:
-            stopped_early = True
-            early_stop_reason = (
-                f"kl={kl_value:.4f} reached stop threshold {float(args.kl_stop_threshold):.4f} "
-                f"for {kl_consecutive_hits} consecutive update(s)"
-            )
-            print(f"stopping early at step {global_step}: {early_stop_reason}")
+        if _maybe_run_periodic_eval_and_save(
+            global_step=global_step,
+            kl_value=kl_value,
+            kl_warning_triggered=kl_warning_triggered,
+            kl_stop_triggered=kl_stop_triggered,
+        ):
             break
-        if args.usage_report_every > 0 and (global_step + 1) % args.usage_report_every == 0:
-            usage_summary = _usage_snapshot(usage, total_train_rows=total_train_rows, top_k=args.usage_top_k)
-            _print_usage_snapshot(usage_summary, prefix=f"usage step {global_step}")
-
-        if args.eval_every > 0 and successful_updates % args.eval_every == 0:
-            if args.async_checkpoint_eval:
-                saved_checkpoint = finetune.save_checkpoint()
-                checkpoint = getattr(saved_checkpoint, "checkpoint", None)
-                checkpoint_step_raw = getattr(checkpoint, "step", global_step)
-                latest_checkpoint_step = int(checkpoint_step_raw)
-                run.summary["latest_checkpoint_step"] = int(latest_checkpoint_step)
-                job = dispatch_checkpoint_eval(
-                    trainer="football_detect",
-                    finetune_id=str(finetune.finetune_id),
-                    checkpoint_step=int(latest_checkpoint_step),
-                    selection_metric=str(args.selection_metric),
-                    base_dir=str(args.async_checkpoint_eval_dir),
-                    command_builder=lambda metrics_json_path, predictions_jsonl_path, _stdout_log_path: _build_async_checkpoint_eval_command(
-                        args=args,
-                        finetune_id=str(finetune.finetune_id),
-                        split_name=str(val_split),
-                        checkpoint_step=int(latest_checkpoint_step),
-                        metrics_json_path=metrics_json_path,
-                        predictions_jsonl_path=predictions_jsonl_path,
-                    ),
-                    metadata={
-                        "step_for_log": int(global_step),
-                        "split_name": str(val_split),
-                    },
-                    env_overrides={
-                        "MOONDREAM_API_KEY": str(args.api_key),
-                        "HF_TOKEN": str(args.hf_token),
-                    },
-                    max_inflight=int(args.async_checkpoint_eval_max_inflight),
-                    inflight_jobs=async_eval_jobs,
-                )
-                if job is None:
-                    print(
-                        f"async checkpoint eval skipped step={global_step} checkpoint_step={latest_checkpoint_step} "
-                        f"reason=max_inflight"
-                    )
-                else:
-                    async_eval_jobs.append(job)
-                    print(
-                        f"async checkpoint eval dispatched step={global_step} checkpoint_step={latest_checkpoint_step} "
-                        f"job_dir={job.job_dir}"
-                    )
-            else:
-                eval_metrics = _run_and_log_eval(trigger="periodic", step_for_log=global_step)
-                if eval_metrics is None:
-                    continue
-                delta_payload: dict[str, Any] = {}
-                if baseline_eval_metrics is not None:
-                    delta_payload["eval_miou_delta_vs_baseline"] = (
-                        float(eval_metrics.get("eval_miou", 0.0)) - float(baseline_eval_metrics.get("eval_miou", 0.0))
-                    )
-                if baseline_selection_metric is not None:
-                    delta_payload["eval_selection_metric_delta_vs_baseline"] = (
-                        _selection_metric_value(eval_metrics, args.selection_metric) - baseline_selection_metric
-                    )
-                if delta_payload:
-                    wandb.log(delta_payload, step=global_step)
-                print(
-                    f"eval step {global_step} tasks={eval_metrics['eval_tasks']} "
-                    f"miou={eval_metrics['eval_miou']:.4f} f1={eval_metrics['eval_f1']:.4f} "
-                    f"macro_f1={eval_metrics['eval_f1_macro']:.4f} "
-                    f"{args.selection_metric}={_selection_metric_value(eval_metrics, args.selection_metric):.4f} "
-                    f"updates={successful_updates}"
-                )
-
-                metric = _selection_metric_value(eval_metrics, args.selection_metric)
-                if best_metric is None or metric > best_metric:
-                    best_metric = metric
-                    best_step = global_step
-                    best_eval_metrics = dict(eval_metrics)
-                    saved_checkpoint = finetune.save_checkpoint()
-                    checkpoint = getattr(saved_checkpoint, "checkpoint", None)
-                    checkpoint_step_raw = getattr(checkpoint, "step", global_step)
-                    best_checkpoint_step = int(checkpoint_step_raw)
-                    latest_checkpoint_step = int(checkpoint_step_raw)
-                    run.summary["best_selection_metric_name"] = args.selection_metric
-                    run.summary["best_selection_metric"] = float(best_metric)
-                    run.summary["best_step"] = int(best_step)
-                    run.summary["best_checkpoint_step"] = int(best_checkpoint_step)
-                    run.summary["latest_checkpoint_step"] = int(latest_checkpoint_step)
-                    run.summary["best_eval_f1"] = float(eval_metrics.get("eval_f1", 0.0))
-                    run.summary["best_eval_f1_macro"] = float(eval_metrics.get("eval_f1_macro", 0.0))
-                    run.summary["best_eval_miou"] = float(eval_metrics.get("eval_miou", 0.0))
-
-        if args.save_every > 0 and (global_step + 1) % args.save_every == 0:
-            saved_checkpoint = finetune.save_checkpoint()
-            checkpoint = getattr(saved_checkpoint, "checkpoint", None)
-            checkpoint_step_raw = getattr(checkpoint, "step", global_step)
-            latest_checkpoint_step = int(checkpoint_step_raw)
 
     saved_checkpoint = finetune.save_checkpoint()
     checkpoint = getattr(saved_checkpoint, "checkpoint", None)
@@ -2831,6 +3035,12 @@ def main(argv: Optional[list[str]] = None) -> None:
     run.summary["early_stop_reason"] = early_stop_reason
     run.summary["async_checkpoint_eval_enabled"] = bool(args.async_checkpoint_eval)
     run.summary["async_checkpoint_eval_success_count"] = int(async_eval_success_count)
+    run.summary["sft_bootstrap_steps_configured"] = int(args.sft_bootstrap_steps)
+    run.summary["effective_sft_bootstrap_steps"] = int(active_sft_bootstrap_steps)
+    run.summary["sft_bootstrap_steps_completed"] = int(bootstrap_steps_completed)
+    run.summary["sft_bootstrap_groups_total"] = int(bootstrap_groups_total)
+    run.summary["sft_bootstrap_skipped_ineligible_total"] = int(bootstrap_skipped_ineligible_total)
+    run.summary["sft_bootstrap_disabled_backend_unsupported"] = int(sft_bootstrap_disabled_backend_unsupported)
     if args.run_final_test:
         if test_rows_factory is None or test_split is None:
             raise ValueError("--run-final-test requested, but no held-out test split could be resolved")

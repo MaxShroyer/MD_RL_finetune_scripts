@@ -34,6 +34,11 @@ python train_pid_icons.py \
   --env-file .env \
   --dataset-path outputs/pid_icons_merged
 
+python train_pid_icons.py \
+  --env-file .env \
+  --dataset-path outputs/pid_icons_merged \
+  --sft-bootstrap-steps 20
+
 python benchmark_pid_icons.py \
   --env-file .env \
   --dataset-path outputs/pid_icons_merged \
@@ -68,6 +73,13 @@ python train_pid_icons.py \
 Prompt A/B for point mode:
 - `--point-prompt-style detect_phrase` (default): uses `"<class> icon or icons"`.
 - `--point-prompt-style class_name`: uses raw class name only.
+
+SFT bootstrap notes:
+- `--sft-bootstrap-steps` runs positive-only SFT warmup before RL updates.
+- `--skill detect` bootstrap targets GT boxes directly.
+- `--skill point` bootstrap also uses GT boxes as targets; it does not synthesize center points.
+- Negative prompts remain RL-only in this first pass.
+- Runtime tiling disables bootstrap for now; the trainer logs a warning and falls back to pure RL.
 
 Acceptance gates now logged in `wandb-summary.json`:
 - `recall_gate_pass`: fails if TP drops more than `--recall-drop-threshold` at/after `--recall-gate-step`.

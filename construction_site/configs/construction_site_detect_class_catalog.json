@@ -1,0 +1,20 @@
+{
+  "class_catalog": [
+    {
+      "class_uid": "construction_site:excavator",
+      "class_name": "excavator"
+    },
+    {
+      "class_uid": "construction_site:rebar",
+      "class_name": "rebar"
+    },
+    {
+      "class_uid": "construction_site:worker_with_white_hard_hat",
+      "class_name": "worker_with_white_hard_hat"
+    },
+    {
+      "class_uid": "construction_site:rule_1_violation",
+      "class_name": "rule_1_violation"
+    }
+  ]
+}

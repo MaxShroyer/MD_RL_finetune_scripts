@@ -1,6 +1,6 @@
-# Aerial Airport Point RL Pipeline
+# Aerial Airport / VisDrone RL Pipeline
 
-This module reads the local COCO export at `aerial_airport/raw_dataset/Aerial Airport.coco`, normalizes it into the repo's image-level point-training schema, optionally pushes that dataset to Hugging Face, and trains or benchmarks Moondream point-skill RL runs against it.
+`aerial_airport/` now defaults to frame-level VisDrone2019-VID detect and point training. The code stays in the same module, and the old airport COCO workflow is preserved under `aerial_airport/configs/legacy/`.
 
 ## Dataset Build
 
@@ -11,44 +11,45 @@ python aerial_airport/build_aerial_airport_hf_dataset.py \
   --config aerial_airport/configs/build_aerial_airport_hf_dataset_default.json
 ```
 
-Behavior:
+Default VisDrone build behavior:
 
-- Reads the local COCO export from `aerial_airport/raw_dataset/Aerial Airport.coco`.
-- If the raw dataset only contains `train/`, auto-splits it deterministically into `train`, `validation`, and `test`.
-- Preserves image-level rows, including empty/unlabeled images as `answer_boxes=[]`.
-- Tops up each split toward the configured `target_empty_fraction` using deterministic synthetic background-negative crops.
-- Writes a local HF `DatasetDict` plus `metadata.json` and `stats.json`.
-- Optionally pushes `train`, `validation`, and `test` splits to HF.
+- Reads the local raw tree at `aerial_airport/raw_dataset/VisDrone2019-VID-{train,val,test-dev}`.
+- Builds one frame-level HF `DatasetDict` at `aerial_airport/outputs/maxs-m87_visdrone_vid_frames_car_van_merged_v2`.
+- Maps splits directly to `train`, `validation`, and `test`.
+- Keeps empty frames.
+- Uses `frame_stride_train=5`, `frame_stride_validation=1`, and `frame_stride_test=1`.
+- Uses a merged 9-class VisDrone taxonomy where raw `van` annotations are normalized into `car`.
+- Does not synthesize background negatives by default.
 
-Optional HF push:
-
-```bash
-python aerial_airport/build_aerial_airport_hf_dataset.py \
-  --config aerial_airport/configs/build_aerial_airport_hf_dataset_default.json \
-  --push-to-hub maxs-m87/aerial_airport_point_v2
-```
+Legacy airport build configs live under [configs/legacy](/Users/maxs/Documents/Repos/MD/MD_RL_Pipe/RL_amazon_logo/aerial_airport/configs/legacy) and explicitly use `source_format=airport_coco`.
 
 ## Training
 
-Default config: [train_aerial_airport_point_default.json](/Users/maxs/Documents/Repos/MD/MD_RL_Pipe/RL_amazon_logo/aerial_airport/configs/train_aerial_airport_point_default.json)
+Default point config: [train_aerial_airport_point_default.json](/Users/maxs/Documents/Repos/MD/MD_RL_Pipe/RL_amazon_logo/aerial_airport/configs/train_aerial_airport_point_default.json)
 
 ```bash
 python aerial_airport/train_aerial_airport_point.py \
   --config aerial_airport/configs/train_aerial_airport_point_default.json
 ```
 
-Key behavior:
+Default detect config: [train_aerial_airport_detect_default.json](/Users/maxs/Documents/Repos/MD/MD_RL_Pipe/RL_amazon_logo/aerial_airport/configs/train_aerial_airport_detect_default.json)
 
-- Uses the shared point RL trainer with airport-specific defaults.
-- Defaults to the local normalized dataset at `aerial_airport/outputs/maxs-m87_aerial_airport_point_v2`.
-- Defaults to `skill=point`, `point_prompt_style=class_name`, and `reward_metric=f1`.
-- Uses recall-gated point defaults tuned for single-class point supervision.
-- Uses W&B project `moondream-aerial-airport-point-rl`.
-- Uses `CICID_GPUB_MOONDREAM_API_KEY_1` by default; the round-2 recall grid rotates across keys `1` through `4`.
+```bash
+python aerial_airport/train_aerial_airport_detect.py \
+  --config aerial_airport/configs/train_aerial_airport_detect_default.json
+```
+
+VisDrone-specific configs live under [configs/visdrone](/Users/maxs/Documents/Repos/MD/MD_RL_Pipe/RL_amazon_logo/aerial_airport/configs/visdrone):
+
+- `visdrone_class_catalog.json` for the all-class general run.
+- `train_aerial_airport_point_<class>.json` and `train_aerial_airport_detect_<class>.json` for isolated per-class runs.
+- `train_aerial_airport_detect_control.json` for the non-tiling detect control recipe.
+
+The local detect wrappers use plain class-name prompts for VisDrone categories rather than the shared icon-style phrasing.
 
 ## Benchmark
 
-Default config: [benchmark_aerial_airport_point_default.json](/Users/maxs/Documents/Repos/MD/MD_RL_Pipe/RL_amazon_logo/aerial_airport/configs/benchmark_aerial_airport_point_default.json)
+Default point benchmark: [benchmark_aerial_airport_point_default.json](/Users/maxs/Documents/Repos/MD/MD_RL_Pipe/RL_amazon_logo/aerial_airport/configs/benchmark_aerial_airport_point_default.json)
 
 ```bash
 python aerial_airport/benchmark_aerial_airport_point.py \
@@ -57,12 +58,18 @@ python aerial_airport/benchmark_aerial_airport_point.py \
   --checkpoint-step <CHECKPOINT_STEP>
 ```
 
-This runs held-out evaluation on the dataset `test` split rather than adding trainer-level final-test logic.
-The benchmark default config uses the local normalized dataset output and `CICID_GPUB_MOONDREAM_API_KEY_4`.
+Default detect benchmark: [benchmark_aerial_airport_detect_default.json](/Users/maxs/Documents/Repos/MD/MD_RL_Pipe/RL_amazon_logo/aerial_airport/configs/benchmark_aerial_airport_detect_default.json)
 
-## Round-2 Recall Grid
+```bash
+python aerial_airport/benchmark_aerial_airport_detect.py \
+  --config aerial_airport/configs/benchmark_aerial_airport_detect_default.json \
+  --finetune-id <FINETUNE_ID> \
+  --checkpoint-step <CHECKPOINT_STEP>
+```
 
-- `cicd_train_aerial_airport_point_recall_lr1e4_r8.json`
-- `cicd_train_aerial_airport_point_recall_lr5e4_r8.json`
-- `cicd_train_aerial_airport_point_recall_lr1e4_r16.json`
-- `cicd_train_aerial_airport_point_recall_lr5e4_r16.json`
+The default benchmark configs process all classes from the merged VisDrone catalog and prefer the rebuilt local dataset path.
+Per-class isolated benchmark configs remain in `aerial_airport/configs/visdrone/` for debugging.
+
+## Legacy Airport
+
+Airport-specific build, train, and benchmark configs are preserved in [configs/legacy](/Users/maxs/Documents/Repos/MD/MD_RL_Pipe/RL_amazon_logo/aerial_airport/configs/legacy).

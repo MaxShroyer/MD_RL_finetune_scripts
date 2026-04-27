@@ -1,0 +1,20 @@
+{
+  "env_file": "inspector_md/.env.staging",
+  "detect_dataset_path": "inspector_md/outputs/inspector_detect_v1",
+  "point_dataset_path": "inspector_md/outputs/inspector_point_v1",
+  "query_dataset_dir": "inspector_md/outputs/inspector_query_issues_v2",
+  "require_query_text_refresh": true,
+  "verify_openrouter_judge": true,
+  "grader_api_key_env_var": "OPENROUTER_API_KEY",
+  "grader_api_base": "https://openrouter.ai/api/v1",
+  "grader_model_id": "openai/gpt-4.1-mini",
+  "grader_profile": "balanced",
+  "grader_rubric_version": "query_issues_v2",
+  "output_json": "inspector_md/outputs/inspector_finetune_readiness.json",
+  "python_executable": "python",
+  "emit_smoke_commands": true,
+  "launch_smoke": false,
+  "smoke_detect_config": "inspector_md/configs/train_inspector_detect_sft_default.json",
+  "smoke_query_config": "inspector_md/configs/train_inspector_query_default.json",
+  "smoke_output_root": "inspector_md/outputs/runs/inspector_smoke"
+}

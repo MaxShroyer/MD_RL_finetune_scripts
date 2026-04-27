@@ -1,0 +1,2 @@
+{"id":"train-1","image_path":"frame_train_1.ppm","class_name":"logo","prompt":"detect the logo","boxes":[[0.05,0.10,0.55,0.65]]}
+{"id":"train-2","image_path":"frame_train_1.ppm","class_name":"logo","prompt":"detect the logo","boxes":[[0.20,0.20,0.75,0.80]]}

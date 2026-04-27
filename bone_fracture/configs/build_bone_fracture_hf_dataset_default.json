@@ -1,0 +1,13 @@
+{
+  "env_file": ".env.staging",
+  "roboflow_workspace": "roboflow-100",
+  "roboflow_project": "bone-fracture-7fylg",
+  "roboflow_version": 2,
+  "roboflow_api_key_env_var": "ROBOFLOW_API_KEY",
+  "download_dir": "bone_fracture/raw_dataset/bone fracture.coco",
+  "output_dir": "bone_fracture/outputs/maxs-m87_bone_fracture_point_v1",
+  "push_to_hub": "maxs-m87/bone_fracture_point_v1",
+  "hub_val_split": "validation",
+  "hub_post_val_split": "test",
+  "hf_token": ""
+}

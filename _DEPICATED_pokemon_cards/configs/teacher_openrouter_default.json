@@ -1,0 +1,27 @@
+{
+  "env_file": ".env",
+  "api_base": "https://openrouter.ai/api/v1",
+  "dataset_dir": "pokemon_cards/outputs/thefusion21_pokemoncards_v1",
+  "output_dir": "pokemon_cards/outputs/thefusion21_pokemoncards_v1_teacher",
+  "teacher_model_id": "",
+  "splits": [
+    "train",
+    "val",
+    "test"
+  ],
+  "task_types": [
+    "card_identity",
+    "card_core",
+    "attack_overview",
+    "card_summary"
+  ],
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "max_tokens": 256,
+  "timeout": 90.0,
+  "max_rows_per_split": 0,
+  "request_overrides": {},
+  "fallback_to_ground_truth_rationale": false,
+  "no_progress": false
+}
+

@@ -7,3 +7,5 @@ python aerial_airport/benchmark_aerial_airport_point.py \
   --viz-samples 40 \
   --viz-dir aerial_airport/outputs/benchmark_viz/runtime_best_overlap30_step199 \
   --out-json aerial_airport/outputs/benchmarks/runtime_best_overlap30_step199.json
+
+  Take into account all my previous fintune scripts. What I want is a generic framework for RL training with moondream using all my best performing reward functions and interfacing. I want it to be robust clan and staight foward easy to use. I wasnt 

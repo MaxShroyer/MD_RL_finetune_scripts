@@ -1263,6 +1263,99 @@ class SamplingConfigTests(unittest.TestCase):
         self.assertEqual(args.center_bias_gate_min_best_move_samples, 100)
 
 
+class SFTBootstrapHelperTests(unittest.TestCase):
+    def _example(
+        self,
+        *,
+        row_id: str,
+        task_type: str = "available_moves_count",
+        expected_answer: dict[str, object] | None = None,
+        answer_text: str = "",
+        optimal_set: frozenset[int] = frozenset(),
+    ) -> mod.QAExample:
+        return mod.QAExample(
+            row_id=row_id,
+            split="train",
+            task_type=task_type,
+            question="q",
+            image_path=Path("/tmp/unused.png"),
+            expected_answer=expected_answer or {"available_move_count": 1},
+            best_move_canonical=1 if task_type == "best_move" else None,
+            best_move_optimal_set=optimal_set,
+            answer_text=answer_text,
+        )
+
+    def test_extract_sft_reasoning_text_splits_reason_from_final_answer(self) -> None:
+        reasoning = mod._extract_sft_reasoning_text(
+            'Reason: center creates two threats.\nFinal: {"row":2,"col":2}'
+        )
+        self.assertEqual(reasoning, "center creates two threats.")
+
+    def test_supports_sft_bootstrap_rejects_tied_best_move(self) -> None:
+        example = self._example(
+            row_id="best_tied",
+            task_type="best_move",
+            expected_answer={"row": 1, "col": 1},
+            optimal_set=frozenset({1, 5}),
+        )
+        self.assertFalse(mod._supports_sft_bootstrap(example, reasoning=False))
+
+    def test_build_sft_group_for_reasoning_uses_structured_answer_and_reasoning_only(self) -> None:
+        example = self._example(
+            row_id="reasoning_ok",
+            expected_answer={"available_move_count": 1},
+            answer_text='Reason: there is one empty square.\nFinal: {"available_move_count":1}',
+        )
+        request = mod.QueryRequest(question=example.question, reasoning=True)
+
+        group = mod._build_sft_group_for_example(example, request)
+
+        self.assertIsNotNone(group)
+        assert group is not None
+        self.assertEqual(group.mode, "sft")
+        self.assertEqual(len(group.targets), 1)
+        self.assertIsInstance(group.targets[0], mod.QuerySFTTarget)
+        self.assertEqual(group.targets[0].answer, '{"available_move_count":1}')
+        self.assertEqual(group.targets[0].reasoning, "there is one empty square.")
+
+    def test_sample_sft_bootstrap_batch_replaces_ineligible_examples(self) -> None:
+        tied_best_move = self._example(
+            row_id="best_tied",
+            task_type="best_move",
+            expected_answer={"row": 1, "col": 1},
+            optimal_set=frozenset({1, 5}),
+        )
+        eligible = self._example(row_id="count_ok")
+
+        with patch.object(mod, "_sample_training_example", side_effect=[tied_best_move, eligible]):
+            selected, skipped = mod._sample_sft_bootstrap_batch(
+                batch_size=1,
+                sampling_tasks=["best_move"],
+                sampling_weights=[1.0],
+                train_examples_by_task={"best_move": [tied_best_move, eligible]},
+                intra_task_sampling_groups={},
+                reasoning=False,
+                rng=random.Random(7),
+            )
+
+        self.assertEqual([item.row_id for item in selected], ["count_ok"])
+        self.assertEqual(skipped, 1)
+
+    def test_detects_backend_rl_only_schema_rejection_for_sft(self) -> None:
+        exc = TunaAPIError(
+            "Request failed",
+            status_code=422,
+            response_body={
+                "detail": [
+                    {"msg": "Input should be 'rl'", "loc": ["body", "groups", 0, "mode"]},
+                    {"msg": "Field required", "loc": ["body", "groups", 0, "request", "finetune_id"]},
+                ]
+            },
+            request_id="req_test",
+        )
+        self.assertTrue(mod._is_sft_bootstrap_unsupported_error(exc))
+
+
 class GateAndWandbHelperTests(unittest.TestCase):
     def test_should_trigger_center_bias_gate(self) -> None:
         self.assertTrue(

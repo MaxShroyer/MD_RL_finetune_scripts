@@ -1,0 +1,15 @@
+{
+  "best_known_defaults": {
+    "group_size": 8,
+    "lr": 0.001,
+    "off_policy_min_buffer_groups": 64,
+    "off_policy_mix_ratio": 0.25,
+    "off_policy_warmup_steps": 10,
+    "reasoning": true
+  },
+  "notes": [
+    "Defaults are seeded from the winning ttt_query sweep family in-repo.",
+    "The parity config uses the legacy v1 task mix and aggregate eval_reward_mean checkpoint ranking.",
+    "Ranked best-move scoring is still preserved inside the per-sample reward."
+  ]
+}
